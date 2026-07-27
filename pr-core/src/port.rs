@@ -40,6 +40,9 @@ pub enum PortCommand {
     OpenConnection { remote: String },
     CloseConnection { id: ConnectionId },
     Send { id: ConnectionId, bytes: Vec<u8> },
+    /// One-shot unconnected (UI) frame, e.g. a beacon. Backends that have no
+    /// notion of unproto traffic (Telnet, SSH) silently ignore this.
+    SendUnproto { dest: String, bytes: Vec<u8> },
 }
 
 pub struct PortHandle {

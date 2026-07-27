@@ -145,6 +145,15 @@ impl PortRunner for AgwpeRunner {
                         let _ = writer.write_all(&frame.encode());
                     }
                 }
+                Ok(PortCommand::SendUnproto { dest, bytes }) => {
+                    let _ = event_tx.send_blocking(PortEvent::Monitor {
+                        line: format!("{my_call} > {dest} [unproto TX]: {}", String::from_utf8_lossy(&bytes)),
+                    });
+                    let frame = AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes);
+                    if writer.write_all(&frame.encode()).is_err() {
+                        break;
+                    }
+                }
                 Ok(PortCommand::Disconnect) => break,
                 Ok(PortCommand::Connect) => {}
                 Err(_) => break,

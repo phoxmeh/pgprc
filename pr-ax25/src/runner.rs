@@ -93,6 +93,9 @@ impl PortRunner for Ax25RawSocketRunner {
                 }
                 Ok(PortCommand::Disconnect) => break,
                 Ok(PortCommand::Connect) => {}
+                // Sending unconnected UI frames over a raw AF_AX25 socket
+                // would need a separate SOCK_DGRAM socket; not implemented yet.
+                Ok(PortCommand::SendUnproto { .. }) => {}
                 Err(_) => break,
             }
         }
