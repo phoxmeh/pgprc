@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["pr-core", "pr-ax25", "pr-agwpe", "pr-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-channel = "2"
+libc = "0.2"
+ax25 = "0.4"
+portable-pty = "0.8"
+
+pr-core = { path = "pr-core" }
+pr-ax25 = { path = "pr-ax25" }
+pr-agwpe = { path = "pr-agwpe" }
+
+[profile.dev]
+opt-level = 0

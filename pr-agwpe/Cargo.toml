@@ -1,0 +1,13 @@
+[package]
+name = "pr-agwpe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pr-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-channel.workspace = true
+
+[dev-dependencies]
