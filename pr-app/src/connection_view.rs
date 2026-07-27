@@ -43,8 +43,11 @@ impl ConnectionTab {
     }
 
     pub fn append_text(&self, text: &str) {
+        // GTK's string marshaling panics on embedded NUL bytes; a peer could
+        // send arbitrary/binary data over a connection.
+        let sanitized = if text.contains('\0') { text.replace('\0', "") } else { text.to_string() };
         let mut end = self.buffer.end_iter();
-        self.buffer.insert(&mut end, text);
+        self.buffer.insert(&mut end, &sanitized);
         let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
         self.text_view.scroll_mark_onscreen(&end_mark);
     }

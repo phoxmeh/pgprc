@@ -420,6 +420,70 @@ pub fn show_new_connection(ui: &Rc<Ui>) {
     win.present();
 }
 
+/// Prompt for a destination address and message, and send a one-shot
+/// unconnected (UI/beacon) frame over an already-connected AGWPE port.
+pub fn show_send_unproto(ui: &Rc<Ui>) {
+    let candidates: Vec<PortEntry> = ui
+        .state
+        .config
+        .borrow()
+        .ports
+        .iter()
+        .filter(|p| ui.state.is_active(&p.id) && matches!(p.config, PortConfig::Agwpe { .. }))
+        .cloned()
+        .collect();
+
+    let (win, root) = dialog_window(&ui.window, "Send Beacon", 400);
+
+    if candidates.is_empty() {
+        root.append(&gtk::Label::new(Some("No connected AGWPE ports. Connect one first via Ports\u{2026}")));
+        win.present();
+        return;
+    }
+
+    let names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
+    let port_model = gtk::StringList::new(&names);
+    let port_dropdown = gtk::DropDown::builder().model(&port_model).build();
+    root.append(&labeled("Port", &port_dropdown));
+
+    let dest_entry = gtk::Entry::builder().placeholder_text("BEACON").text("BEACON").build();
+    root.append(&labeled("Destination", &dest_entry));
+
+    let message_entry = gtk::Entry::builder().placeholder_text("Message text").build();
+    root.append(&labeled("Message", &message_entry));
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    button_row.set_halign(gtk::Align::End);
+    let cancel_button = gtk::Button::with_label("Cancel");
+    {
+        let win = win.clone();
+        cancel_button.connect_clicked(move |_| win.close());
+    }
+    let send_button = gtk::Button::with_label("Send");
+    send_button.add_css_class("suggested-action");
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        send_button.connect_clicked(move |_| {
+            let dest = dest_entry.text().to_string();
+            if dest.trim().is_empty() {
+                return;
+            }
+            let message = message_entry.text().to_string();
+            let idx = port_dropdown.selected() as usize;
+            if let Some(entry) = candidates.get(idx) {
+                ui.send_unproto(&entry.id, dest.to_uppercase(), message.into_bytes());
+            }
+            win.close();
+        });
+    }
+    button_row.append(&cancel_button);
+    button_row.append(&send_button);
+    root.append(&button_row);
+
+    win.present();
+}
+
 fn labeled(text: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     labeled_widget(text, widget.clone().upcast())
 }

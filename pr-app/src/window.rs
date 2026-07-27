@@ -60,6 +60,12 @@ impl Ui {
         }
     }
 
+    pub fn send_unproto(&self, id: &str, dest: String, bytes: Vec<u8>) {
+        if let Some(handle) = self.state.active.borrow().get(id) {
+            let _ = handle.cmd_tx.send(PortCommand::SendUnproto { dest, bytes });
+        }
+    }
+
     fn handle_event(self: &Rc<Self>, port_id: &str, cmd_tx: &mpsc::Sender<PortCommand>, event: PortEvent) {
         match event {
             PortEvent::PortConnected => {
@@ -183,6 +189,17 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
     header.pack_start(&new_conn_button);
+
+    // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
+    // already-connected AGWPE port.
+    let beacon_button = gtk::Button::with_label("Send Beacon\u{2026}");
+    {
+        let ui = ui.clone();
+        beacon_button.connect_clicked(move |_| {
+            ports_dialog::show_send_unproto(&ui);
+        });
+    }
+    header.pack_start(&beacon_button);
 
     let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
     {

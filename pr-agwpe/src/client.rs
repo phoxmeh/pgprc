@@ -147,7 +147,7 @@ impl PortRunner for AgwpeRunner {
                 }
                 Ok(PortCommand::SendUnproto { dest, bytes }) => {
                     let _ = event_tx.send_blocking(PortEvent::Monitor {
-                        line: format!("{my_call} > {dest} [unproto TX]: {}", String::from_utf8_lossy(&bytes)),
+                        line: format!("{my_call} > {dest} [unproto TX]: {}", text_from_bytes(&bytes)),
                     });
                     let frame = AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes);
                     if writer.write_all(&frame.encode()).is_err() {
@@ -186,12 +186,20 @@ fn read_loop(stream: &mut TcpStream, events: &async_channel::Sender<PortEvent>, 
     }
 }
 
+/// AGWPE frequently null-pads/terminates text fields inside the data
+/// payload (e.g. port info replies, monitored-frame descriptions). GTK
+/// panics if an embedded NUL reaches its string marshaling, so strip them
+/// (not just trim, since NULs can be interior, not only trailing).
+fn text_from_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace('\0', "").trim().to_string()
+}
+
 /// `Err(())` signals the UI side has gone away and the reader loop should stop.
 fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conns: &Arc<Mutex<ConnMap>>) -> Result<(), ()> {
     let kind = frame.kind();
     match kind {
         'G' | 'R' | 'H' | 'g' => {
-            let text = String::from_utf8_lossy(&frame.data).trim().to_string();
+            let text = text_from_bytes(&frame.data);
             events
                 .send_blocking(PortEvent::Monitor { line: format!("[{kind}] {text}") })
                 .map_err(|_| ())?;
@@ -213,7 +221,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
                     }
                 }
             };
-            let text = String::from_utf8_lossy(&frame.data).trim().to_string();
+            let text = text_from_bytes(&frame.data);
             events
                 .send_blocking(PortEvent::ConnectionOpened { id, label: remote })
                 .map_err(|_| ())?;
@@ -249,7 +257,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             }
         }
         'U' | 'S' | 'I' | 'T' => {
-            let text = String::from_utf8_lossy(&frame.data).trim().to_string();
+            let text = text_from_bytes(&frame.data);
             events
                 .send_blocking(PortEvent::Monitor {
                     line: format!("{} > {} [{kind}]: {text}", frame.call_from, frame.call_to),

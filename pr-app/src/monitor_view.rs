@@ -29,8 +29,11 @@ impl MonitorView {
     }
 
     pub fn append_line(&self, line: &str) {
+        // GTK's string marshaling panics on embedded NUL bytes; backend
+        // data (e.g. AGWPE's null-padded text fields) can contain them.
+        let sanitized = if line.contains('\0') { line.replace('\0', "") } else { line.to_string() };
         let mut end = self.buffer.end_iter();
-        self.buffer.insert(&mut end, line);
+        self.buffer.insert(&mut end, &sanitized);
         self.buffer.insert(&mut self.buffer.end_iter(), "\n");
         let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
         self.text_view.scroll_mark_onscreen(&end_mark);
