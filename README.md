@@ -54,7 +54,9 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
 - **Desktop notifications** (off by default): an unsolicited incoming
   connection, a monitored frame addressed to your Default Callsign, or a
   frame matching a Custom Rule with its bell toggle on, each raise a
-  notification.
+  notification. Every notified packet is also kept in the **Notified
+  Packets** list (menu) — useful since these can be bulletins — with the
+  same highlighting as the Monitor and a two-click delete per entry.
 
 ## Not supported (by design, for now)
 
