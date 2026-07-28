@@ -22,6 +22,7 @@ pub struct QrzInfo {
 /// transparently retrying once after a fresh login if the cached session
 /// turns out to be expired/invalid.
 pub fn lookup(username: &str, password: &str, session: &mut Option<String>, callsign: &str) -> Result<QrzInfo, String> {
+    let callsign = strip_ssid(callsign);
     if session.is_none() {
         *session = Some(login(username, password)?);
     }
@@ -32,6 +33,17 @@ pub fn lookup(username: &str, password: &str, session: &mut Option<String>, call
             fetch(session.as_deref().unwrap(), callsign)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// QRZ doesn't know about AX.25 SSIDs (they're not part of a real amateur
+/// callsign) — strip a trailing "-<digits>" like the "-9" in "KD3BFP-9"
+/// before looking anything up. Non-numeric suffixes (there shouldn't be any
+/// for AX.25, but just in case) are left alone.
+fn strip_ssid(callsign: &str) -> &str {
+    match callsign.rsplit_once('-') {
+        Some((base, ssid)) if !ssid.is_empty() && ssid.chars().all(|c| c.is_ascii_digit()) => base,
+        _ => callsign,
     }
 }
 
@@ -113,6 +125,22 @@ mod tests {
     fn missing_tag_returns_none() {
         let xml = "<QRZDatabase><Session><Key>abc123</Key></Session></QRZDatabase>";
         assert_eq!(extract_tag(xml, "Error"), None);
+    }
+
+    #[test]
+    fn strip_ssid_removes_numeric_suffix() {
+        assert_eq!(strip_ssid("KD3BFP-9"), "KD3BFP");
+        assert_eq!(strip_ssid("KD3BFP-15"), "KD3BFP");
+    }
+
+    #[test]
+    fn strip_ssid_leaves_bare_callsign_alone() {
+        assert_eq!(strip_ssid("KD3BFP"), "KD3BFP");
+    }
+
+    #[test]
+    fn strip_ssid_leaves_non_numeric_suffix_alone() {
+        assert_eq!(strip_ssid("KD3BFP-P"), "KD3BFP-P");
     }
 
     #[test]
