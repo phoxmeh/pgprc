@@ -74,6 +74,14 @@ pub struct AddressBookEntry {
     pub callsign: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// A node/BBS alias, e.g. "WL2K" or a digipeater/BBS system name —
+    /// distinct from the operator's personal name.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Free-text location (city/state, grid square, whatever's useful).
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Free-form, potentially multi-line notes about this station.
     #[serde(default)]
     pub notes: Option<String>,
     /// Local time of the most recent time this callsign was heard, formatted
@@ -105,6 +113,13 @@ pub struct UiPrefs {
     /// Pre-fills the "My Callsign" field when adding a new AGWPE/KISS port.
     #[serde(default)]
     pub default_call: Option<String>,
+    /// QRZ.com XML API credentials, for address book "Lookup QRZ". Stored in
+    /// plain text like the AGWPE login fields already are — same tradeoff,
+    /// not a new one.
+    #[serde(default)]
+    pub qrz_username: Option<String>,
+    #[serde(default)]
+    pub qrz_password: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -118,6 +133,8 @@ impl Default for UiPrefs {
             font: None,
             show_timestamps: true,
             default_call: None,
+            qrz_username: None,
+            qrz_password: None,
         }
     }
 }

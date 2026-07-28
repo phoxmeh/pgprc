@@ -12,6 +12,9 @@ pub struct AppState {
     pub config: RefCell<AppConfig>,
     /// Port entry id -> live handle, present only while that port is connected.
     pub active: RefCell<HashMap<String, PortHandle>>,
+    /// Cached QRZ.com session key, valid for ~24h server-side. Deliberately
+    /// not persisted: it's a live auth token, not configuration.
+    pub qrz_session: RefCell<Option<String>>,
 }
 
 impl AppState {
@@ -19,6 +22,7 @@ impl AppState {
         Rc::new(AppState {
             config: RefCell::new(config),
             active: RefCell::new(HashMap::new()),
+            qrz_session: RefCell::new(None),
         })
     }
 
@@ -54,6 +58,8 @@ impl AppState {
             None => cfg.address_book.push(AddressBookEntry {
                 callsign,
                 name: None,
+                alias: None,
+                location: None,
                 notes: None,
                 last_heard: Some(now),
                 heard_count: 1,

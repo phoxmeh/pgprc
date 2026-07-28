@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::ports_dialog::{dialog_window, labeled};
+use crate::ports_dialog::{dialog_window, labeled, labeled_widget};
 use crate::window::{apply_font, Ui};
 
 pub fn show(ui: &Rc<Ui>) {
@@ -26,6 +26,18 @@ pub fn show(ui: &Rc<Ui>) {
         .build();
     root.append(&labeled("Default Callsign", &default_call_entry));
 
+    let qrz_user_entry = gtk::Entry::builder()
+        .placeholder_text("QRZ username (optional)")
+        .text(current.qrz_username.as_deref().unwrap_or(""))
+        .build();
+    root.append(&labeled("QRZ Username", &qrz_user_entry));
+
+    let qrz_pass_entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
+    if let Some(pass) = &current.qrz_password {
+        qrz_pass_entry.set_text(pass);
+    }
+    root.append(&labeled_widget("QRZ Password", qrz_pass_entry.clone().upcast()));
+
     let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     button_row.set_halign(gtk::Align::End);
     let cancel_button = gtk::Button::with_label("Cancel");
@@ -42,6 +54,8 @@ pub fn show(ui: &Rc<Ui>) {
             let font = font_entry.text().to_string();
             let show_timestamps = timestamps_check.is_active();
             let default_call = default_call_entry.text().to_string();
+            let qrz_username = qrz_user_entry.text().to_string();
+            let qrz_password = qrz_pass_entry.text().to_string();
 
             {
                 let mut cfg = ui.state.config.borrow_mut();
@@ -49,7 +63,11 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.ui.show_timestamps = show_timestamps;
                 cfg.ui.default_call =
                     if default_call.trim().is_empty() { None } else { Some(default_call.to_uppercase()) };
+                cfg.ui.qrz_username = if qrz_username.trim().is_empty() { None } else { Some(qrz_username) };
+                cfg.ui.qrz_password = if qrz_password.is_empty() { None } else { Some(qrz_password) };
             }
+            // Credentials may have changed; force a fresh login next lookup.
+            *ui.state.qrz_session.borrow_mut() = None;
             ui.state.save_config();
 
             apply_font(&font);

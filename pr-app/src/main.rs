@@ -4,6 +4,7 @@ mod connection_view;
 mod monitor_view;
 mod ports_dialog;
 mod preferences_dialog;
+mod qrz;
 mod window;
 
 use adw::prelude::*;
