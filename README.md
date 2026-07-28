@@ -20,6 +20,15 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   - **KISS (TCP or serial)** — talks directly to a bare KISS TNC.
     Unproto/UI traffic only — a bare KISS TNC has no connected-mode ARQ
     state machine of its own, and this app doesn't implement one.
+- **Managed Direwolf process** (optional): a handset-icon header button
+  starts/stops a local `direwolf` process directly — green while running,
+  yellow if it failed to start. Right-click for the **Direwolf Console**
+  (its captured log output, live, plus its own Start/Stop buttons, a
+  "Save Log..." export, and a "Settings..." dialog holding the raw
+  `direwolf.conf` text — editable in place, or loaded from an existing
+  file — and an auto-start-with-this-app checkbox). Entirely separate from
+  the ports above — you still add/connect an AGWPE or KISS port pointed at
+  it the normal way.
 - **Session tabs**: pick a port and (for node-capable ports) a destination
   callsign, connect explicitly, and send/receive text. Tabs persist across
   disconnects so you can reconnect or repoint them at a different node.
@@ -140,7 +149,9 @@ in-file node history into these per-node text files.
 
 1. Open the menu (top-left, hamburger icon) → **Ports...** and add a port.
    Telnet/SSH need a host; AGWPE/KISS-TCP need a host and port; KISS-Serial
-   needs a device and baud rate.
+   needs a device and baud rate. Running a local Direwolf instance? Right-
+   click the handset icon in the header → **Settings...** to paste in its
+   config and (optionally) have this app start it for you.
 2. Click **+** on the tab bar (or the empty-state's **+ New Tab** button) to
    open a new session tab, pick the port, and (for AGWPE/AX.25/KISS ports)
    enter a destination callsign — either type it in or pick one from the

@@ -183,6 +183,25 @@ pub struct MailboxPrefs {
     pub messages: Vec<MailboxMessage>,
 }
 
+/// Preferences for optionally launching Direwolf as a managed child process
+/// (this app's own dev/test rig runs against it, and plenty of users run it
+/// standalone anyway). Entirely separate from `PortEntry`/`PortConfig` —
+/// this only owns the OS process; a port still has to be added and
+/// connected normally to actually talk to it over AGWPE/KISS.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DirewolfPrefs {
+    /// Start Direwolf automatically when this app starts, mirroring a
+    /// port's own `autoconnect`.
+    #[serde(default)]
+    pub auto_start: bool,
+    /// Raw `direwolf.conf` text, written out to a managed file and passed
+    /// as `-c` when this app launches Direwolf itself. Kept as one plain
+    /// text blob rather than a structured form — Direwolf's config format
+    /// is large and varied, and a full parser isn't worth building here.
+    #[serde(default)]
+    pub config_text: String,
+}
+
 /// Desktop notification preferences. Off by default, like the mailbox —
 /// firing OS notifications is a side effect the user should opt into. Which
 /// destinations actually raise a notification (beyond the built-in
@@ -427,6 +446,8 @@ pub struct AppConfig {
     pub notify: NotifyPrefs,
     #[serde(skip)]
     pub notified_packets: Vec<NotifiedPacket>,
+    #[serde(default)]
+    pub direwolf: DirewolfPrefs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

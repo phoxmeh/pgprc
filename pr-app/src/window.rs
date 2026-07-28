@@ -10,6 +10,8 @@ use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
 use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::beacons_dialog;
+use crate::direwolf::{DirewolfProcess, DirewolfState};
+use crate::direwolf_dialog;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
 use crate::notified_packets_dialog;
@@ -53,6 +55,7 @@ pub struct Ui {
     status_conn_icon: gtk::Image,
     status_conn_label: gtk::Label,
     status_stats_label: gtk::Label,
+    pub direwolf: Rc<DirewolfProcess>,
     pub window: adw::ApplicationWindow,
 }
 
@@ -866,7 +869,9 @@ fn apply_base_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
         ".pin-toggle.pin-pinned { color: @accent_color; } \
-         .notify-rule-toggle.notify-rule-active { background-color: @accent_color; }",
+         .notify-rule-toggle.notify-rule-active { background-color: @accent_color; } \
+         .direwolf-running { background-color: @success_color; } \
+         .direwolf-failed { background-color: @warning_color; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -902,6 +907,28 @@ fn add_shortcut(controller: &gtk::ShortcutController, accel: &str, ui: &Rc<Ui>, 
         glib::Propagation::Stop
     });
     controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(callback_action)));
+}
+
+/// Reflect `direwolf`'s current state on its header button: color (via CSS
+/// class — `background-color`, not `color`, since a plain `color` override
+/// doesn't visibly recolor every symbolic icon in this theme, per the
+/// `notifications-symbolic` gotcha noted elsewhere in this project) and
+/// tooltip text.
+fn refresh_direwolf_button(button: &gtk::Button, direwolf: &DirewolfProcess) {
+    button.remove_css_class("direwolf-running");
+    button.remove_css_class("direwolf-failed");
+    let tooltip = match direwolf.state.get() {
+        DirewolfState::Stopped => "Direwolf: stopped \u{2014} click to start, right-click for log/settings",
+        DirewolfState::Running => {
+            button.add_css_class("direwolf-running");
+            "Direwolf: running \u{2014} click to stop, right-click for log/settings"
+        }
+        DirewolfState::FailedToStart => {
+            button.add_css_class("direwolf-failed");
+            "Direwolf: failed to start \u{2014} right-click for log/settings"
+        }
+    };
+    button.set_tooltip_text(Some(tooltip));
 }
 
 fn describe_state(state: ConnState) -> &'static str {
@@ -1051,6 +1078,7 @@ pub fn build_ui(app: &adw::Application) {
         status_conn_icon,
         status_conn_label,
         status_stats_label,
+        direwolf: DirewolfProcess::new(),
         window: window.clone(),
     });
 
@@ -1177,9 +1205,49 @@ pub fn build_ui(app: &adw::Application) {
     }
     header_start.append(&mailbox_button);
 
-    // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
-    // already-connected AGWPE/KISS port.
-    let beacon_button = gtk::Button::with_label("Send Beacon\u{2026}");
+    // Modem-style handset for the optional managed Direwolf process — icon
+    // only, colored via CSS class to reflect state (see
+    // `refresh_direwolf_button`): default = stopped, green = running,
+    // yellow = failed to start. Left-click toggles start/stop; right-click
+    // opens the console window (`direwolf_dialog::show_console`).
+    let direwolf_button = gtk::Button::from_icon_name("call-start-symbolic");
+    direwolf_button.add_css_class("flat");
+    refresh_direwolf_button(&direwolf_button, &ui.direwolf);
+    {
+        let ui = ui.clone();
+        direwolf_button.connect_clicked(move |_| {
+            if ui.direwolf.is_running() {
+                ui.direwolf.stop();
+            } else if let Some(dir) = pr_core::AppConfig::config_dir() {
+                let config_text = ui.state.config.borrow().direwolf.config_text.clone();
+                ui.direwolf.start(&dir.join("direwolf.conf"), &config_text);
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, _, _| {
+            direwolf_dialog::show_console(&ui);
+        });
+        direwolf_button.add_controller(gesture);
+    }
+    {
+        let direwolf_button = direwolf_button.clone();
+        let direwolf = ui.direwolf.clone();
+        ui.direwolf.add_on_change(move || {
+            refresh_direwolf_button(&direwolf_button, &direwolf);
+        });
+    }
+    header_start.append(&direwolf_button);
+
+    // "Send Beacon" sends a one-shot unconnected (UI) frame over an
+    // already-connected AGWPE/KISS port — icon-only (a loudspeaker with
+    // sound waves, the closest stock glyph to "broadcasting"), same tier
+    // as the Direwolf button next to it.
+    let beacon_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
+    beacon_button.set_tooltip_text(Some("Send Beacon\u{2026}"));
     {
         let ui = ui.clone();
         beacon_button.connect_clicked(move |_| {
@@ -1227,6 +1295,13 @@ pub fn build_ui(app: &adw::Application) {
 
     for id in autoconnect_ids {
         ui.connect_port(&id);
+    }
+
+    if ui.state.config.borrow().direwolf.auto_start {
+        if let Some(dir) = pr_core::AppConfig::config_dir() {
+            let config_text = ui.state.config.borrow().direwolf.config_text.clone();
+            ui.direwolf.start(&dir.join("direwolf.conf"), &config_text);
+        }
     }
 
     ui.reschedule_beacons();
