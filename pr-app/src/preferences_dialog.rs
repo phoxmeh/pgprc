@@ -84,6 +84,14 @@ pub fn show(ui: &Rc<Ui>) {
     known_color_row.add_suffix(&known_color_btn);
     hl_group.add(&known_color_row);
 
+    let my_call_color_btn = color_button(&current_hl.my_call_color);
+    let my_call_color_row = adw::ActionRow::builder()
+        .title("My Callsign")
+        .subtitle("Matches the Default Callsign above, wherever it's mentioned")
+        .build();
+    my_call_color_row.add_suffix(&my_call_color_btn);
+    hl_group.add(&my_call_color_row);
+
     let ax25_color_btn = color_button(&current_hl.ax25_command_color);
     let ax25_color_row = adw::ActionRow::builder().title("AX.25 Command Tags").build();
     ax25_color_row.add_suffix(&ax25_color_btn);
@@ -172,6 +180,7 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.highlighting.enabled = hl_enabled_row.is_active();
                 cfg.highlighting.callsign_color = rgba_to_hex(&callsign_color_btn.rgba());
                 cfg.highlighting.known_callsign_color = rgba_to_hex(&known_color_btn.rgba());
+                cfg.highlighting.my_call_color = rgba_to_hex(&my_call_color_btn.rgba());
                 cfg.highlighting.ax25_command_color = rgba_to_hex(&ax25_color_btn.rgba());
                 cfg.highlighting.rules = rules.borrow().clone();
 

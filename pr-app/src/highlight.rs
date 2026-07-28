@@ -26,6 +26,8 @@ pub struct Highlighter {
     callsign_color: String,
     known_color: String,
     known_bases: HashSet<String>,
+    my_call_color: String,
+    my_call_base: Option<String>,
     ax25_re: Regex,
     ax25_color: String,
     /// Custom/keyword rules in configured order; later entries are applied
@@ -41,6 +43,13 @@ impl Highlighter {
             .iter()
             .map(|e| strip_ssid(&e.callsign).to_uppercase())
             .collect();
+        let my_call_base = config
+            .ui
+            .default_call
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| strip_ssid(s).to_uppercase());
         let rules = hl
             .rules
             .iter()
@@ -79,6 +88,8 @@ impl Highlighter {
             callsign_color: hl.callsign_color.clone(),
             known_color: hl.known_callsign_color.clone(),
             known_bases,
+            my_call_color: hl.my_call_color.clone(),
+            my_call_base,
             // Matches only the bracketed frame/command tag itself (exact
             // content, not a generic "any bracketed text" scan) — otherwise
             // this would also light up unrelated bracketed labels like
@@ -106,8 +117,13 @@ impl Highlighter {
         }
         for m in self.callsign_re.find_iter(line) {
             let base = strip_ssid(m.as_str()).to_uppercase();
-            let color =
-                if self.known_bases.contains(&base) { self.known_color.clone() } else { self.callsign_color.clone() };
+            let color = if self.my_call_base.as_deref() == Some(base.as_str()) {
+                self.my_call_color.clone()
+            } else if self.known_bases.contains(&base) {
+                self.known_color.clone()
+            } else {
+                self.callsign_color.clone()
+            };
             spans.push((m.start(), m.end(), color));
         }
         for (re, color) in &self.rules {

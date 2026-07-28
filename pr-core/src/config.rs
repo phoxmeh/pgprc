@@ -240,6 +240,12 @@ pub struct HighlightPrefs {
     /// Color for callsign tokens matching an address book entry.
     #[serde(default = "default_known_callsign_color")]
     pub known_callsign_color: String,
+    /// Color for callsign tokens matching `UiPrefs.default_call` (the
+    /// user's own station) — takes priority over `known_callsign_color`,
+    /// since "traffic mentioning me" is more actionable than "a station I
+    /// happen to know".
+    #[serde(default = "default_my_call_color")]
+    pub my_call_color: String,
     /// Color for the bracketed frame/command tag on monitor lines, e.g.
     /// `[UI]`, `[SABM]`, `[I N(S)=1 N(R)=0]`.
     #[serde(default = "default_ax25_command_color")]
@@ -254,6 +260,10 @@ fn default_callsign_color() -> String {
 
 fn default_known_callsign_color() -> String {
     "#B5CEA8".to_string()
+}
+
+fn default_my_call_color() -> String {
+    "#FF5555".to_string()
 }
 
 fn default_ax25_command_color() -> String {
@@ -279,6 +289,7 @@ impl Default for HighlightPrefs {
             enabled: true,
             callsign_color: default_callsign_color(),
             known_callsign_color: default_known_callsign_color(),
+            my_call_color: default_my_call_color(),
             ax25_command_color: default_ax25_command_color(),
             rules: default_rules(),
         }

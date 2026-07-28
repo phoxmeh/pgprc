@@ -169,6 +169,12 @@ impl SessionTab {
         controls.append(&connect_button);
         controls.append(&disconnect_button);
 
+        // Pushes Save/Clear History/stats to the row's right edge, away from
+        // the port/Connect/Disconnect controls on the left.
+        let controls_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        controls_spacer.set_hexpand(true);
+        controls.append(&controls_spacer);
+
         let save_button = gtk::Button::with_label("Save\u{2026}");
         controls.append(&save_button);
 
@@ -210,8 +216,13 @@ impl SessionTab {
 
         // --- notebook tab label: title + Pin + Close ---
         let tab_label = gtk::Label::new(Some("New Tab"));
-        let pin_toggle = gtk::ToggleButton::builder().label("Pin").build();
+        // Recolored via CSS (`.pin-toggle:checked`, set up once in
+        // `window::apply_base_css`) instead of swapping icons, so the pin
+        // itself stays a plain pushpin glyph and only its color signals
+        // whether this tab is currently pinned.
+        let pin_toggle = gtk::ToggleButton::builder().icon_name("pin-symbolic").tooltip_text("Pin").build();
         pin_toggle.add_css_class("flat");
+        pin_toggle.add_css_class("pin-toggle");
 
         SessionTab {
             root,

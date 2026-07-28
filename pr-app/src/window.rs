@@ -225,6 +225,15 @@ impl Ui {
         {
             let ui = self.clone();
             pin_toggle.connect_toggled(move |btn| {
+                // Toggled explicitly (rather than relying on a `:checked`
+                // CSS pseudo-class) so the pinned color is unambiguous and
+                // doesn't depend on how a given GTK theme styles toggle
+                // buttons.
+                if btn.is_active() {
+                    btn.add_css_class("pin-pinned");
+                } else {
+                    btn.remove_css_class("pin-pinned");
+                }
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     if btn.is_active() {
                         ui.sync_pin(tab);
@@ -744,6 +753,17 @@ pub fn apply_font(font_desc: &str) {
     }
 }
 
+/// One-time static CSS for widgets whose styling doesn't depend on user
+/// preferences (unlike `apply_font`, which is reapplied whenever the font
+/// setting changes) — currently just the pin toggle's checked-state tint.
+fn apply_base_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(".pin-toggle.pin-pinned { color: @accent_color; }");
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
 fn parse_font_desc(desc: &str) -> (String, u32) {
     let desc = desc.trim();
     if desc.is_empty() {
@@ -783,6 +803,7 @@ pub fn build_ui(app: &adw::Application) {
         .map(|p| TabPrefill { port_id: p.port_id.clone(), remote: p.remote.clone(), via: p.via.clone(), unproto: p.unproto })
         .collect();
     apply_font(&font);
+    apply_base_css();
     let state = AppState::new(config);
 
     let window = adw::ApplicationWindow::builder()
@@ -890,11 +911,12 @@ pub fn build_ui(app: &adw::Application) {
     menu_popover.set_child(Some(&menu_box));
     menu_button.set_popover(Some(&menu_popover));
 
+    // Mailbox has its own header button now (next to Send Beacon), so it's
+    // deliberately left out of this menu rather than duplicated in both.
     type MenuAction = fn(&Rc<Ui>);
-    let menu_items: [(&str, MenuAction); 5] = [
+    let menu_items: [(&str, MenuAction); 4] = [
         ("Ports\u{2026}", |ui| ports_dialog::show(ui)),
         ("Address Book\u{2026}", |ui| address_book_dialog::show(ui)),
-        ("Mailbox\u{2026}", |ui| mailbox_dialog::show(ui)),
         ("Beacons\u{2026}", |ui| beacons_dialog::show(ui)),
         ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
     ];
@@ -915,6 +937,20 @@ pub fn build_ui(app: &adw::Application) {
         menu_box.append(&item_button);
     }
     header.pack_start(&menu_button);
+
+    // Quick-access icon button for the Mailbox dialog, same tier of
+    // frequent-use action as "Send Beacon...", so it lives in the header
+    // instead of behind the hamburger menu.
+    let mailbox_button = gtk::Button::from_icon_name("mail-unread-symbolic");
+    mailbox_button.add_css_class("flat");
+    mailbox_button.set_tooltip_text(Some("Mailbox"));
+    {
+        let ui = ui.clone();
+        mailbox_button.connect_clicked(move |_| {
+            mailbox_dialog::show(&ui);
+        });
+    }
+    header.pack_start(&mailbox_button);
 
     // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
     // already-connected AGWPE/KISS port.
