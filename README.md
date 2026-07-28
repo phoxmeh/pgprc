@@ -1,4 +1,4 @@
-# Packet Radio
+# Pretty Good Packet Radio Client (PGPRC)
 
 A Linux-native packet radio client built with Rust and GTK4/libadwaita,
 supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
@@ -77,6 +77,8 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   notification. Every notified packet is also kept in the **Notified
   Packets** list (menu) — useful since these can be bulletins — with the
   same highlighting as the Monitor and a two-click delete per entry.
+- **Help** and **About** (bottom of the menu): a quick in-app reference for
+  basic usage and keyboard shortcuts, and standard version/license info.
 
 ## Not supported (by design, for now)
 
@@ -110,7 +112,7 @@ A `PKGBUILD` is included; it builds directly from this working directory
 
 ```sh
 makepkg -f
-sudo pacman -U packet-radio-*.pkg.tar.zst
+sudo pacman -U pgprc-*.pkg.tar.zst
 ```
 
 Optional dependencies: `direwolf` (sound-card TNC — required for the
@@ -125,7 +127,7 @@ kind — the mainline `linux` kernel package doesn't enable it).
 | `pr-core`  | Config model (`~/.config/packet-radio/`, split across several files), the `Port` trait, and shared event/command types. |
 | `pr-ax25`  | AX.25 raw-socket (`AF_AX25`) and KISS (TCP/serial) transports.   |
 | `pr-agwpe` | AGWPE frame codec and client actor.                              |
-| `pr-app`   | The GTK4/libadwaita UI.                                          |
+| `pr-app`   | The GTK4/libadwaita UI — builds the `pgprc` binary.              |
 
 ## Configuration
 
@@ -170,7 +172,8 @@ in-file node history into these per-node text files.
    **Preferences** (fonts, QRZ credentials, highlighting colors, the
    personal mailbox and notification toggles, and the **Custom Rules**
    list — destination addresses to highlight, each with a bell toggle to
-   also raise a desktop notification on a match).
+   also raise a desktop notification on a match). **Help** and **About**
+   are at the bottom of the same menu.
 
 ## Keyboard shortcuts
 

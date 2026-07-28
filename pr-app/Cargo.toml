@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The crate/package is still called "pr-app" (matches the other workspace
+# members' pr-* naming), but it builds the actual distributed executable
+# under its real product name.
+[[bin]]
+name = "pgprc"
+path = "src/main.rs"
+
 [dependencies]
 pr-core.workspace = true
 pr-ax25.workspace = true

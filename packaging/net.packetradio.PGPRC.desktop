@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Packet Radio
+Name=Pretty Good Packet Radio Client
 GenericName=Packet Radio Client
 Comment=AGWPE/AX.25/KISS packet radio client
-Exec=packet-radio
-Icon=net.packetradio.PacketRadio
+Exec=pgprc
+Icon=net.packetradio.PGPRC
 Terminal=false
 Categories=Network;X-HamRadio;
-StartupWMClass=net.packetradio.PacketRadio
+StartupWMClass=net.packetradio.PGPRC

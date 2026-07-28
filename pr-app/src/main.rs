@@ -1,3 +1,4 @@
+mod about_dialog;
 mod address_book_dialog;
 mod adif;
 mod app_state;
@@ -5,6 +6,7 @@ mod beacons_dialog;
 mod direwolf;
 mod direwolf_dialog;
 mod export;
+mod help_dialog;
 mod highlight;
 mod mailbox;
 mod mailbox_dialog;
@@ -20,7 +22,7 @@ mod window;
 use adw::prelude::*;
 use gtk::glib;
 
-const APP_ID: &str = "net.packetradio.PacketRadio";
+const APP_ID: &str = "net.packetradio.PGPRC";
 
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt::init();

@@ -1,9 +1,9 @@
-pkgbase = packet-radio
-	pkgdesc = Linux-native AGWPE/AX.25/KISS packet radio client
+pkgbase = pgprc
+	pkgdesc = Pretty Good Packet Radio Client — a Linux-native AGWPE/AX.25/KISS packet radio client
 	pkgver = 0.1.0
-	pkgrel = 3
+	pkgrel = 1
 	url = https://example.invalid/packet-radio
-	install = packet-radio.install
+	install = pgprc.install
 	arch = x86_64
 	license = MIT
 	makedepends = cargo
@@ -15,6 +15,11 @@ pkgbase = packet-radio
 	depends = desktop-file-utils
 	optdepends = direwolf: sound modem
 	optdepends = linux-lts: native Linux AX.25 modem support
+	optdepends = libax25: native Linux AX.25 modem support
+	optdepends = ax25-tools: native Linux AX.25 modem support
+	optdepends = ax25-apps: native Linux AX.25 modem support
+	conflicts = packet-radio
+	replaces = packet-radio
 	options = !lto
 
-pkgname = packet-radio
+pkgname = pgprc

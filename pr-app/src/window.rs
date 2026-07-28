@@ -7,11 +7,13 @@ use gtk::glib;
 
 use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
 
+use crate::about_dialog;
 use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::beacons_dialog;
 use crate::direwolf::{DirewolfProcess, DirewolfState};
 use crate::direwolf_dialog;
+use crate::help_dialog;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
 use crate::notified_packets_dialog;
@@ -961,7 +963,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Packet Radio")
+        .title("PGPRC")
         .default_width(1000)
         .default_height(700)
         .build();
@@ -1049,7 +1051,7 @@ pub fn build_ui(app: &adw::Application) {
     // minimize/maximize/close buttons `HeaderBar` provided automatically.
     let header_start = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let header_end = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let header_title = gtk::Label::new(Some("Packet Radio"));
+    let header_title = gtk::Label::new(Some("PGPRC"));
     header_title.add_css_class("title");
     header_title.set_hexpand(true);
     header_title.set_halign(gtk::Align::Center);
@@ -1174,6 +1176,25 @@ pub fn build_ui(app: &adw::Application) {
         ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
     ];
     for (label, open) in menu_items {
+        let item_button = gtk::Button::with_label(label);
+        item_button.add_css_class("flat");
+        if let Some(l) = item_button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            l.set_halign(gtk::Align::Start);
+        }
+        {
+            let ui = ui.clone();
+            let menu_popover = menu_popover.clone();
+            item_button.connect_clicked(move |_| {
+                menu_popover.popdown();
+                open(&ui);
+            });
+        }
+        menu_box.append(&item_button);
+    }
+    menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let help_about_items: [(&str, MenuAction); 2] =
+        [("Help\u{2026}", |ui| help_dialog::show(ui)), ("About\u{2026}", |ui| about_dialog::show(ui))];
+    for (label, open) in help_about_items {
         let item_button = gtk::Button::with_label(label);
         item_button.add_css_class("flat");
         if let Some(l) = item_button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {

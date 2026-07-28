@@ -1,4 +1,4 @@
-# pacman install hook for packet-radio.
+# pacman install hook for pgprc (Pretty Good Packet Radio Client).
 #
 # Refreshes the desktop-entry and hicolor icon caches so the launcher entry
 # and its icon actually show up after install — the previous package

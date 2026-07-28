@@ -4,19 +4,27 @@
 # than a downloaded tarball, since the project has no published releases or
 # remote yet. Once it does, switch `source`/`sha256sums` to a real tagged
 # tarball/git URL for a proper (e.g. AUR) submission.
-pkgname=packet-radio
+pkgname=pgprc
 pkgver=0.1.0
-pkgrel=3
-pkgdesc="Linux-native AGWPE/AX.25/KISS packet radio client"
+pkgrel=1
+pkgdesc="Pretty Good Packet Radio Client — a Linux-native AGWPE/AX.25/KISS packet radio client"
 arch=('x86_64')
 url="https://example.invalid/packet-radio" # TODO: replace once a remote exists
 license=('MIT')
 depends=('gtk4' 'libadwaita' 'systemd-libs' 'hicolor-icon-theme' 'desktop-file-utils')
 optdepends=('direwolf: sound modem'
-            'linux-lts: native Linux AX.25 modem support')
+            'linux-lts: native Linux AX.25 modem support'
+            'libax25: native Linux AX.25 modem support'
+            'ax25-tools: native Linux AX.25 modem support'
+            'ax25-apps: native Linux AX.25 modem support')
+# Renamed from packet-radio (same project) — replaces/conflicts so
+# installing this package cleanly migrates off the old one instead of
+# leaving both installed side by side under different names.
+replaces=('packet-radio')
+conflicts=('packet-radio')
 makedepends=('cargo' 'pkgconf')
 options=('!lto')
-install=packet-radio.install
+install=pgprc.install
 source=()
 sha256sums=()
 
@@ -34,10 +42,10 @@ build() {
 
 package() {
 	cd "$startdir"
-	install -Dm755 "$srcdir/target/release/pr-app" "$pkgdir/usr/bin/packet-radio"
-	install -Dm644 packaging/net.packetradio.PacketRadio.desktop \
-		"$pkgdir/usr/share/applications/net.packetradio.PacketRadio.desktop"
-	install -Dm644 packaging/net.packetradio.PacketRadio.svg \
-		"$pkgdir/usr/share/icons/hicolor/scalable/apps/net.packetradio.PacketRadio.svg"
+	install -Dm755 "$srcdir/target/release/pgprc" "$pkgdir/usr/bin/pgprc"
+	install -Dm644 packaging/net.packetradio.PGPRC.desktop \
+		"$pkgdir/usr/share/applications/net.packetradio.PGPRC.desktop"
+	install -Dm644 packaging/net.packetradio.PGPRC.svg \
+		"$pkgdir/usr/share/icons/hicolor/scalable/apps/net.packetradio.PGPRC.svg"
 	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
