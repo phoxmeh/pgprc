@@ -186,6 +186,19 @@ pub struct NotifyPrefs {
     pub enabled: bool,
 }
 
+/// A packet whose destination triggered a desktop notification, kept for
+/// later review since the OS notification itself is transient — these are
+/// often bulletins/nets worth revisiting, not just a one-time alert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifiedPacket {
+    pub id: u64,
+    pub port_id: String,
+    /// The exact text shown in the notification body, so it can be
+    /// re-highlighted identically to how it first appeared in the Monitor.
+    pub line: String,
+    pub timestamp: String,
+}
+
 /// One real connected-mode QSO, logged for ADIF export. Distinct from the
 /// address book's "heard" tracking, which includes any monitored traffic,
 /// not just two-way contacts we actually opened/received a connection for.
@@ -394,6 +407,8 @@ pub struct AppConfig {
     pub mailbox: MailboxPrefs,
     #[serde(default)]
     pub notify: NotifyPrefs,
+    #[serde(default)]
+    pub notified_packets: Vec<NotifiedPacket>,
 }
 
 impl AppConfig {

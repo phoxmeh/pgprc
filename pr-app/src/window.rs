@@ -12,6 +12,7 @@ use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::beacons_dialog;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
+use crate::notified_packets_dialog;
 use crate::ports_dialog;
 use crate::preferences_dialog;
 use crate::session_tab::{port_supports_connect, port_supports_unproto, SessionTab, TabId};
@@ -696,11 +697,9 @@ impl Ui {
                         // feature's on/off switch.
                         if self.state.config.borrow().notify.enabled {
                             let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
-                            crate::notify::send(
-                                &self.window,
-                                &format!("Packet Radio \u{2014} {port_name}"),
-                                &format!("{label} connected to you"),
-                            );
+                            let body = format!("{label} connected to you");
+                            crate::notify::send(&self.window, &format!("Packet Radio \u{2014} {port_name}"), &body);
+                            self.state.record_notified_packet(port_id, &body);
                         }
                     }
                 }
@@ -761,6 +760,7 @@ impl Ui {
         let Some(reason) = matcher.match_destination(to) else { return };
         let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
         crate::notify::send(&self.window, &format!("Packet Radio \u{2014} {port_name}"), &format!("{reason}\n{line}"));
+        self.state.record_notified_packet(port_id, line);
     }
 }
 
@@ -950,10 +950,11 @@ pub fn build_ui(app: &adw::Application) {
     // Mailbox has its own header button now (next to Send Beacon), so it's
     // deliberately left out of this menu rather than duplicated in both.
     type MenuAction = fn(&Rc<Ui>);
-    let menu_items: [(&str, MenuAction); 4] = [
+    let menu_items: [(&str, MenuAction); 5] = [
         ("Ports\u{2026}", |ui| ports_dialog::show(ui)),
         ("Address Book\u{2026}", |ui| address_book_dialog::show(ui)),
         ("Beacons\u{2026}", |ui| beacons_dialog::show(ui)),
+        ("Notified Packets\u{2026}", |ui| notified_packets_dialog::show(ui)),
         ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
     ];
     for (label, open) in menu_items {

@@ -7,8 +7,8 @@ use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
 use pr_core::{
-    spawn_port, AddressBookEntry, AppConfig, NodeHistory, PinnedSession, PortConfig, PortEntry, PortHandle,
-    QsoLogEntry,
+    spawn_port, AddressBookEntry, AppConfig, NodeHistory, NotifiedPacket, PinnedSession, PortConfig, PortEntry,
+    PortHandle, QsoLogEntry,
 };
 
 pub struct AppState {
@@ -167,6 +167,31 @@ impl AppState {
                 lines: vec![line.to_string()],
             }),
         }
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Record a packet whose destination triggered a desktop notification,
+    /// for later review in the Notified Packets dialog — these are
+    /// transient OS popups otherwise, easy to miss if you weren't looking.
+    pub fn record_notified_packet(&self, port_id: &str, line: &str) {
+        let mut cfg = self.config.borrow_mut();
+        let id = cfg.notified_packets.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+        cfg.notified_packets.push(NotifiedPacket {
+            id,
+            port_id: port_id.to_string(),
+            line: line.to_string(),
+            timestamp: now_timestamp(),
+        });
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Remove one entry from the Notified Packets list — used by its
+    /// two-click (arm, then confirm) delete button.
+    pub fn remove_notified_packet(&self, id: u64) {
+        let mut cfg = self.config.borrow_mut();
+        cfg.notified_packets.retain(|p| p.id != id);
         drop(cfg);
         self.save_config();
     }

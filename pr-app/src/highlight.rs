@@ -154,6 +154,33 @@ impl TagCache {
     }
 }
 
+/// Render `line_text` as Pango markup with the same colored spans
+/// `highlight_line` would apply to a GTK text buffer — for list-style views
+/// (e.g. the Notified Packets dialog) where a `gtk::Label` fits the row
+/// layout better than an embedded `gtk::TextView`. Overlapping spans can't
+/// be represented as flat markup tags, so later-starting spans that would
+/// overlap an already-emitted one are simply skipped (matches this app's
+/// existing "first-seen wins" tag priority elsewhere).
+pub fn highlight_to_markup(highlighter: &Highlighter, line_text: &str) -> String {
+    let mut spans = highlighter.spans(line_text);
+    spans.sort_by_key(|(start, _, _)| *start);
+
+    let mut out = String::new();
+    let mut pos = 0;
+    for (start, end, color) in spans {
+        if start < pos {
+            continue;
+        }
+        out.push_str(&gtk::glib::markup_escape_text(&line_text[pos..start]));
+        out.push_str(&format!("<span foreground=\"{color}\">"));
+        out.push_str(&gtk::glib::markup_escape_text(&line_text[start..end]));
+        out.push_str("</span>");
+        pos = end;
+    }
+    out.push_str(&gtk::glib::markup_escape_text(&line_text[pos..]));
+    out
+}
+
 /// Apply highlighting to `line_text`, which must already sit in `buffer` at
 /// `[line_start_offset, line_start_offset + line_text.chars().count())`
 /// (a char offset, not byte offset — GTK `TextIter` positions are in chars).
