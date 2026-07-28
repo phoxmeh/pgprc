@@ -6,7 +6,10 @@ use pr_agwpe::client::AgwpeRunner;
 use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
-use pr_core::{spawn_port, AddressBookEntry, AppConfig, NodeHistory, PinnedSession, PortConfig, PortEntry, PortHandle};
+use pr_core::{
+    spawn_port, AddressBookEntry, AppConfig, NodeHistory, PinnedSession, PortConfig, PortEntry, PortHandle,
+    QsoLogEntry,
+};
 
 pub struct AppState {
     pub config: RefCell<AppConfig>,
@@ -44,10 +47,7 @@ impl AppState {
         if callsign.is_empty() {
             return;
         }
-        let now = gtk::glib::DateTime::now_local()
-            .and_then(|t| t.format("%Y-%m-%d %H:%M:%S"))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let now = now_timestamp();
 
         let mut cfg = self.config.borrow_mut();
         match cfg.address_book.iter_mut().find(|e| e.callsign == callsign) {
@@ -92,6 +92,34 @@ impl AppState {
                 via: via.to_string(),
                 unproto,
             });
+        }
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Log the start of a real connected-mode QSO, for ADIF export — call
+    /// only for `port_supports_connect` ports (Telnet/SSH aren't ham-radio
+    /// contacts, KISS has no connected mode).
+    pub fn log_qso_started(&self, port_id: &str, callsign: &str) {
+        let callsign = callsign.trim().to_uppercase();
+        if callsign.is_empty() {
+            return;
+        }
+        let mut cfg = self.config.borrow_mut();
+        cfg.qso_log.push(QsoLogEntry { callsign, port_id: port_id.to_string(), started: now_timestamp(), ended: None });
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Fill in the `ended` timestamp of the most recent still-open QSO log
+    /// entry for this (port, callsign).
+    pub fn log_qso_ended(&self, port_id: &str, callsign: &str) {
+        let callsign = callsign.trim().to_uppercase();
+        let mut cfg = self.config.borrow_mut();
+        if let Some(entry) =
+            cfg.qso_log.iter_mut().rev().find(|e| e.port_id == port_id && e.callsign == callsign && e.ended.is_none())
+        {
+            entry.ended = Some(now_timestamp());
         }
         drop(cfg);
         self.save_config();
@@ -155,17 +183,26 @@ pub fn spawn_for_config(config: &PortConfig) -> PortHandle {
             login: login.as_ref().map(|l| (l.username.clone(), l.password.clone())),
         }),
         PortConfig::Ax25RawSocket { device } => spawn_port(Ax25RawSocketRunner { device: device.clone() }),
-        PortConfig::KissTcp { host, port, my_call } => spawn_port(KissRunner {
+        PortConfig::KissTcp { host, port, my_call, kiss_params } => spawn_port(KissRunner {
             transport: KissTransport::Tcp { host: host.clone(), port: *port },
             my_call: my_call.clone(),
+            params: kiss_params.clone(),
         }),
-        PortConfig::KissSerial { device, baud, my_call } => spawn_port(KissRunner {
+        PortConfig::KissSerial { device, baud, my_call, kiss_params } => spawn_port(KissRunner {
             transport: KissTransport::Serial { device: device.clone(), baud: *baud },
             my_call: my_call.clone(),
+            params: kiss_params.clone(),
         }),
     }
 }
 
 pub fn find_entry(config: &AppConfig, id: &str) -> Option<PortEntry> {
     config.ports.iter().find(|p| p.id == id).cloned()
+}
+
+pub(crate) fn now_timestamp() -> String {
+    gtk::glib::DateTime::now_local()
+        .and_then(|t| t.format("%Y-%m-%d %H:%M:%S"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }

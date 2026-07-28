@@ -7,6 +7,7 @@ use pr_core::{ConnectionId, PortConfig, PortEntry};
 
 use crate::app_state::AppState;
 use crate::highlight::{highlight_line, Highlighter, TagCache};
+use crate::mailbox::MailboxState;
 
 pub type TabId = u64;
 
@@ -56,6 +57,7 @@ pub struct SessionTab {
     pub unproto_toggle: gtk::CheckButton,
     pub connect_button: gtk::Button,
     pub disconnect_button: gtk::Button,
+    pub save_button: gtk::Button,
     pub input_entry: gtk::Entry,
     pub conn_id: Cell<Option<ConnectionId>>,
     /// Text received since the last completed line, for splitting arbitrary
@@ -65,6 +67,21 @@ pub struct SessionTab {
     /// tab, if any — lets us unpin the *old* identity when the user edits a
     /// pinned tab's port/node/mode instead of leaking an orphaned pin entry.
     pub pinned_identity: RefCell<Option<(String, String, bool)>>,
+    /// Bytes actually sent/received over the wire — the only traffic stats
+    /// honestly available here, since the AX.25 ARQ state machine (and any
+    /// retry/timer counts) lives in the AGWPE host or the kernel, not in
+    /// this app, for every backend we support.
+    bytes_sent: Cell<u64>,
+    bytes_received: Cell<u64>,
+    stats_label: gtk::Label,
+    /// `Some` when this tab's replies are being driven by the personal
+    /// mailbox's auto-responder instead of the user typing — set on an
+    /// unsolicited incoming connection while the mailbox is enabled.
+    pub mailbox_state: RefCell<Option<MailboxState>>,
+    /// Separate from `pending_line` (which drives history persistence):
+    /// buffers incoming bytes into complete lines for the mailbox command
+    /// parser specifically.
+    mailbox_input: RefCell<String>,
     buffer: gtk::TextBuffer,
     text_view: gtk::TextView,
     state: Rc<AppState>,
@@ -104,6 +121,13 @@ impl SessionTab {
         disconnect_button.set_sensitive(false);
         controls.append(&connect_button);
         controls.append(&disconnect_button);
+
+        let save_button = gtk::Button::with_label("Save\u{2026}");
+        controls.append(&save_button);
+
+        let stats_label = gtk::Label::new(Some("\u{2191}0 B \u{2193}0 B"));
+        stats_label.add_css_class("dim-label");
+        controls.append(&stats_label);
 
         root.append(&controls);
 
@@ -145,10 +169,16 @@ impl SessionTab {
             unproto_toggle,
             connect_button,
             disconnect_button,
+            save_button,
             input_entry,
             conn_id: Cell::new(None),
             pending_line: RefCell::new(String::new()),
             pinned_identity: RefCell::new(None),
+            bytes_sent: Cell::new(0),
+            bytes_received: Cell::new(0),
+            stats_label,
+            mailbox_state: RefCell::new(None),
+            mailbox_input: RefCell::new(String::new()),
             buffer,
             text_view,
             state,
@@ -168,6 +198,21 @@ impl SessionTab {
         self.port_dropdown.set_sensitive(!connected);
         self.node_entry.set_sensitive(!connected);
         self.via_entry.set_sensitive(!connected);
+    }
+
+    /// Append a chunk of received bytes to the mailbox's own line buffer
+    /// (separate from history's `pending_line`) and return every newly
+    /// completed line, for the mailbox command parser to process one at a
+    /// time.
+    pub fn take_mailbox_lines(&self, chunk: &str) -> Vec<String> {
+        let mut buf = self.mailbox_input.borrow_mut();
+        buf.push_str(chunk);
+        let mut lines = Vec::new();
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+        }
+        lines
     }
 
     /// The via digipeater path as an ordered, uppercased, non-empty list —
@@ -229,6 +274,9 @@ impl SessionTab {
     /// the backend gives us whatever it read off the wire, not necessarily
     /// aligned to line boundaries.
     pub fn receive_data(&self, text: &str) {
+        self.bytes_received.set(self.bytes_received.get() + text.len() as u64);
+        self.update_stats_label();
+
         let (start_offset, sanitized) = self.insert(text);
         self.highlight_new_lines(start_offset, &sanitized);
 
@@ -258,6 +306,9 @@ impl SessionTab {
     /// echo our own transmissions back to us, so without this the buffer
     /// would only ever show what the *other* station sent.
     pub fn append_sent_line(&self, text: &str) {
+        self.bytes_sent.set(self.bytes_sent.get() + text.len() as u64);
+        self.update_stats_label();
+
         let formatted = format!("\u{00BB} {text}\n");
         let (start_offset, sanitized) = self.insert(&formatted);
         self.highlight_new_lines(start_offset, &sanitized);
@@ -281,5 +332,28 @@ impl SessionTab {
 
     pub fn clear_text(&self) {
         self.buffer.set_text("");
+    }
+
+    /// The full scrollback text, e.g. for exporting to a file.
+    pub fn full_text(&self) -> String {
+        self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true).to_string()
+    }
+
+    fn update_stats_label(&self) {
+        self.stats_label.set_text(&format!(
+            "\u{2191}{} \u{2193}{}",
+            format_bytes(self.bytes_sent.get()),
+            format_bytes(self.bytes_received.get())
+        ));
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }

@@ -18,6 +18,7 @@ pub fn show(ui: &Rc<Ui>) {
 
     let current = ui.state.config.borrow().ui.clone();
     let current_hl = ui.state.config.borrow().highlighting.clone();
+    let current_mailbox_enabled = ui.state.config.borrow().mailbox.enabled;
 
     let font_entry = gtk::Entry::builder()
         .placeholder_text("Monospace 11")
@@ -49,6 +50,16 @@ pub fn show(ui: &Rc<Ui>) {
 
     let history_lines_entry = gtk::Entry::builder().text(current.history_lines.to_string()).build();
     content.append(&labeled("History Lines", &history_lines_entry));
+
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let mailbox_heading = gtk::Label::new(Some("Personal Mailbox"));
+    mailbox_heading.add_css_class("heading");
+    mailbox_heading.set_halign(gtk::Align::Start);
+    content.append(&mailbox_heading);
+
+    let mailbox_enabled_check = gtk::CheckButton::with_label("Answer unsolicited connections as a mailbox (BBS-style, local only)");
+    mailbox_enabled_check.set_active(current_mailbox_enabled);
+    content.append(&mailbox_enabled_check);
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let hl_heading = gtk::Label::new(Some("Highlighting"));
@@ -147,6 +158,8 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.highlighting.known_callsign_color = rgba_to_hex(&known_color_btn.rgba());
                 cfg.highlighting.ax25_command_color = rgba_to_hex(&ax25_color_btn.rgba());
                 cfg.highlighting.rules = rules.borrow().clone();
+
+                cfg.mailbox.enabled = mailbox_enabled_check.is_active();
             }
             // Credentials may have changed; force a fresh login next lookup.
             *ui.state.qrz_session.borrow_mut() = None;

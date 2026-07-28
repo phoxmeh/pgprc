@@ -3,7 +3,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::object::IsA;
 
-use pr_core::{AgwpeLogin, AppConfig, PortConfig, PortEntry};
+use pr_core::{AgwpeLogin, AppConfig, KissParams, PortConfig, PortEntry};
 
 use crate::window::Ui;
 
@@ -206,20 +206,36 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let kt_host = gtk::Entry::builder().placeholder_text("host").text("127.0.0.1").build();
     let kt_port = gtk::Entry::builder().placeholder_text("port").text("8001").build();
     let kt_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
+    let kt_tx_delay = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kt_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kt_slot_time = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kt_full_duplex = gtk::CheckButton::with_label("Force full duplex");
     let kt_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     kt_box.append(&labeled("Host", &kt_host));
     kt_box.append(&labeled("Port", &kt_port));
     kt_box.append(&labeled("My Callsign", &kt_my_call));
+    kt_box.append(&labeled("TXDELAY (x10ms)", &kt_tx_delay));
+    kt_box.append(&labeled("Persistence", &kt_persistence));
+    kt_box.append(&labeled("Slot Time (x10ms)", &kt_slot_time));
+    kt_box.append(&kt_full_duplex);
     stack.add_named(&kt_box, Some("KISS (TCP)"));
 
     // KISS (Serial)
     let ks_device = gtk::Entry::builder().placeholder_text("/dev/ttyUSB0").build();
     let ks_baud = gtk::Entry::builder().placeholder_text("baud").text("9600").build();
     let ks_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
+    let ks_tx_delay = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let ks_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let ks_slot_time = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let ks_full_duplex = gtk::CheckButton::with_label("Force full duplex");
     let ks_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     ks_box.append(&labeled("Device", &ks_device));
     ks_box.append(&labeled("Baud", &ks_baud));
     ks_box.append(&labeled("My Callsign", &ks_my_call));
+    ks_box.append(&labeled("TXDELAY (x10ms)", &ks_tx_delay));
+    ks_box.append(&labeled("Persistence", &ks_persistence));
+    ks_box.append(&labeled("Slot Time (x10ms)", &ks_slot_time));
+    ks_box.append(&ks_full_duplex);
     stack.add_named(&ks_box, Some("KISS (Serial)"));
 
     if existing.is_none() {
@@ -271,15 +287,17 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
             PortConfig::Ax25RawSocket { device } => {
                 ax25_device.set_text(device);
             }
-            PortConfig::KissTcp { host, port, my_call } => {
+            PortConfig::KissTcp { host, port, my_call, kiss_params } => {
                 kt_host.set_text(host);
                 kt_port.set_text(&port.to_string());
                 kt_my_call.set_text(my_call);
+                load_kiss_params(kiss_params, &kt_tx_delay, &kt_persistence, &kt_slot_time, &kt_full_duplex);
             }
-            PortConfig::KissSerial { device, baud, my_call } => {
+            PortConfig::KissSerial { device, baud, my_call, kiss_params } => {
                 ks_device.set_text(device);
                 ks_baud.set_text(&baud.to_string());
                 ks_my_call.set_text(my_call);
+                load_kiss_params(kiss_params, &ks_tx_delay, &ks_persistence, &ks_slot_time, &ks_full_duplex);
             }
         }
     }
@@ -383,10 +401,18 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                             return;
                         }
                     };
+                    let kiss_params = match parse_kiss_params(&kt_tx_delay, &kt_persistence, &kt_slot_time, &kt_full_duplex) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
                     PortConfig::KissTcp {
                         host: kt_host.text().to_string(),
                         port,
                         my_call: kt_my_call.text().to_string(),
+                        kiss_params,
                     }
                 }
                 _ => {
@@ -397,10 +423,18 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                             return;
                         }
                     };
+                    let kiss_params = match parse_kiss_params(&ks_tx_delay, &ks_persistence, &ks_slot_time, &ks_full_duplex) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
                     PortConfig::KissSerial {
                         device: ks_device.text().to_string(),
                         baud,
                         my_call: ks_my_call.text().to_string(),
+                        kiss_params,
                     }
                 }
             };
@@ -507,6 +541,47 @@ pub fn show_send_unproto(ui: &Rc<Ui>) {
     root.append(&button_row);
 
     win.present();
+}
+
+/// Populate a KISS parameter form (three optional-number entries + a
+/// force-full-duplex checkbox) from a loaded `KissParams` — `None` fields
+/// are left as their "TNC default" placeholder, i.e. blank.
+fn load_kiss_params(params: &KissParams, tx_delay: &gtk::Entry, persistence: &gtk::Entry, slot_time: &gtk::Entry, full_duplex: &gtk::CheckButton) {
+    if let Some(v) = params.tx_delay {
+        tx_delay.set_text(&v.to_string());
+    }
+    if let Some(v) = params.persistence {
+        persistence.set_text(&v.to_string());
+    }
+    if let Some(v) = params.slot_time {
+        slot_time.set_text(&v.to_string());
+    }
+    // Only "on" is representable via a single checkbox; explicitly forcing
+    // half-duplex is rare enough not to need its own control here.
+    full_duplex.set_active(params.full_duplex == Some(true));
+}
+
+/// Parse a KISS parameter form back into a `KissParams`, blank = `None`.
+fn parse_kiss_params(
+    tx_delay: &gtk::Entry,
+    persistence: &gtk::Entry,
+    slot_time: &gtk::Entry,
+    full_duplex: &gtk::CheckButton,
+) -> Result<KissParams, String> {
+    let parse_optional_u8 = |entry: &gtk::Entry, field: &str| -> Result<Option<u8>, String> {
+        let text = entry.text();
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.parse::<u8>().map(Some).map_err(|_| format!("{field} must be a number 0-255."))
+    };
+    Ok(KissParams {
+        tx_delay: parse_optional_u8(tx_delay, "TXDELAY")?,
+        persistence: parse_optional_u8(persistence, "Persistence")?,
+        slot_time: parse_optional_u8(slot_time, "Slot Time")?,
+        full_duplex: if full_duplex.is_active() { Some(true) } else { None },
+    })
 }
 
 pub(crate) fn labeled(text: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {

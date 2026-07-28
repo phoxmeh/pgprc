@@ -44,7 +44,7 @@ fn main() {
     };
 
     println!("connecting to {}\u{2026}", args[0]);
-    let handle = spawn_port(KissRunner { transport, my_call: my_call.clone() });
+    let handle = spawn_port(KissRunner { transport, my_call: my_call.clone(), params: Default::default() });
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut connected = false;

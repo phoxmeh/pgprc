@@ -276,10 +276,11 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
         }
         'U' | 'S' | 'I' | 'T' => {
             let text = text_from_bytes(&frame.data);
+            let pid_suffix = pr_ax25::pid_label(frame.pid).map(|l| format!(" [PID: {l}]")).unwrap_or_default();
             emit_heard(events, &frame.call_from)?;
             events
                 .send_blocking(PortEvent::Monitor {
-                    line: format!("{} > {} [{kind}]: {text}", frame.call_from, frame.call_to),
+                    line: format!("{} > {} [{kind}]{pid_suffix}: {text}", frame.call_from, frame.call_to),
                 })
                 .map_err(|_| ())?;
         }

@@ -10,11 +10,31 @@ pub const FESC: u8 = 0xDB;
 pub const TFEND: u8 = 0xDC;
 pub const TFESC: u8 = 0xDD;
 
+/// KISS command-frame types (the low nibble of the command byte) for the TNC
+/// parameter frames — everything besides plain data (type 0).
+pub const CMD_TX_DELAY: u8 = 1;
+pub const CMD_PERSISTENCE: u8 = 2;
+pub const CMD_SLOT_TIME: u8 = 3;
+pub const CMD_TX_TAIL: u8 = 4;
+pub const CMD_FULL_DUPLEX: u8 = 5;
+
 /// Encode a single data frame for the given KISS port (0-15).
 pub fn encode_data_frame(kiss_port: u8, payload: &[u8]) -> Vec<u8> {
+    encode_frame(kiss_port, 0, payload)
+}
+
+/// Encode a single-byte TNC parameter frame (TXDELAY/persistence/slot time/
+/// TX tail/full duplex — KISS command types 1-5), e.g.
+/// `encode_param_frame(0, CMD_TX_DELAY, 30)` for a 300ms TXDELAY (units of
+/// 10ms, per the KISS spec).
+pub fn encode_param_frame(kiss_port: u8, kind: u8, value: u8) -> Vec<u8> {
+    encode_frame(kiss_port, kind, &[value])
+}
+
+fn encode_frame(kiss_port: u8, frame_type: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 8);
     out.push(FEND);
-    out.push((kiss_port & 0x0F) << 4); // low nibble 0 = data frame
+    out.push(((kiss_port & 0x0F) << 4) | (frame_type & 0x0F));
     for &b in payload {
         match b {
             FEND => {
@@ -109,6 +129,12 @@ mod tests {
         let mut decoder = KissDecoder::new();
         let frames = decoder.feed(&[FEND, FEND, FEND, 0x00, b'h', b'i', FEND]);
         assert_eq!(frames, vec![(0x00, b"hi".to_vec())]);
+    }
+
+    #[test]
+    fn param_frame_encodes_port_in_high_nibble_and_kind_in_low_nibble() {
+        let encoded = encode_param_frame(2, CMD_TX_DELAY, 30);
+        assert_eq!(encoded, [FEND, (2 << 4) | CMD_TX_DELAY, 30, FEND]);
     }
 
     #[test]

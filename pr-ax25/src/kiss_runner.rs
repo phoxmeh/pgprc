@@ -20,13 +20,16 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use ax25::frame::{Address, Ax25Frame, FrameContent, RouteEntry};
+use ax25::frame::{Address, Ax25Frame, FrameContent, ProtocolIdentifier, RouteEntry};
 
-use pr_core::{PortCommand, PortEvent, PortRunner};
+use pr_core::{KissParams, PortCommand, PortEvent, PortRunner};
 
-use crate::kiss::{encode_data_frame, KissDecoder};
+use crate::kiss::{encode_data_frame, encode_param_frame, KissDecoder, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_SLOT_TIME, CMD_TX_DELAY};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(300);
+/// Every KISS frame we send/receive uses this port; Direwolf's/most TNCs'
+/// raw KISS servers are single-channel, so there's nothing to configure here.
+const KISS_PORT: u8 = 0;
 
 pub enum KissTransport {
     Tcp { host: String, port: u16 },
@@ -36,21 +39,49 @@ pub enum KissTransport {
 pub struct KissRunner {
     pub transport: KissTransport,
     pub my_call: String,
+    pub params: KissParams,
 }
 
 impl PortRunner for KissRunner {
     fn run(self: Box<Self>, cmd_rx: mpsc::Receiver<PortCommand>, event_tx: async_channel::Sender<PortEvent>) {
-        let KissRunner { transport, my_call } = *self;
+        let KissRunner { transport, my_call, params } = *self;
         match transport {
-            KissTransport::Tcp { host, port } => run_tcp(&host, port, &my_call, cmd_rx, event_tx),
-            KissTransport::Serial { device, baud } => run_serial(&device, baud, &my_call, cmd_rx, event_tx),
+            KissTransport::Tcp { host, port } => run_tcp(&host, port, &my_call, &params, cmd_rx, event_tx),
+            KissTransport::Serial { device, baud } => run_serial(&device, baud, &my_call, &params, cmd_rx, event_tx),
         }
     }
 }
 
-fn run_tcp(host: &str, port: u16, my_call: &str, cmd_rx: mpsc::Receiver<PortCommand>, event_tx: async_channel::Sender<PortEvent>) {
+/// Send any configured TNC transmit parameters as KISS command frames
+/// (TXDELAY/persistence/slot time/full duplex — command types 1/2/3/5).
+/// `None` fields are left alone, so a config with no `KissParams` set sends
+/// nothing and behaves exactly as before this feature existed.
+fn send_kiss_params(writer: &mut impl Write, params: &KissParams) -> std::io::Result<()> {
+    if let Some(v) = params.tx_delay {
+        writer.write_all(&encode_param_frame(KISS_PORT, CMD_TX_DELAY, v))?;
+    }
+    if let Some(v) = params.persistence {
+        writer.write_all(&encode_param_frame(KISS_PORT, CMD_PERSISTENCE, v))?;
+    }
+    if let Some(v) = params.slot_time {
+        writer.write_all(&encode_param_frame(KISS_PORT, CMD_SLOT_TIME, v))?;
+    }
+    if let Some(v) = params.full_duplex {
+        writer.write_all(&encode_param_frame(KISS_PORT, CMD_FULL_DUPLEX, v as u8))?;
+    }
+    Ok(())
+}
+
+fn run_tcp(
+    host: &str,
+    port: u16,
+    my_call: &str,
+    params: &KissParams,
+    cmd_rx: mpsc::Receiver<PortCommand>,
+    event_tx: async_channel::Sender<PortEvent>,
+) {
     let addr = format!("{host}:{port}");
-    let stream = match TcpStream::connect(&addr) {
+    let mut stream = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(e) => {
             let _ = event_tx.send_blocking(PortEvent::PortError {
@@ -60,6 +91,9 @@ fn run_tcp(host: &str, port: u16, my_call: &str, cmd_rx: mpsc::Receiver<PortComm
         }
     };
     let _ = event_tx.send_blocking(PortEvent::PortConnected);
+    if let Err(e) = send_kiss_params(&mut stream, params) {
+        let _ = event_tx.send_blocking(PortEvent::PortError { message: format!("send TNC params: {e}") });
+    }
 
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -86,8 +120,15 @@ fn run_tcp(host: &str, port: u16, my_call: &str, cmd_rx: mpsc::Receiver<PortComm
     let _ = reader_handle.join();
 }
 
-fn run_serial(device: &str, baud: u32, my_call: &str, cmd_rx: mpsc::Receiver<PortCommand>, event_tx: async_channel::Sender<PortEvent>) {
-    let port = match serialport::new(device, baud).timeout(READ_TIMEOUT).open() {
+fn run_serial(
+    device: &str,
+    baud: u32,
+    my_call: &str,
+    params: &KissParams,
+    cmd_rx: mpsc::Receiver<PortCommand>,
+    event_tx: async_channel::Sender<PortEvent>,
+) {
+    let mut port = match serialport::new(device, baud).timeout(READ_TIMEOUT).open() {
         Ok(p) => p,
         Err(e) => {
             let _ = event_tx.send_blocking(PortEvent::PortError { message: format!("open {device}: {e}") });
@@ -95,6 +136,9 @@ fn run_serial(device: &str, baud: u32, my_call: &str, cmd_rx: mpsc::Receiver<Por
         }
     };
     let _ = event_tx.send_blocking(PortEvent::PortConnected);
+    if let Err(e) = send_kiss_params(&mut port, params) {
+        let _ = event_tx.send_blocking(PortEvent::PortError { message: format!("send TNC params: {e}") });
+    }
 
     let reader_port = match port.try_clone() {
         Ok(p) => p,
@@ -132,7 +176,7 @@ fn command_loop(writer: &mut impl Write, my_call: &str, cmd_rx: &mpsc::Receiver<
                 let text = String::from_utf8_lossy(&bytes).replace('\0', "");
                 match build_ui_frame(my_call, &dest, &via, bytes) {
                     Ok(frame) => {
-                        let kiss_bytes = encode_data_frame(0, &frame.to_bytes());
+                        let kiss_bytes = encode_data_frame(KISS_PORT, &frame.to_bytes());
                         if writer.write_all(&kiss_bytes).is_err() {
                             break;
                         }
@@ -198,11 +242,13 @@ fn describe_frame(frame: &Ax25Frame) -> String {
     match &frame.content {
         FrameContent::Information(i) => {
             let text = String::from_utf8_lossy(&i.info).replace('\0', "");
-            format!("{from} > {to} [I N(S)={} N(R)={}]: {text}", i.send_sequence, i.receive_sequence)
+            let pid_suffix = pid_suffix(&i.pid);
+            format!("{from} > {to} [I N(S)={} N(R)={}]{pid_suffix}: {text}", i.send_sequence, i.receive_sequence)
         }
         FrameContent::UnnumberedInformation(ui) => {
             let text = String::from_utf8_lossy(&ui.info).replace('\0', "");
-            format!("{from} > {to} [UI]: {text}")
+            let pid_suffix = pid_suffix(&ui.pid);
+            format!("{from} > {to} [UI]{pid_suffix}: {text}")
         }
         FrameContent::ReceiveReady(rr) => format!("{from} > {to} [RR N(R)={}]", rr.receive_sequence),
         FrameContent::ReceiveNotReady(rnr) => format!("{from} > {to} [RNR N(R)={}]", rnr.receive_sequence),
@@ -214,6 +260,33 @@ fn describe_frame(frame: &Ax25Frame) -> String {
         FrameContent::FrameReject(_) => format!("{from} > {to} [FRMR]"),
         FrameContent::UnknownContent(_) => format!("{from} > {to} [?]"),
     }
+}
+
+/// `" [PID: ...]"` when the frame carries something other than plain text
+/// (0xF0, "no layer 3"), else empty — pure decode/labeling, matching
+/// `pr_ax25::pid_label`'s byte-based labels (the `ax25` crate's own
+/// `ProtocolIdentifier -> byte` conversion is private, so this matches the
+/// enum variants directly instead of round-tripping through a byte).
+fn pid_suffix(pid: &ProtocolIdentifier) -> String {
+    let label = match pid {
+        ProtocolIdentifier::None => return String::new(),
+        ProtocolIdentifier::X25Plp => "X.25 PLP",
+        ProtocolIdentifier::CompressedTcpIp => "Compressed TCP/IP",
+        ProtocolIdentifier::UncompressedTcpIp => "Uncompressed TCP/IP",
+        ProtocolIdentifier::SegmentationFragment => "Segmentation Fragment",
+        ProtocolIdentifier::TexnetDatagram => "TEXNET",
+        ProtocolIdentifier::LinkQuality => "Link Quality",
+        ProtocolIdentifier::Appletalk => "Appletalk",
+        ProtocolIdentifier::AppletalkArp => "Appletalk ARP",
+        ProtocolIdentifier::ArpaIp => "ARPA IP",
+        ProtocolIdentifier::ArpaAddress => "ARPA ARP",
+        ProtocolIdentifier::Flexnet => "FlexNet",
+        ProtocolIdentifier::NetRom => "NET/ROM",
+        ProtocolIdentifier::Layer3Impl => "Layer 3",
+        ProtocolIdentifier::Escape => "Escape",
+        ProtocolIdentifier::Unknown(_) => return String::new(),
+    };
+    format!(" [PID: {label}]")
 }
 
 fn build_ui_frame(my_call: &str, dest: &str, via: &[String], info: Vec<u8>) -> Result<Ax25Frame, String> {

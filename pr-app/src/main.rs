@@ -1,6 +1,11 @@
 mod address_book_dialog;
+mod adif;
 mod app_state;
+mod beacons_dialog;
+mod export;
 mod highlight;
+mod mailbox;
+mod mailbox_dialog;
 mod monitor_view;
 mod ports_dialog;
 mod preferences_dialog;

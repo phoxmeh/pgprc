@@ -44,13 +44,35 @@ pub enum PortConfig {
         host: String,
         port: u16,
         my_call: String,
+        #[serde(default)]
+        kiss_params: KissParams,
     },
     /// KISS TNC on a serial/USB port.
     KissSerial {
         device: String,
         baud: u32,
         my_call: String,
+        #[serde(default)]
+        kiss_params: KissParams,
     },
+}
+
+/// Optional TNC transmit parameters sent as KISS command frames right after
+/// connecting. `None` (the default for every field) means "leave the TNC's
+/// own default alone" — existing configs behave exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KissParams {
+    /// Units of 10ms, e.g. `30` = 300ms.
+    #[serde(default)]
+    pub tx_delay: Option<u8>,
+    /// 0-255, per the KISS spec's persistence algorithm.
+    #[serde(default)]
+    pub persistence: Option<u8>,
+    /// Units of 10ms.
+    #[serde(default)]
+    pub slot_time: Option<u8>,
+    #[serde(default)]
+    pub full_duplex: Option<bool>,
 }
 
 impl PortConfig {
@@ -123,6 +145,64 @@ pub struct NodeHistory {
     pub unproto: bool,
     #[serde(default)]
     pub lines: Vec<String>,
+}
+
+/// A message left in the personal packet mailbox, addressed to a callsign.
+/// Local store-and-forward only — not compatible with real Winlink/RMS
+/// network infrastructure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxMessage {
+    pub id: u64,
+    pub to: String,
+    pub from: String,
+    pub subject: String,
+    pub body: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub read: bool,
+}
+
+/// Personal packet mailbox preferences. Off by default: when enabled, any
+/// unsolicited incoming connection on a connect-capable port is answered
+/// automatically by a small BBS-style command prompt instead of waiting for
+/// a human to type back.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MailboxPrefs {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub messages: Vec<MailboxMessage>,
+}
+
+/// One real connected-mode QSO, logged for ADIF export. Distinct from the
+/// address book's "heard" tracking, which includes any monitored traffic,
+/// not just two-way contacts we actually opened/received a connection for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QsoLogEntry {
+    pub callsign: String,
+    pub port_id: String,
+    /// UTC-ish local timestamp, "YYYY-MM-DD HH:MM:SS" (matches
+    /// `AddressBookEntry.last_heard`'s formatting).
+    pub started: String,
+    #[serde(default)]
+    pub ended: Option<String>,
+}
+
+/// A beacon that fires automatically on an interval while its port is
+/// connected — the scheduled counterpart to the one-shot "Send Beacon"
+/// action, using the exact same unproto send path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Beacon {
+    pub id: String,
+    pub port_id: String,
+    pub dest: String,
+    /// Digipeater path, e.g. "WIDE1-1,WIDE2-1". Empty for a direct path.
+    #[serde(default)]
+    pub via: String,
+    pub message: String,
+    pub interval_secs: u32,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,10 +309,19 @@ pub struct UiPrefs {
     /// Max lines of scrollback kept per (port, node) in `NodeHistory`.
     #[serde(default = "default_history_lines")]
     pub history_lines: u32,
+    /// Max raw lines the Monitor view keeps around for re-rendering when the
+    /// filter changes. Separate from `history_lines` since the Monitor is a
+    /// single global stream, not per-node.
+    #[serde(default = "default_monitor_buffer_lines")]
+    pub monitor_buffer_lines: u32,
 }
 
 fn default_history_lines() -> u32 {
     1000
+}
+
+fn default_monitor_buffer_lines() -> u32 {
+    5000
 }
 
 fn default_true() -> bool {
@@ -249,6 +338,7 @@ impl Default for UiPrefs {
             qrz_username: None,
             qrz_password: None,
             history_lines: default_history_lines(),
+            monitor_buffer_lines: default_monitor_buffer_lines(),
         }
     }
 }
@@ -267,6 +357,12 @@ pub struct AppConfig {
     pub node_history: Vec<NodeHistory>,
     #[serde(default)]
     pub highlighting: HighlightPrefs,
+    #[serde(default)]
+    pub beacons: Vec<Beacon>,
+    #[serde(default)]
+    pub qso_log: Vec<QsoLogEntry>,
+    #[serde(default)]
+    pub mailbox: MailboxPrefs,
 }
 
 impl AppConfig {

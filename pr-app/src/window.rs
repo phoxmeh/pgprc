@@ -9,6 +9,8 @@ use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
 
 use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
+use crate::beacons_dialog;
+use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
 use crate::ports_dialog;
 use crate::preferences_dialog;
@@ -36,6 +38,9 @@ pub struct Ui {
     /// only ever have one connection to bind.
     pending: RefCell<HashMap<(String, String), TabId>>,
     next_tab_id: Cell<TabId>,
+    /// Scheduled beacon timers, keyed by `Beacon.id` — reset in full by
+    /// `reschedule_beacons` whenever the beacon list changes.
+    beacon_timers: RefCell<HashMap<String, glib::SourceId>>,
     pub window: adw::ApplicationWindow,
 }
 
@@ -77,6 +82,32 @@ impl Ui {
         }
     }
 
+    /// (Re)schedule every enabled beacon from the current config, discarding
+    /// any previously-scheduled timers first. Call this once at startup and
+    /// again whenever the beacon list is edited/saved.
+    pub fn reschedule_beacons(self: &Rc<Self>) {
+        for (_, source) in self.beacon_timers.borrow_mut().drain() {
+            source.remove();
+        }
+        for beacon in self.state.config.borrow().beacons.iter().filter(|b| b.enabled) {
+            let ui = self.clone();
+            let port_id = beacon.port_id.clone();
+            let dest = beacon.dest.clone();
+            let via: Vec<String> = beacon.via.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_uppercase).collect();
+            let message = beacon.message.clone();
+            let source = glib::source::timeout_add_seconds_local(beacon.interval_secs.max(1), move || {
+                // Skip silently if the port isn't up — matches the existing
+                // unproto-send behavior elsewhere, no need to spam the
+                // Monitor every interval while a port happens to be down.
+                if ui.state.is_active(&port_id) {
+                    ui.send_unproto(&port_id, dest.clone(), via.clone(), message.clone().into_bytes());
+                }
+                glib::ControlFlow::Continue
+            });
+            self.beacon_timers.borrow_mut().insert(beacon.id.clone(), source);
+        }
+    }
+
     /// Create a new, disconnected session tab — optionally prefilled — and
     /// return its id.
     pub fn add_tab(self: &Rc<Self>, prefill: Option<TabPrefill>) -> TabId {
@@ -110,6 +141,7 @@ impl Ui {
         let unproto_toggle = tab.unproto_toggle.clone();
         let connect_button = tab.connect_button.clone();
         let disconnect_button = tab.disconnect_button.clone();
+        let save_button = tab.save_button.clone();
         let input_entry = tab.input_entry.clone();
 
         self.tabs.borrow_mut().insert(tab_id, tab);
@@ -203,6 +235,15 @@ impl Ui {
         }
         {
             let ui = self.clone();
+            save_button.connect_clicked(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    let name = tab.tab_label.text().to_string().replace([':', ' ', '/'], "_");
+                    crate::export::save_text(&ui.window, &format!("{name}.txt"), tab.full_text());
+                }
+            });
+        }
+        {
+            let ui = self.clone();
             input_entry.connect_activate(move |entry| {
                 let text = entry.text().to_string();
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
@@ -285,6 +326,48 @@ impl Ui {
         tab.append_sent_line(text);
         let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
         self.monitor.append_line(&format!("[{port_name}] TX unproto > {dest}{via_suffix}: {text}"));
+    }
+
+    /// Send arbitrary text over a tab's live connection on the mailbox's
+    /// behalf — the same wire path `send_tab_connected` uses for a human's
+    /// typed line, but callable with pre-built (possibly multi-line) text.
+    fn send_tab_text(&self, tab: &SessionTab, port_id: &str, text: &str) {
+        if let Some(conn_id) = tab.conn_id.get() {
+            if let Some(handle) = self.state.active.borrow().get(port_id) {
+                let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes: text.as_bytes().to_vec() });
+            }
+        }
+        tab.append_sent_line(text);
+    }
+
+    /// Feed a chunk of received bytes to a mailbox-driven tab's command
+    /// parser, one completed line at a time, sending back whatever response
+    /// each line produces. No-op for tabs not currently mailbox-driven.
+    fn drive_mailbox(&self, tab: &SessionTab, port_id: &str, chunk: &str) {
+        if tab.mailbox_state.borrow().is_none() {
+            return;
+        }
+        let remote_call = tab.node_entry.text().trim().to_uppercase();
+        for line in tab.take_mailbox_lines(chunk) {
+            let mut state_slot = tab.mailbox_state.borrow_mut();
+            let Some(state) = state_slot.as_mut() else { break };
+            let mut cfg = self.state.config.borrow_mut();
+            let timestamp = crate::app_state::now_timestamp();
+            let (response, close) = crate::mailbox::handle_line(state, &mut cfg.mailbox.messages, &remote_call, &line, &timestamp);
+            drop(cfg);
+            drop(state_slot);
+            self.state.save_config();
+            if !response.is_empty() {
+                self.send_tab_text(tab, port_id, &response);
+            }
+            if close {
+                *tab.mailbox_state.borrow_mut() = None;
+                if let (Some(conn_id), Some(handle)) = (tab.conn_id.get(), self.state.active.borrow().get(port_id)) {
+                    let _ = handle.cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
+                }
+                break;
+            }
+        }
     }
 
     /// Connect the tab's selected port (if not already active) and, for
@@ -495,7 +578,9 @@ impl Ui {
                 let pending_key =
                     if needs_node { (port_id.to_string(), label.clone()) } else { (port_id.to_string(), String::new()) };
 
-                let tab_id = self.pending.borrow_mut().remove(&pending_key).unwrap_or_else(|| {
+                let existing_tab_id = self.pending.borrow_mut().remove(&pending_key);
+                let is_new_incoming = existing_tab_id.is_none();
+                let tab_id = existing_tab_id.unwrap_or_else(|| {
                     self.add_tab(Some(TabPrefill {
                         port_id: port_id.to_string(),
                         remote: label.clone(),
@@ -512,14 +597,32 @@ impl Ui {
                         tab.node_entry.set_text(&label);
                     }
                     self.update_tab_title(tab);
+
+                    // An unsolicited connect while the mailbox is enabled is
+                    // answered automatically instead of waiting for a human
+                    // to type back.
+                    if needs_node && is_new_incoming && self.state.config.borrow().mailbox.enabled {
+                        *tab.mailbox_state.borrow_mut() = Some(crate::mailbox::MailboxState::Command);
+                        let my_call = self.state.config.borrow().ui.default_call.clone().unwrap_or_else(|| "MAILBOX".to_string());
+                        self.send_tab_text(tab, port_id, &crate::mailbox::welcome_banner(&my_call));
+                    }
+                }
+                if needs_node {
+                    self.state.log_qso_started(port_id, &label);
                 }
             }
             PortEvent::ConnectionClosed { id } => {
                 if let Some(tab_id) = self.bound.borrow_mut().remove(&(port_id.to_string(), id)) {
                     if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                        let is_connect_port =
+                            find_entry(&self.state.config.borrow(), port_id).map(|e| port_supports_connect(&e.config)).unwrap_or(false);
+                        if is_connect_port {
+                            self.state.log_qso_ended(port_id, &tab.node_entry.text());
+                        }
                         tab.conn_id.set(None);
                         tab.set_connected(false);
                         tab.flush_pending();
+                        *tab.mailbox_state.borrow_mut() = None;
                     }
                 }
             }
@@ -532,6 +635,7 @@ impl Ui {
                     if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                         let text = String::from_utf8_lossy(&bytes).replace('\0', "");
                         tab.receive_data(&text);
+                        self.drive_mailbox(tab, port_id, &text);
                     }
                 }
             }
@@ -623,7 +727,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
-        .start_child(&monitor.widget)
+        .start_child(&monitor.container)
         .end_child(&notebook)
         .resize_start_child(true)
         .resize_end_child(true)
@@ -632,7 +736,7 @@ pub fn build_ui(app: &adw::Application) {
         .position(220)
         .build();
     paned.set_visible(true);
-    monitor.widget.set_visible(show_monitor);
+    monitor.container.set_visible(show_monitor);
 
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -645,8 +749,17 @@ pub fn build_ui(app: &adw::Application) {
         bound: RefCell::new(HashMap::new()),
         pending: RefCell::new(HashMap::new()),
         next_tab_id: Cell::new(0),
+        beacon_timers: RefCell::new(HashMap::new()),
         window: window.clone(),
     });
+
+    {
+        let ui = ui.clone();
+        let filter_entry = ui.monitor.filter_entry.clone();
+        filter_entry.connect_changed(move |entry| {
+            ui.monitor.set_filter(&entry.text());
+        });
+    }
 
     // "Ports\u{2026}" button opens the Port Manager.
     let ports_button = gtk::Button::with_label("Ports\u{2026}");
@@ -680,6 +793,26 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&beacon_button);
 
+    // "Beacons\u{2026}" manages scheduled/periodic beacons.
+    let beacons_button = gtk::Button::with_label("Beacons\u{2026}");
+    {
+        let ui = ui.clone();
+        beacons_button.connect_clicked(move |_| {
+            beacons_dialog::show(&ui);
+        });
+    }
+    header.pack_start(&beacons_button);
+
+    // "Mailbox\u{2026}" lists stored personal-mailbox messages.
+    let mailbox_button = gtk::Button::with_label("Mailbox\u{2026}");
+    {
+        let ui = ui.clone();
+        mailbox_button.connect_clicked(move |_| {
+            mailbox_dialog::show(&ui);
+        });
+    }
+    header.pack_start(&mailbox_button);
+
     // "Address Book\u{2026}" lists stations heard automatically plus manual entries.
     let address_book_button = gtk::Button::with_label("Address Book\u{2026}");
     {
@@ -700,11 +833,21 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&prefs_button);
 
+    // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered) view.
+    let save_monitor_button = gtk::Button::with_label("Save Monitor Log\u{2026}");
+    {
+        let ui = ui.clone();
+        save_monitor_button.connect_clicked(move |_| {
+            crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text());
+        });
+    }
+    header.pack_start(&save_monitor_button);
+
     let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
     {
         let ui = ui.clone();
         monitor_toggle.connect_toggled(move |btn| {
-            ui.monitor.widget.set_visible(btn.is_active());
+            ui.monitor.container.set_visible(btn.is_active());
             ui.state.config.borrow_mut().ui.show_monitor = btn.is_active();
             ui.state.save_config();
         });
@@ -726,4 +869,6 @@ pub fn build_ui(app: &adw::Application) {
     for id in autoconnect_ids {
         ui.connect_port(&id);
     }
+
+    ui.reschedule_beacons();
 }

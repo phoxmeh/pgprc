@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 pr-core.workspace = true
+pr-ax25.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-channel.workspace = true

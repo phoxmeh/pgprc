@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,8 +14,8 @@ use crate::raw_socket::{read_axports, RawAx25Socket};
 /// entry was attached to via `kissattach`/`ax25rtd`).
 ///
 /// Each outgoing connection opens its own `SOCK_SEQPACKET` socket bound to
-/// that local callsign — incoming (listen/accept) connections are future
-/// work, not implemented in this pass.
+/// that local callsign. A separate listening socket (best-effort — see
+/// `run`) accepts incoming connections too, e.g. for the personal mailbox.
 pub struct Ax25RawSocketRunner {
     pub device: String,
 }
@@ -31,14 +32,29 @@ impl PortRunner for Ax25RawSocketRunner {
         let _ = event_tx.send_blocking(PortEvent::PortConnected);
 
         let sockets: Arc<Mutex<HashMap<ConnectionId, RawAx25Socket>>> = Arc::new(Mutex::new(HashMap::new()));
-        let mut next_id: u64 = 1;
+        let next_id = Arc::new(AtomicU64::new(1));
         let mut readers = Vec::new();
+
+        // Best-effort: not every axports/kernel setup necessarily allows a
+        // separate listening bind alongside outgoing sockets on the same
+        // callsign, so a failure here just means incoming connections
+        // aren't available on this port, not a fatal port error.
+        let accept_handle = RawAx25Socket::bind(&local_call).ok().and_then(|listener| {
+            listener.listen(4).ok()?;
+            let listener_shutdown = listener.try_clone().ok()?;
+            let accept_events = event_tx.clone();
+            let accept_sockets = sockets.clone();
+            let accept_next_id = next_id.clone();
+            let handle = thread::spawn(move || {
+                accept_loop(listener, &accept_events, &accept_sockets, &accept_next_id);
+            });
+            Some((handle, listener_shutdown))
+        });
 
         loop {
             match cmd_rx.recv() {
                 Ok(PortCommand::OpenConnection { remote, via }) => {
-                    let id = next_id;
-                    next_id += 1;
+                    let id = next_id.fetch_add(1, Ordering::SeqCst);
                     let _ = event_tx.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
                     let _ = event_tx.send_blocking(PortEvent::ConnectionOpened {
                         id,
@@ -104,6 +120,10 @@ impl PortRunner for Ax25RawSocketRunner {
         for socket in sockets.lock().unwrap().values() {
             socket.shutdown();
         }
+        if let Some((handle, listener_shutdown)) = accept_handle {
+            listener_shutdown.shutdown();
+            let _ = handle.join();
+        }
         let _ = event_tx.send_blocking(PortEvent::PortDisconnected { reason: None });
         for reader in readers {
             let _ = reader.join();
@@ -124,6 +144,36 @@ fn open_connection(local_call: &str, remote_call: &str, via: &[String]) -> Resul
     let socket = RawAx25Socket::bind(local_call)?;
     socket.connect(remote_call, via)?;
     Ok(socket)
+}
+
+/// Accepts incoming connections until the listening socket is shut down
+/// (from the main loop, on port disconnect) or errors out.
+fn accept_loop(
+    listener: RawAx25Socket,
+    events: &async_channel::Sender<PortEvent>,
+    sockets: &Arc<Mutex<HashMap<ConnectionId, RawAx25Socket>>>,
+    next_id: &Arc<AtomicU64>,
+) {
+    loop {
+        let (socket, remote) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+        let _ = events.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
+        let _ = events.send_blocking(PortEvent::ConnectionOpened { id, label: remote });
+        let _ = events.send_blocking(PortEvent::ConnState { id, state: ConnState::Connected });
+        let reader_socket = match socket.try_clone() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        sockets.lock().unwrap().insert(id, socket);
+        let reader_events = events.clone();
+        let reader_sockets = sockets.clone();
+        thread::spawn(move || {
+            connection_read_loop(id, reader_socket, reader_events, reader_sockets);
+        });
+    }
 }
 
 fn connection_read_loop(

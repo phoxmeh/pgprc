@@ -167,6 +167,33 @@ impl RawAx25Socket {
         Ok(())
     }
 
+    /// Mark this (bound) socket as a listener for incoming connections —
+    /// used for the personal mailbox, so other stations can connect to us
+    /// instead of only ever the other way around.
+    pub fn listen(&self, backlog: i32) -> Result<(), Ax25Error> {
+        let ret = unsafe { libc::listen(self.fd.as_raw_fd(), backlog) };
+        if ret < 0 {
+            return Err(Ax25Error::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Block until a station connects to this listening socket, returning a
+    /// fresh socket for that session plus the remote station's callsign.
+    pub fn accept(&self) -> Result<(RawAx25Socket, String), Ax25Error> {
+        let mut addr: FullSockaddrAx25 = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<FullSockaddrAx25>() as libc::socklen_t;
+        let raw = unsafe {
+            libc::accept(self.fd.as_raw_fd(), &mut addr as *mut FullSockaddrAx25 as *mut libc::sockaddr, &mut len)
+        };
+        if raw < 0 {
+            return Err(Ax25Error::Io(io::Error::last_os_error()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let remote = decode_callsign(&addr.fsa_ax25.sax25_call);
+        Ok((RawAx25Socket { fd }, remote))
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {

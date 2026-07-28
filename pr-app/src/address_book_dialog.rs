@@ -26,6 +26,8 @@ pub fn show(ui: &Rc<Ui>) {
 
     rebuild_list(ui, &list_box);
 
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
     let add_button = gtk::Button::with_label("Add Entry\u{2026}");
     {
         let ui = ui.clone();
@@ -35,7 +37,21 @@ pub fn show(ui: &Rc<Ui>) {
             edit_entry_dialog(&ui, &win, None, &list_box);
         });
     }
-    root.append(&add_button);
+    button_row.append(&add_button);
+
+    // "Export ADIF..." exports real connected-mode QSOs (`AppConfig.qso_log`)
+    // — distinct from this list, which includes any monitored traffic.
+    let export_button = gtk::Button::with_label("Export ADIF\u{2026}");
+    {
+        let ui = ui.clone();
+        export_button.connect_clicked(move |_| {
+            let adif = crate::adif::format_adif(&ui.state.config.borrow().qso_log);
+            crate::export::save_text(&ui.window, "log.adi", adif);
+        });
+    }
+    button_row.append(&export_button);
+
+    root.append(&button_row);
 
     win.present();
 }
