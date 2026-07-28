@@ -78,21 +78,68 @@ fn rebuild_list(ui: &Rc<Ui>, list_box: &gtk::ListBox) {
         list_box.remove(&child);
     }
     let entries: Vec<PortEntry> = ui.state.config.borrow().ports.clone();
-    for entry in entries {
-        list_box.append(&build_port_row(ui, entry, list_box));
+    let count = entries.len();
+    for (idx, entry) in entries.into_iter().enumerate() {
+        list_box.append(&build_port_row(ui, entry, idx, count, list_box));
     }
 }
 
-fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, list_box: &gtk::ListBox) -> gtk::Widget {
+/// Swap the port at `id` with its neighbor in the given direction (-1 = up,
+/// +1 = down), if one exists. The port dropdown everywhere else in the app
+/// just iterates `AppConfig.ports` in order, so reordering here is all that's
+/// needed to reorder those dropdowns too.
+fn move_port(ui: &Rc<Ui>, id: &str, direction: isize) {
+    let mut cfg = ui.state.config.borrow_mut();
+    if let Some(idx) = cfg.ports.iter().position(|p| p.id == id) {
+        let new_idx = idx as isize + direction;
+        if new_idx >= 0 && (new_idx as usize) < cfg.ports.len() {
+            cfg.ports.swap(idx, new_idx as usize);
+        }
+    }
+    drop(cfg);
+    ui.state.save_config();
+}
+
+fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_box: &gtk::ListBox) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.set_margin_top(6);
     row.set_margin_bottom(6);
     row.set_margin_start(6);
     row.set_margin_end(6);
 
+    let reorder_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let up_button = gtk::Button::from_icon_name("go-up-symbolic");
+    up_button.add_css_class("flat");
+    up_button.set_sensitive(idx > 0);
+    {
+        let ui = ui.clone();
+        let id = entry.id.clone();
+        let list_box = list_box.clone();
+        up_button.connect_clicked(move |_| {
+            move_port(&ui, &id, -1);
+            rebuild_list(&ui, &list_box);
+        });
+    }
+    reorder_box.append(&up_button);
+    let down_button = gtk::Button::from_icon_name("go-down-symbolic");
+    down_button.add_css_class("flat");
+    down_button.set_sensitive(idx + 1 < count);
+    {
+        let ui = ui.clone();
+        let id = entry.id.clone();
+        let list_box = list_box.clone();
+        down_button.connect_clicked(move |_| {
+            move_port(&ui, &id, 1);
+            rebuild_list(&ui, &list_box);
+        });
+    }
+    reorder_box.append(&down_button);
+    row.append(&reorder_box);
+
     let label = gtk::Label::new(Some(&format!("{}  \u{2014}  {}", entry.name, entry.config.kind_label())));
     label.set_hexpand(true);
     label.set_halign(gtk::Align::Start);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     row.append(&label);
 
     let is_active = ui.state.is_active(&entry.id);

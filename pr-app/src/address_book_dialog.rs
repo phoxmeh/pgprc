@@ -84,36 +84,32 @@ fn build_entry_row(ui: &Rc<Ui>, entry: AddressBookEntry, list_box: &gtk::ListBox
     row.set_margin_start(6);
     row.set_margin_end(6);
 
+    // Kept deliberately compact: callsign + name/alias on one line, last-heard
+    // (or "manual entry") as a dim subtitle. Heard-count and location are
+    // still there in the edit dialog, just not cluttering the list view.
     let mut summary = entry.callsign.clone();
-    if let Some(alias) = &entry.alias {
-        if !alias.is_empty() {
-            summary.push_str(&format!(" \"{alias}\""));
-        }
+    let extra = entry.name.as_deref().filter(|s| !s.is_empty()).or(entry.alias.as_deref().filter(|s| !s.is_empty()));
+    if let Some(extra) = extra {
+        summary.push_str(&format!("  \u{2014}  {extra}"));
     }
-    if let Some(name) = &entry.name {
-        if !name.is_empty() {
-            summary.push_str(&format!("  \u{2014}  {name}"));
-        }
-    }
-    let mut detail = match &entry.last_heard {
-        Some(when) => format!("heard {} time(s), last: {when}", entry.heard_count),
-        None => "never heard \u{2014} manual entry".to_string(),
+    let detail = match &entry.last_heard {
+        Some(when) => format!("Last heard {when}"),
+        None => "Manual entry".to_string(),
     };
-    if let Some(loc) = &entry.location {
-        if !loc.is_empty() {
-            detail.push_str(&format!("  \u{b7}  {loc}"));
-        }
-    }
 
     let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let summary_label = gtk::Label::new(Some(&summary));
     summary_label.set_halign(gtk::Align::Start);
+    summary_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let detail_label = gtk::Label::new(Some(&detail));
     detail_label.set_halign(gtk::Align::Start);
+    detail_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     detail_label.add_css_class("dim-label");
+    detail_label.add_css_class("caption");
     text_box.append(&summary_label);
     text_box.append(&detail_label);
     text_box.set_hexpand(true);
+    text_box.set_valign(gtk::Align::Center);
     row.append(&text_box);
 
     let edit_button = gtk::Button::with_label("Edit\u{2026}");
@@ -325,63 +321,6 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
     button_row.append(&cancel_button);
     button_row.append(&save_button);
     root.append(&button_row);
-
-    win.present();
-}
-
-/// Open a small picker listing address book entries; selecting one writes
-/// its callsign into `target` and closes the picker.
-pub fn pick(ui: &Rc<Ui>, target: &gtk::Entry) {
-    let (win, root) = dialog_window(&ui.window, "Choose a Station", 420);
-    win.set_default_height(360);
-
-    let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
-    list_box.add_css_class("boxed-list");
-    let scrolled = gtk::ScrolledWindow::builder().child(&list_box).vexpand(true).min_content_height(220).build();
-    root.append(&scrolled);
-
-    let mut entries: Vec<AddressBookEntry> = ui.state.config.borrow().address_book.clone();
-    entries.sort_by(|a, b| a.callsign.cmp(&b.callsign));
-    if entries.is_empty() {
-        let label = gtk::Label::new(Some("No address book entries yet."));
-        label.set_margin_top(12);
-        label.set_margin_bottom(12);
-        list_box.append(&label);
-    }
-    for entry in entries {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.set_margin_top(6);
-        row.set_margin_bottom(6);
-        row.set_margin_start(6);
-        row.set_margin_end(6);
-
-        let mut summary = entry.callsign.clone();
-        if let Some(name) = &entry.name {
-            if !name.is_empty() {
-                summary.push_str(&format!("  \u{2014}  {name}"));
-            }
-        }
-        let label = gtk::Label::new(Some(&summary));
-        label.set_halign(gtk::Align::Start);
-        label.set_hexpand(true);
-        row.append(&label);
-
-        let use_button = gtk::Button::with_label("Use");
-        {
-            let ui = ui.clone();
-            let target = target.clone();
-            let win = win.clone();
-            let callsign = entry.callsign.clone();
-            use_button.connect_clicked(move |_| {
-                target.set_text(&callsign);
-                ui.refresh_tab_for_node_entry(&target);
-                win.close();
-            });
-        }
-        row.append(&use_button);
-
-        list_box.append(&row);
-    }
 
     win.present();
 }

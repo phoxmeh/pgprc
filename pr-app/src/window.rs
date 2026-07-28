@@ -30,6 +30,11 @@ pub struct Ui {
     pub state: Rc<AppState>,
     pub monitor: MonitorView,
     pub notebook: gtk::Notebook,
+    /// Swaps between the notebook and an empty-state placeholder with its
+    /// own "+ New Tab" button — GTK hides the notebook's entire tab strip
+    /// (and with it, the "+" action widget on the tab line) when it has zero
+    /// pages, so that's otherwise the *only* way to create the first tab.
+    notebook_stack: gtk::Stack,
     pub tabs: RefCell<HashMap<TabId, SessionTab>>,
     /// Live connection (port, id) -> the tab it's bound to.
     bound: RefCell<HashMap<(String, ConnectionId), TabId>>,
@@ -115,7 +120,8 @@ impl Ui {
         self.next_tab_id.set(tab_id + 1);
 
         let ports = self.state.config.borrow().ports.clone();
-        let tab = SessionTab::new(ports, self.state.clone());
+        let address_book = self.state.config.borrow().address_book.clone();
+        let tab = SessionTab::new(ports, address_book, self.state.clone());
 
         if let Some(prefill) = &prefill {
             if let Some(idx) = tab.available_ports.iter().position(|p| p.id == prefill.port_id) {
@@ -137,12 +143,14 @@ impl Ui {
         let port_dropdown = tab.port_dropdown.clone();
         let node_entry = tab.node_entry.clone();
         let via_entry = tab.via_entry.clone();
-        let address_book_button = tab.address_book_button.clone();
+        let address_book_dropdown = tab.address_book_dropdown.clone();
         let unproto_toggle = tab.unproto_toggle.clone();
         let connect_button = tab.connect_button.clone();
         let disconnect_button = tab.disconnect_button.clone();
         let save_button = tab.save_button.clone();
+        let clear_history_button = tab.clear_history_button.clone();
         let input_entry = tab.input_entry.clone();
+        let send_input_button = tab.send_input_button.clone();
 
         self.tabs.borrow_mut().insert(tab_id, tab);
         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
@@ -193,9 +201,14 @@ impl Ui {
         }
         {
             let ui = self.clone();
-            let node_entry = node_entry.clone();
-            address_book_button.connect_clicked(move |_| {
-                address_book_dialog::pick(&ui, &node_entry);
+            address_book_dropdown.connect_selected_notify(move |dropdown| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    if let Some(callsign) = tab.selected_address_book_call() {
+                        tab.node_entry.set_text(callsign);
+                        dropdown.set_selected(0);
+                        ui.refresh_tab_for_node_entry(&tab.node_entry);
+                    }
+                }
             });
         }
         {
@@ -244,16 +257,19 @@ impl Ui {
         }
         {
             let ui = self.clone();
+            clear_history_button.connect_clicked(move |_| {
+                ui.confirm_clear_history(tab_id);
+            });
+        }
+        {
+            let ui = self.clone();
+            let entry_for_button = input_entry.clone();
             input_entry.connect_activate(move |entry| {
-                let text = entry.text().to_string();
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    if tab.unproto_toggle.is_active() {
-                        ui.send_tab_unproto(tab, &text);
-                    } else {
-                        ui.send_tab_connected(tab, &text);
-                    }
-                }
-                entry.set_text("");
+                ui.activate_input(tab_id, entry);
+            });
+            let ui = self.clone();
+            send_input_button.connect_clicked(move |_| {
+                ui.activate_input(tab_id, &entry_for_button);
             });
         }
 
@@ -275,8 +291,61 @@ impl Ui {
         self.notebook.set_tab_reorderable(&root, true);
         let page_idx = self.notebook.page_num(&root);
         self.notebook.set_current_page(page_idx);
+        self.update_notebook_stack();
 
         tab_id
+    }
+
+    /// Show the notebook once it has at least one page, otherwise the
+    /// empty-state placeholder (see `notebook_stack`'s doc comment).
+    fn update_notebook_stack(&self) {
+        let name = if self.notebook.n_pages() == 0 { "empty" } else { "notebook" };
+        self.notebook_stack.set_visible_child_name(name);
+    }
+
+    /// Prompt to confirm, then permanently clear the persisted history *and*
+    /// the visible scrollback for whatever (port, node, mode) the tab is
+    /// currently showing.
+    fn confirm_clear_history(self: &Rc<Self>, tab_id: TabId) {
+        let Some((port_id, remote, unproto)) = self.tabs.borrow().get(&tab_id).and_then(|tab| tab.history_key())
+        else {
+            self.monitor.append_line("Nothing to clear \u{2014} select a port and node first.");
+            return;
+        };
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("Clear History?")
+            .body(format!("This permanently deletes the saved history for {remote}. This can't be undone."))
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("clear", "Clear");
+        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let ui = self.clone();
+        dialog.choose(&self.window, gtk::gio::Cancellable::NONE, move |response| {
+            if response == "clear" {
+                ui.state.clear_history(&port_id, &remote, unproto);
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    tab.clear_text();
+                }
+            }
+        });
+    }
+
+    /// Send whatever's currently in a tab's input entry — shared by both
+    /// pressing Enter and clicking the Send button next to it.
+    fn activate_input(self: &Rc<Self>, tab_id: TabId, entry: &gtk::Entry) {
+        let text = entry.text().to_string();
+        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+            if tab.unproto_toggle.is_active() {
+                self.send_tab_unproto(tab, &text);
+            } else {
+                self.send_tab_connected(tab, &text);
+            }
+        }
+        entry.set_text("");
     }
 
     /// Send the tab's connected-mode input over its live connection.
@@ -434,10 +503,11 @@ impl Ui {
                 self.notebook.remove_page(Some(page));
             }
         }
+        self.update_notebook_stack();
     }
 
     /// Called after something outside the tab's own signal handlers sets its
-    /// node text programmatically (the address-book picker) — the normal
+    /// node text programmatically (the address-book dropdown) — the normal
     /// `connect_changed`/focus-out wiring wouldn't otherwise fire for that.
     pub fn refresh_tab_for_node_entry(&self, node_entry: &gtk::Entry) {
         if let Some(tab) = self.tabs.borrow().values().find(|t| &t.node_entry == node_entry) {
@@ -483,6 +553,7 @@ impl Ui {
             tab.via_entry.set_sensitive(true);
             let active = tab.selected_port().map(|p| self.state.is_active(&p.id)).unwrap_or(false);
             tab.input_entry.set_sensitive(active);
+            tab.send_input_button.set_sensitive(active);
         } else {
             tab.set_connected(tab.conn_id.get().is_some());
         }
@@ -725,10 +796,34 @@ pub fn build_ui(app: &adw::Application) {
     monitor.set_show_timestamps(show_timestamps);
     let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).scrollable(true).build();
 
+    // GTK hides the notebook's entire tab strip (and the "+" action widget
+    // on it) when it has zero pages, so an empty state with its own
+    // "+ New Tab" button stands in until the first tab exists.
+    let empty_state = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    let empty_label = gtk::Label::new(Some("No tabs open"));
+    empty_label.add_css_class("dim-label");
+    empty_state.append(&empty_label);
+    let empty_new_tab_button = gtk::Button::with_label("+ New Tab");
+    empty_new_tab_button.add_css_class("pill");
+    empty_new_tab_button.add_css_class("suggested-action");
+    empty_state.append(&empty_new_tab_button);
+
+    let notebook_stack = gtk::Stack::new();
+    notebook_stack.add_named(&empty_state, Some("empty"));
+    notebook_stack.add_named(&notebook, Some("notebook"));
+    notebook_stack.set_visible_child_name("empty");
+
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
         .start_child(&monitor.container)
-        .end_child(&notebook)
+        .end_child(&notebook_stack)
         .resize_start_child(true)
         .resize_end_child(true)
         .shrink_start_child(false)
@@ -745,6 +840,7 @@ pub fn build_ui(app: &adw::Application) {
         state,
         monitor,
         notebook,
+        notebook_stack,
         tabs: RefCell::new(HashMap::new()),
         bound: RefCell::new(HashMap::new()),
         pending: RefCell::new(HashMap::new()),
@@ -761,26 +857,25 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
 
-    // "Ports\u{2026}" button opens the Port Manager.
-    let ports_button = gtk::Button::with_label("Ports\u{2026}");
-    {
-        let ui = ui.clone();
-        ports_button.connect_clicked(move |_| {
-            ports_dialog::show(&ui);
-        });
-    }
-    header.pack_start(&ports_button);
-
-    // "+ New Tab" creates a disconnected session tab: pick a port, a node
-    // (if the port supports one), then Connect explicitly.
-    let new_tab_button = gtk::Button::with_label("+ New Tab");
+    // A plain "+" button on the notebook's own tab bar creates a new,
+    // disconnected session tab: pick a port, a node (if the port supports
+    // one), then Connect explicitly.
+    let new_tab_button = gtk::Button::from_icon_name("list-add-symbolic");
+    new_tab_button.add_css_class("flat");
+    new_tab_button.set_tooltip_text(Some("New Tab"));
     {
         let ui = ui.clone();
         new_tab_button.connect_clicked(move |_| {
             ui.add_tab(None);
         });
     }
-    header.pack_start(&new_tab_button);
+    ui.notebook.set_action_widget(&new_tab_button, gtk::PackType::End);
+    {
+        let ui = ui.clone();
+        empty_new_tab_button.connect_clicked(move |_| {
+            ui.add_tab(None);
+        });
+    }
 
     // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
     // already-connected AGWPE/KISS port.
@@ -793,45 +888,43 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&beacon_button);
 
-    // "Beacons\u{2026}" manages scheduled/periodic beacons.
-    let beacons_button = gtk::Button::with_label("Beacons\u{2026}");
-    {
-        let ui = ui.clone();
-        beacons_button.connect_clicked(move |_| {
-            beacons_dialog::show(&ui);
-        });
-    }
-    header.pack_start(&beacons_button);
+    // A single hamburger menu holds the less-frequently-used management
+    // dialogs, instead of a header button apiece.
+    let menu_button = gtk::MenuButton::builder().icon_name("open-menu-symbolic").tooltip_text("Menu").build();
+    let menu_popover = gtk::Popover::new();
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(4);
+    menu_box.set_margin_end(4);
+    menu_popover.set_child(Some(&menu_box));
+    menu_button.set_popover(Some(&menu_popover));
 
-    // "Mailbox\u{2026}" lists stored personal-mailbox messages.
-    let mailbox_button = gtk::Button::with_label("Mailbox\u{2026}");
-    {
-        let ui = ui.clone();
-        mailbox_button.connect_clicked(move |_| {
-            mailbox_dialog::show(&ui);
-        });
+    type MenuAction = fn(&Rc<Ui>);
+    let menu_items: [(&str, MenuAction); 5] = [
+        ("Ports\u{2026}", |ui| ports_dialog::show(ui)),
+        ("Address Book\u{2026}", |ui| address_book_dialog::show(ui)),
+        ("Mailbox\u{2026}", |ui| mailbox_dialog::show(ui)),
+        ("Beacons\u{2026}", |ui| beacons_dialog::show(ui)),
+        ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
+    ];
+    for (label, open) in menu_items {
+        let item_button = gtk::Button::with_label(label);
+        item_button.add_css_class("flat");
+        if let Some(l) = item_button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            l.set_halign(gtk::Align::Start);
+        }
+        {
+            let ui = ui.clone();
+            let menu_popover = menu_popover.clone();
+            item_button.connect_clicked(move |_| {
+                menu_popover.popdown();
+                open(&ui);
+            });
+        }
+        menu_box.append(&item_button);
     }
-    header.pack_start(&mailbox_button);
-
-    // "Address Book\u{2026}" lists stations heard automatically plus manual entries.
-    let address_book_button = gtk::Button::with_label("Address Book\u{2026}");
-    {
-        let ui = ui.clone();
-        address_book_button.connect_clicked(move |_| {
-            address_book_dialog::show(&ui);
-        });
-    }
-    header.pack_start(&address_book_button);
-
-    // "Preferences\u{2026}" opens font/timestamp/history/default-callsign settings.
-    let prefs_button = gtk::Button::with_label("Preferences\u{2026}");
-    {
-        let ui = ui.clone();
-        prefs_button.connect_clicked(move |_| {
-            preferences_dialog::show(&ui);
-        });
-    }
-    header.pack_start(&prefs_button);
+    header.pack_start(&menu_button);
 
     // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered) view.
     let save_monitor_button = gtk::Button::with_label("Save Monitor Log\u{2026}");

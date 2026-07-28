@@ -138,6 +138,15 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Permanently delete the persisted history for one (port, node, mode) —
+    /// used by the tab's "Clear History" action.
+    pub fn clear_history(&self, port_id: &str, remote: &str, unproto: bool) {
+        let mut cfg = self.config.borrow_mut();
+        cfg.node_history.retain(|h| !(h.port_id == port_id && h.remote == remote && h.unproto == unproto));
+        drop(cfg);
+        self.save_config();
+    }
+
     /// Append one completed line to a (port, node, mode)'s persisted
     /// history, trimming to the configured max line count.
     pub fn append_history_line(&self, port_id: &str, remote: &str, unproto: bool, line: &str) {

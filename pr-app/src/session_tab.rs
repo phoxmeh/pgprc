@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use pr_core::{ConnectionId, PortConfig, PortEntry};
+use pr_core::{AddressBookEntry, ConnectionId, PortConfig, PortEntry};
 
 use crate::app_state::AppState;
 use crate::highlight::{highlight_line, Highlighter, TagCache};
@@ -50,7 +50,14 @@ pub struct SessionTab {
     pub node_entry: gtk::Entry,
     /// Optional digipeater path, e.g. "WIDE1-1,WIDE2-1".
     pub via_entry: gtk::Entry,
-    pub address_book_button: gtk::Button,
+    /// A one-shot picker: index 0 is a placeholder, indices 1.. correspond
+    /// positionally to `available_address_book`. Selecting a real entry
+    /// copies its callsign into `node_entry` and resets back to 0 (wired in
+    /// `window.rs`, mirroring `port_dropdown`/`available_ports`). Snapshot
+    /// taken at tab-creation time like the port list — reopen a new tab to
+    /// see address book entries added since.
+    pub address_book_dropdown: gtk::DropDown,
+    available_address_book: Vec<String>,
     /// When active, this tab sends unconnected (UI) traffic to `node_entry`
     /// instead of opening a connected-mode session — Connect/Disconnect are
     /// disabled and `input_entry` sends via `PortCommand::SendUnproto`.
@@ -58,7 +65,9 @@ pub struct SessionTab {
     pub connect_button: gtk::Button,
     pub disconnect_button: gtk::Button,
     pub save_button: gtk::Button,
+    pub clear_history_button: gtk::Button,
     pub input_entry: gtk::Entry,
+    pub send_input_button: gtk::Button,
     pub conn_id: Cell<Option<ConnectionId>>,
     /// Text received since the last completed line, for splitting arbitrary
     /// byte chunks into history lines.
@@ -89,7 +98,7 @@ pub struct SessionTab {
 }
 
 impl SessionTab {
-    pub fn new(available_ports: Vec<PortEntry>, state: Rc<AppState>) -> Self {
+    pub fn new(available_ports: Vec<PortEntry>, address_book: Vec<AddressBookEntry>, state: Rc<AppState>) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         root.set_margin_top(4);
         root.set_margin_bottom(4);
@@ -107,11 +116,26 @@ impl SessionTab {
         let node_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let node_entry = gtk::Entry::builder().placeholder_text("Node (callsign)").width_chars(12).build();
         let via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(14).build();
-        let address_book_button = gtk::Button::with_label("From Address Book\u{2026}");
+
+        let mut available_address_book: Vec<String> = address_book.iter().map(|e| e.callsign.clone()).collect();
+        available_address_book.sort();
+        let mut address_book_names: Vec<String> = vec!["From Address Book\u{2026}".to_string()];
+        for callsign in &available_address_book {
+            let entry = address_book.iter().find(|e| &e.callsign == callsign);
+            let extra = entry.and_then(|e| e.name.as_deref().or(e.alias.as_deref()));
+            match extra {
+                Some(extra) if !extra.is_empty() => address_book_names.push(format!("{callsign} \u{2014} {extra}")),
+                _ => address_book_names.push(callsign.clone()),
+            }
+        }
+        let address_book_refs: Vec<&str> = address_book_names.iter().map(String::as_str).collect();
+        let address_book_model = gtk::StringList::new(&address_book_refs);
+        let address_book_dropdown = gtk::DropDown::builder().model(&address_book_model).build();
+
         let unproto_toggle = gtk::CheckButton::with_label("Unproto");
         node_row.append(&node_entry);
         node_row.append(&via_entry);
-        node_row.append(&address_book_button);
+        node_row.append(&address_book_dropdown);
         node_row.append(&unproto_toggle);
         controls.append(&node_row);
 
@@ -124,6 +148,9 @@ impl SessionTab {
 
         let save_button = gtk::Button::with_label("Save\u{2026}");
         controls.append(&save_button);
+
+        let clear_history_button = gtk::Button::with_label("Clear History\u{2026}");
+        controls.append(&clear_history_button);
 
         let stats_label = gtk::Label::new(Some("\u{2191}0 B \u{2193}0 B"));
         stats_label.add_css_class("dim-label");
@@ -147,9 +174,15 @@ impl SessionTab {
         let scrolled = gtk::ScrolledWindow::builder().child(&text_view).vexpand(true).hexpand(true).build();
         root.append(&scrolled);
 
+        let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let input_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Type and press Enter\u{2026}").build();
         input_entry.set_sensitive(false);
-        root.append(&input_entry);
+        input_row.append(&input_entry);
+        let send_input_button = gtk::Button::with_label("Send");
+        send_input_button.add_css_class("suggested-action");
+        send_input_button.set_sensitive(false);
+        input_row.append(&send_input_button);
+        root.append(&input_row);
 
         // --- notebook tab label: title + Pin + Close ---
         let tab_label = gtk::Label::new(Some("New Tab"));
@@ -165,12 +198,15 @@ impl SessionTab {
             node_row,
             node_entry,
             via_entry,
-            address_book_button,
+            address_book_dropdown,
+            available_address_book,
             unproto_toggle,
             connect_button,
             disconnect_button,
             save_button,
+            clear_history_button,
             input_entry,
+            send_input_button,
             conn_id: Cell::new(None),
             pending_line: RefCell::new(String::new()),
             pinned_identity: RefCell::new(None),
@@ -191,10 +227,21 @@ impl SessionTab {
         self.available_ports.get(self.port_dropdown.selected() as usize)
     }
 
+    /// The callsign for the currently selected address-book dropdown entry,
+    /// if the selection isn't the "From Address Book..." placeholder (index 0).
+    pub fn selected_address_book_call(&self) -> Option<&str> {
+        let idx = self.address_book_dropdown.selected();
+        if idx == 0 {
+            return None;
+        }
+        self.available_address_book.get(idx as usize - 1).map(String::as_str)
+    }
+
     pub fn set_connected(&self, connected: bool) {
         self.connect_button.set_sensitive(!connected);
         self.disconnect_button.set_sensitive(connected);
         self.input_entry.set_sensitive(connected);
+        self.send_input_button.set_sensitive(connected);
         self.port_dropdown.set_sensitive(!connected);
         self.node_entry.set_sensitive(!connected);
         self.via_entry.set_sensitive(!connected);
@@ -264,7 +311,7 @@ impl SessionTab {
 
     /// `unproto` is part of the key so unproto traffic and a connected-mode
     /// session to the same (port, remote) get separate history buckets.
-    fn history_key(&self) -> Option<(String, String, bool)> {
+    pub fn history_key(&self) -> Option<(String, String, bool)> {
         let port = self.selected_port().filter(|p| port_needs_node(&p.config))?;
         Some((port.id.clone(), self.node_entry.text().to_string(), self.unproto_toggle.is_active()))
     }

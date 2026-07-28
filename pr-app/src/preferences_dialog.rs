@@ -5,95 +5,109 @@ use adw::prelude::*;
 
 use pr_core::HighlightRule;
 
-use crate::ports_dialog::{dialog_window, labeled, labeled_widget};
+use crate::ports_dialog::dialog_window;
 use crate::window::{apply_font, Ui};
 
 pub fn show(ui: &Rc<Ui>) {
     let (win, root) = dialog_window(&ui.window, "Preferences", 480);
-    win.set_default_height(600);
+    win.set_default_height(640);
 
     let scrolled = gtk::ScrolledWindow::builder().vexpand(true).build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     scrolled.set_child(Some(&content));
 
     let current = ui.state.config.borrow().ui.clone();
     let current_hl = ui.state.config.borrow().highlighting.clone();
     let current_mailbox_enabled = ui.state.config.borrow().mailbox.enabled;
 
-    let font_entry = gtk::Entry::builder()
-        .placeholder_text("Monospace 11")
-        .text(current.font.as_deref().unwrap_or("Monospace 11"))
+    // --- General ---
+    let general_group = adw::PreferencesGroup::builder().title("General").build();
+
+    let font_row = adw::EntryRow::builder().title("Font").build();
+    font_row.set_text(current.font.as_deref().unwrap_or("Monospace 11"));
+    general_group.add(&font_row);
+
+    let timestamps_row = adw::SwitchRow::builder().title("Show Timestamps in Monitor").active(current.show_timestamps).build();
+    general_group.add(&timestamps_row);
+
+    let default_call_row = adw::EntryRow::builder().title("Default Callsign").build();
+    default_call_row.set_text(current.default_call.as_deref().unwrap_or(""));
+    general_group.add(&default_call_row);
+
+    let history_lines_row = adw::EntryRow::builder().title("History Lines").build();
+    history_lines_row.set_text(&current.history_lines.to_string());
+    general_group.add(&history_lines_row);
+
+    content.append(&general_group);
+
+    // --- QRZ Lookup ---
+    let qrz_group = adw::PreferencesGroup::builder()
+        .title("QRZ Lookup")
+        .description("Used by \u{201c}Lookup QRZ\u{2026}\u{201d} in the Address Book")
         .build();
-    content.append(&labeled("Font", &font_entry));
 
-    let timestamps_check = gtk::CheckButton::with_label("Show timestamps in Monitor");
-    timestamps_check.set_active(current.show_timestamps);
-    content.append(&timestamps_check);
+    let qrz_user_row = adw::EntryRow::builder().title("Username").build();
+    qrz_user_row.set_text(current.qrz_username.as_deref().unwrap_or(""));
+    qrz_group.add(&qrz_user_row);
 
-    let default_call_entry = gtk::Entry::builder()
-        .placeholder_text("MYCALL-1 (optional)")
-        .text(current.default_call.as_deref().unwrap_or(""))
-        .build();
-    content.append(&labeled("Default Callsign", &default_call_entry));
-
-    let qrz_user_entry = gtk::Entry::builder()
-        .placeholder_text("QRZ username (optional)")
-        .text(current.qrz_username.as_deref().unwrap_or(""))
-        .build();
-    content.append(&labeled("QRZ Username", &qrz_user_entry));
-
-    let qrz_pass_entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
+    let qrz_pass_row = adw::PasswordEntryRow::builder().title("Password").build();
     if let Some(pass) = &current.qrz_password {
-        qrz_pass_entry.set_text(pass);
+        qrz_pass_row.set_text(pass);
     }
-    content.append(&labeled_widget("QRZ Password", qrz_pass_entry.clone().upcast()));
+    qrz_group.add(&qrz_pass_row);
 
-    let history_lines_entry = gtk::Entry::builder().text(current.history_lines.to_string()).build();
-    content.append(&labeled("History Lines", &history_lines_entry));
+    content.append(&qrz_group);
 
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let mailbox_heading = gtk::Label::new(Some("Personal Mailbox"));
-    mailbox_heading.add_css_class("heading");
-    mailbox_heading.set_halign(gtk::Align::Start);
-    content.append(&mailbox_heading);
+    // --- Personal Mailbox ---
+    let mailbox_group = adw::PreferencesGroup::builder().title("Personal Mailbox").build();
+    let mailbox_enabled_row = adw::SwitchRow::builder()
+        .title("Enable Mailbox")
+        .subtitle("Answer unsolicited connections with a BBS-style prompt (local only)")
+        .active(current_mailbox_enabled)
+        .build();
+    mailbox_group.add(&mailbox_enabled_row);
+    content.append(&mailbox_group);
 
-    let mailbox_enabled_check = gtk::CheckButton::with_label("Answer unsolicited connections as a mailbox (BBS-style, local only)");
-    mailbox_enabled_check.set_active(current_mailbox_enabled);
-    content.append(&mailbox_enabled_check);
+    // --- Highlighting ---
+    let hl_group = adw::PreferencesGroup::builder().title("Highlighting").build();
 
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let hl_heading = gtk::Label::new(Some("Highlighting"));
-    hl_heading.add_css_class("heading");
-    hl_heading.set_halign(gtk::Align::Start);
-    content.append(&hl_heading);
-
-    let hl_enabled_check = gtk::CheckButton::with_label("Enable scrollback highlighting");
-    hl_enabled_check.set_active(current_hl.enabled);
-    content.append(&hl_enabled_check);
+    let hl_enabled_row = adw::SwitchRow::builder().title("Enable Scrollback Highlighting").active(current_hl.enabled).build();
+    hl_group.add(&hl_enabled_row);
 
     let callsign_color_btn = color_button(&current_hl.callsign_color);
-    content.append(&labeled_widget("Callsigns", callsign_color_btn.clone().upcast()));
+    let callsign_color_row = adw::ActionRow::builder().title("Callsigns").build();
+    callsign_color_row.add_suffix(&callsign_color_btn);
+    hl_group.add(&callsign_color_row);
 
     let known_color_btn = color_button(&current_hl.known_callsign_color);
-    content.append(&labeled_widget("Known Callsigns", known_color_btn.clone().upcast()));
+    let known_color_row = adw::ActionRow::builder().title("Known Callsigns").build();
+    known_color_row.add_suffix(&known_color_btn);
+    hl_group.add(&known_color_row);
 
     let ax25_color_btn = color_button(&current_hl.ax25_command_color);
-    content.append(&labeled_widget("AX.25 Command Tags", ax25_color_btn.clone().upcast()));
+    let ax25_color_row = adw::ActionRow::builder().title("AX.25 Command Tags").build();
+    ax25_color_row.add_suffix(&ax25_color_btn);
+    hl_group.add(&ax25_color_row);
 
-    let rules_heading = gtk::Label::new(Some("Keyword / Bulletin Rules (e.g. CQ, BEACON, or your own)"));
-    rules_heading.set_halign(gtk::Align::Start);
-    content.append(&rules_heading);
+    content.append(&hl_group);
+
+    // --- Keyword / Bulletin Rules (its own group so the list has breathing room) ---
+    let rules_group = adw::PreferencesGroup::builder()
+        .title("Keyword / Bulletin Rules")
+        .description("e.g. CQ, BEACON, or your own nets/bulletins")
+        .build();
 
     let rules_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
     rules_list.add_css_class("boxed-list");
-    let rules_scrolled =
-        gtk::ScrolledWindow::builder().child(&rules_list).min_content_height(160).vexpand(false).build();
-    content.append(&rules_scrolled);
+    let rules_scrolled = gtk::ScrolledWindow::builder().child(&rules_list).min_content_height(160).vexpand(false).build();
+    rules_group.add(&rules_scrolled);
 
     let rules: Rc<RefCell<Vec<HighlightRule>>> = Rc::new(RefCell::new(current_hl.rules.clone()));
     rebuild_rules_list(&rules_list, &rules);
 
     let add_rule_button = gtk::Button::with_label("Add Rule\u{2026}");
+    add_rule_button.set_margin_top(8);
+    add_rule_button.set_halign(gtk::Align::Start);
     {
         let rules = rules.clone();
         let rules_list = rules_list.clone();
@@ -108,7 +122,9 @@ pub fn show(ui: &Rc<Ui>) {
             rebuild_rules_list(&rules_list, &rules);
         });
     }
-    content.append(&add_rule_button);
+    rules_group.add(&add_rule_button);
+
+    content.append(&rules_group);
 
     root.append(&scrolled);
 
@@ -130,12 +146,12 @@ pub fn show(ui: &Rc<Ui>) {
         let win = win.clone();
         let rules = rules.clone();
         save_button.connect_clicked(move |_| {
-            let font = font_entry.text().to_string();
-            let show_timestamps = timestamps_check.is_active();
-            let default_call = default_call_entry.text().to_string();
-            let qrz_username = qrz_user_entry.text().to_string();
-            let qrz_password = qrz_pass_entry.text().to_string();
-            let history_lines = match history_lines_entry.text().trim().parse::<u32>() {
+            let font = font_row.text().to_string();
+            let show_timestamps = timestamps_row.is_active();
+            let default_call = default_call_row.text().to_string();
+            let qrz_username = qrz_user_row.text().to_string();
+            let qrz_password = qrz_pass_row.text().to_string();
+            let history_lines = match history_lines_row.text().trim().parse::<u32>() {
                 Ok(n) if n > 0 => n,
                 _ => {
                     error_label.set_text("History Lines must be a positive number.");
@@ -153,13 +169,13 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.ui.qrz_password = if qrz_password.is_empty() { None } else { Some(qrz_password) };
                 cfg.ui.history_lines = history_lines;
 
-                cfg.highlighting.enabled = hl_enabled_check.is_active();
+                cfg.highlighting.enabled = hl_enabled_row.is_active();
                 cfg.highlighting.callsign_color = rgba_to_hex(&callsign_color_btn.rgba());
                 cfg.highlighting.known_callsign_color = rgba_to_hex(&known_color_btn.rgba());
                 cfg.highlighting.ax25_command_color = rgba_to_hex(&ax25_color_btn.rgba());
                 cfg.highlighting.rules = rules.borrow().clone();
 
-                cfg.mailbox.enabled = mailbox_enabled_check.is_active();
+                cfg.mailbox.enabled = mailbox_enabled_row.is_active();
             }
             // Credentials may have changed; force a fresh login next lookup.
             *ui.state.qrz_session.borrow_mut() = None;
@@ -272,6 +288,7 @@ fn build_rule_row(list_box: &gtk::ListBox, rules: &Rc<RefCell<Vec<HighlightRule>
 
 fn color_button(hex: &str) -> gtk::ColorDialogButton {
     let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    button.set_valign(gtk::Align::Center);
     if let Ok(rgba) = gtk::gdk::RGBA::parse(hex) {
         button.set_rgba(&rgba);
     }
