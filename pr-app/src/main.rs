@@ -11,6 +11,7 @@ mod notify;
 mod ports_dialog;
 mod preferences_dialog;
 mod qrz;
+mod rules_dialog;
 mod session_tab;
 mod window;
 
