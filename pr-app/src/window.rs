@@ -12,7 +12,17 @@ use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::monitor_view::MonitorView;
 use crate::ports_dialog;
 use crate::preferences_dialog;
-use crate::session_tab::{port_needs_node, SessionTab, TabId};
+use crate::session_tab::{port_supports_connect, port_supports_unproto, SessionTab, TabId};
+
+/// Prefills a newly-created tab's shell: port + node, and optionally a via
+/// path and/or unproto mode. Used both for pinned-tab restoration at startup
+/// and for the fallback tab created when an unsolicited connection arrives.
+pub struct TabPrefill {
+    pub port_id: String,
+    pub remote: String,
+    pub via: String,
+    pub unproto: bool,
+}
 
 pub struct Ui {
     pub state: Rc<AppState>,
@@ -22,8 +32,8 @@ pub struct Ui {
     /// Live connection (port, id) -> the tab it's bound to.
     bound: RefCell<HashMap<(String, ConnectionId), TabId>>,
     /// A Connect click in progress, keyed by (port_id, remote) — remote is
-    /// empty for port kinds with no node concept (Telnet/SSH/KISS), since
-    /// those only ever have one connection to bind.
+    /// empty for port kinds with no node concept (Telnet/SSH), since those
+    /// only ever have one connection to bind.
     pending: RefCell<HashMap<(String, String), TabId>>,
     next_tab_id: Cell<TabId>,
     pub window: adw::ApplicationWindow,
@@ -61,29 +71,31 @@ impl Ui {
         }
     }
 
-    pub fn send_unproto(&self, id: &str, dest: String, bytes: Vec<u8>) {
+    pub fn send_unproto(&self, id: &str, dest: String, via: Vec<String>, bytes: Vec<u8>) {
         if let Some(handle) = self.state.active.borrow().get(id) {
-            let _ = handle.cmd_tx.send(PortCommand::SendUnproto { dest, bytes });
+            let _ = handle.cmd_tx.send(PortCommand::SendUnproto { dest, via, bytes });
         }
     }
 
-    /// Create a new, disconnected session tab — optionally prefilled with a
-    /// (port_id, remote) — and return its id.
-    pub fn add_tab(self: &Rc<Self>, prefill: Option<(String, String)>) -> TabId {
+    /// Create a new, disconnected session tab — optionally prefilled — and
+    /// return its id.
+    pub fn add_tab(self: &Rc<Self>, prefill: Option<TabPrefill>) -> TabId {
         let tab_id = self.next_tab_id.get();
         self.next_tab_id.set(tab_id + 1);
 
         let ports = self.state.config.borrow().ports.clone();
         let tab = SessionTab::new(ports, self.state.clone());
 
-        if let Some((port_id, remote)) = &prefill {
-            if let Some(idx) = tab.available_ports.iter().position(|p| &p.id == port_id) {
+        if let Some(prefill) = &prefill {
+            if let Some(idx) = tab.available_ports.iter().position(|p| p.id == prefill.port_id) {
                 tab.port_dropdown.set_selected(idx as u32);
             }
-            tab.node_entry.set_text(remote);
-            if self.state.is_pinned(port_id, remote) {
+            tab.node_entry.set_text(&prefill.remote);
+            tab.via_entry.set_text(&prefill.via);
+            tab.unproto_toggle.set_active(prefill.unproto);
+            if self.state.is_pinned(&prefill.port_id, &prefill.remote, prefill.unproto) {
                 tab.pin_toggle.set_active(true);
-                *tab.pinned_identity.borrow_mut() = Some((port_id.clone(), remote.clone()));
+                *tab.pinned_identity.borrow_mut() = Some((prefill.port_id.clone(), prefill.remote.clone(), prefill.unproto));
             }
         }
 
@@ -93,7 +105,9 @@ impl Ui {
         let pin_toggle = tab.pin_toggle.clone();
         let port_dropdown = tab.port_dropdown.clone();
         let node_entry = tab.node_entry.clone();
+        let via_entry = tab.via_entry.clone();
         let address_book_button = tab.address_book_button.clone();
+        let unproto_toggle = tab.unproto_toggle.clone();
         let connect_button = tab.connect_button.clone();
         let disconnect_button = tab.disconnect_button.clone();
         let input_entry = tab.input_entry.clone();
@@ -101,6 +115,7 @@ impl Ui {
         self.tabs.borrow_mut().insert(tab_id, tab);
         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
             self.update_node_visibility(tab);
+            self.update_mode_controls(tab);
             self.update_tab_title(tab);
             self.preview_history(tab);
         }
@@ -110,6 +125,7 @@ impl Ui {
             port_dropdown.connect_selected_notify(move |_| {
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     ui.update_node_visibility(tab);
+                    ui.update_mode_controls(tab);
                     ui.update_tab_title(tab);
                     ui.preview_history(tab);
                     ui.sync_pin(tab);
@@ -137,9 +153,28 @@ impl Ui {
         }
         {
             let ui = self.clone();
+            via_entry.connect_changed(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    ui.sync_pin(tab);
+                }
+            });
+        }
+        {
+            let ui = self.clone();
             let node_entry = node_entry.clone();
             address_book_button.connect_clicked(move |_| {
                 address_book_dialog::pick(&ui, &node_entry);
+            });
+        }
+        {
+            let ui = self.clone();
+            unproto_toggle.connect_toggled(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    ui.update_mode_controls(tab);
+                    ui.update_tab_title(tab);
+                    ui.preview_history(tab);
+                    ui.sync_pin(tab);
+                }
             });
         }
         {
@@ -148,8 +183,8 @@ impl Ui {
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     if btn.is_active() {
                         ui.sync_pin(tab);
-                    } else if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
-                        ui.state.set_pinned(&old_port, &old_remote, false);
+                    } else if let Some((old_port, old_remote, old_unproto)) = tab.pinned_identity.borrow_mut().take() {
+                        ui.state.set_pinned(&old_port, &old_remote, old_unproto, "", false);
                     }
                 }
             });
@@ -170,23 +205,11 @@ impl Ui {
             let ui = self.clone();
             input_entry.connect_activate(move |entry| {
                 let text = entry.text().to_string();
-                let mut bytes = text.clone().into_bytes();
-                bytes.push(b'\n');
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    if let (Some(conn_id), Some(port)) = (tab.conn_id.get(), tab.selected_port()) {
-                        if let Some(handle) = ui.state.active.borrow().get(&port.id) {
-                            let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
-                        }
-                        // Connected-mode AX.25/AGWPE backends don't echo our
-                        // own transmissions back, so log what we sent
-                        // ourselves. Telnet/SSH already get a remote echo
-                        // from the far end, so don't double it up there.
-                        if port_needs_node(&port.config) {
-                            let port_name = port.name.clone();
-                            let remote = tab.node_entry.text().to_string();
-                            tab.append_sent_line(&text);
-                            ui.monitor.append_line(&format!("[{port_name}] TX > {remote}: {text}"));
-                        }
+                    if tab.unproto_toggle.is_active() {
+                        ui.send_tab_unproto(tab, &text);
+                    } else {
+                        ui.send_tab_connected(tab, &text);
                     }
                 }
                 entry.set_text("");
@@ -215,12 +238,65 @@ impl Ui {
         tab_id
     }
 
+    /// Send the tab's connected-mode input over its live connection.
+    fn send_tab_connected(&self, tab: &SessionTab, text: &str) {
+        let mut bytes = text.to_string().into_bytes();
+        bytes.push(b'\n');
+        if let (Some(conn_id), Some(port)) = (tab.conn_id.get(), tab.selected_port()) {
+            if let Some(handle) = self.state.active.borrow().get(&port.id) {
+                let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
+            }
+            // Connected-mode AX.25/AGWPE backends don't echo our own
+            // transmissions back, so log what we sent ourselves. Telnet/SSH
+            // already get a remote echo from the far end, so don't double
+            // it up there.
+            if port_supports_connect(&port.config) {
+                let port_name = port.name.clone();
+                let remote = tab.node_entry.text().to_string();
+                tab.append_sent_line(text);
+                self.monitor.append_line(&format!("[{port_name}] TX > {remote}: {text}"));
+            }
+        }
+    }
+
+    /// Send the tab's input as a one-shot unconnected (UI) frame — the tab's
+    /// own destination/via fields, not tied to any live connection.
+    fn send_tab_unproto(&self, tab: &SessionTab, text: &str) {
+        let Some(port) = tab.selected_port() else { return };
+        let port_id = port.id.clone();
+        let port_name = port.name.clone();
+        let dest = tab.node_entry.text().trim().to_uppercase();
+        if dest.is_empty() {
+            self.monitor.append_line("Enter a destination before sending unproto.");
+            return;
+        }
+        if !self.state.is_active(&port_id) {
+            self.monitor.append_line(&format!("[{port_name}] port not connected \u{2014} can't send unproto."));
+            return;
+        }
+        let via = tab.via();
+        if let Some(handle) = self.state.active.borrow().get(&port_id) {
+            let _ = handle.cmd_tx.send(PortCommand::SendUnproto {
+                dest: dest.clone(),
+                via: via.clone(),
+                bytes: text.to_string().into_bytes(),
+            });
+        }
+        tab.append_sent_line(text);
+        let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
+        self.monitor.append_line(&format!("[{port_name}] TX unproto > {dest}{via_suffix}: {text}"));
+    }
+
     /// Connect the tab's selected port (if not already active) and, for
-    /// node-capable ports, open a session to the entered node.
+    /// connect-capable ports, open a session to the entered node. No-op if
+    /// the tab is in Unproto mode.
     pub fn connect_tab(self: &Rc<Self>, tab_id: TabId) {
-        let Some((port_id, remote, needs_node)) = self.tabs.borrow().get(&tab_id).and_then(|tab| {
+        let Some((port_id, remote, via, needs_node)) = self.tabs.borrow().get(&tab_id).and_then(|tab| {
+            if tab.unproto_toggle.is_active() {
+                return None;
+            }
             let port = tab.selected_port()?;
-            Some((port.id.clone(), tab.node_entry.text().trim().to_uppercase(), port_needs_node(&port.config)))
+            Some((port.id.clone(), tab.node_entry.text().trim().to_uppercase(), tab.via(), port_supports_connect(&port.config)))
         }) else {
             return;
         };
@@ -242,7 +318,7 @@ impl Ui {
         }
         if needs_node {
             if let Some(handle) = self.state.active.borrow().get(&port_id) {
-                let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote });
+                let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote, via });
             }
         }
     }
@@ -263,8 +339,8 @@ impl Ui {
         self.disconnect_tab(tab_id);
 
         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
-            if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
-                self.state.set_pinned(&old_port, &old_remote, false);
+            if let Some((old_port, old_remote, old_unproto)) = tab.pinned_identity.borrow_mut().take() {
+                self.state.set_pinned(&old_port, &old_remote, old_unproto, "", false);
             }
         }
         self.bound.borrow_mut().retain(|_, v| *v != tab_id);
@@ -288,15 +364,54 @@ impl Ui {
         }
     }
 
+    /// Shows/hides the node/via/unproto row for ports with no node concept
+    /// at all (Telnet/SSH), and forces the Unproto toggle on/off + locked
+    /// for ports that only support one of connect/unproto.
     fn update_node_visibility(&self, tab: &SessionTab) {
-        let needs_node = tab.selected_port().map(|p| port_needs_node(&p.config)).unwrap_or(false);
-        tab.node_row.set_visible(needs_node);
+        let Some(port) = tab.selected_port() else {
+            tab.node_row.set_visible(false);
+            return;
+        };
+        let can_connect = port_supports_connect(&port.config);
+        let can_unproto = port_supports_unproto(&port.config);
+        tab.node_row.set_visible(can_connect || can_unproto);
+        if !can_unproto {
+            tab.unproto_toggle.set_active(false);
+            tab.unproto_toggle.set_sensitive(false);
+        } else if !can_connect {
+            tab.unproto_toggle.set_active(true);
+            tab.unproto_toggle.set_sensitive(false);
+        } else {
+            tab.unproto_toggle.set_sensitive(true);
+        }
+    }
+
+    /// Refreshes Connect/Disconnect/input sensitivity for the tab's current
+    /// Unproto state. In Unproto mode, Connect/Disconnect are always
+    /// disabled (there's no per-tab connection to manage) and the input
+    /// entry tracks whether the underlying port is currently active; outside
+    /// Unproto mode this just restores the normal connected-mode sensitivity.
+    fn update_mode_controls(&self, tab: &SessionTab) {
+        if tab.unproto_toggle.is_active() {
+            tab.connect_button.set_sensitive(false);
+            tab.disconnect_button.set_sensitive(false);
+            tab.port_dropdown.set_sensitive(true);
+            tab.node_entry.set_sensitive(true);
+            tab.via_entry.set_sensitive(true);
+            let active = tab.selected_port().map(|p| self.state.is_active(&p.id)).unwrap_or(false);
+            tab.input_entry.set_sensitive(active);
+        } else {
+            tab.set_connected(tab.conn_id.get().is_some());
+        }
     }
 
     fn update_tab_title(&self, tab: &SessionTab) {
         let port_name = tab.selected_port().map(|p| p.name.as_str()).unwrap_or("(no port)");
         let remote = tab.node_entry.text();
-        let title = if remote.trim().is_empty() { port_name.to_string() } else { format!("{port_name}: {remote}") };
+        let mut title = if remote.trim().is_empty() { port_name.to_string() } else { format!("{port_name}: {remote}") };
+        if tab.unproto_toggle.is_active() {
+            title.push_str(" (unproto)");
+        }
         tab.tab_label.set_text(&title);
     }
 
@@ -315,12 +430,13 @@ impl Ui {
             tab.clear_text();
             return;
         }
-        let history = self.state.history_for(&port.id, &remote);
+        let history = self.state.history_for(&port.id, &remote, tab.unproto_toggle.is_active());
         tab.load_history(&history);
     }
 
-    /// Keep a pinned tab's persisted (port, node) identity in sync as the
-    /// user edits its fields, unpinning the stale identity in the process.
+    /// Keep a pinned tab's persisted (port, node, mode) identity — and its
+    /// via path — in sync as the user edits its fields, unpinning the stale
+    /// identity in the process.
     fn sync_pin(&self, tab: &SessionTab) {
         if !tab.pin_toggle.is_active() {
             return;
@@ -330,21 +446,24 @@ impl Ui {
         if remote.is_empty() {
             return;
         }
-        let new_id = (port.id.clone(), remote);
+        let unproto = tab.unproto_toggle.is_active();
+        let via = tab.via_entry.text().trim().to_uppercase();
+        let new_id = (port.id.clone(), remote, unproto);
         let mut current = tab.pinned_identity.borrow_mut();
-        if current.as_ref() != Some(&new_id) {
-            if let Some((old_port, old_remote)) = current.take() {
-                self.state.set_pinned(&old_port, &old_remote, false);
+        if let Some(old) = current.as_ref() {
+            if old != &new_id {
+                self.state.set_pinned(&old.0, &old.1, old.2, "", false);
             }
-            self.state.set_pinned(&new_id.0, &new_id.1, true);
-            *current = Some(new_id);
         }
+        self.state.set_pinned(&new_id.0, &new_id.1, new_id.2, &via, true);
+        *current = Some(new_id);
     }
 
     fn handle_event(self: &Rc<Self>, port_id: &str, event: PortEvent) {
         match event {
             PortEvent::PortConnected => {
                 self.monitor.append_line(&format!("[{port_id}] port connected"));
+                self.refresh_unproto_tabs_for_port(port_id);
             }
             PortEvent::PortDisconnected { reason } => {
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
@@ -362,6 +481,7 @@ impl Ui {
                     }
                 }
                 self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
+                self.refresh_unproto_tabs_for_port(port_id);
             }
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
@@ -371,15 +491,18 @@ impl Ui {
             }
             PortEvent::ConnectionOpened { id, label } => {
                 let needs_node =
-                    find_entry(&self.state.config.borrow(), port_id).map(|e| port_needs_node(&e.config)).unwrap_or(false);
+                    find_entry(&self.state.config.borrow(), port_id).map(|e| port_supports_connect(&e.config)).unwrap_or(false);
                 let pending_key =
                     if needs_node { (port_id.to_string(), label.clone()) } else { (port_id.to_string(), String::new()) };
 
-                let tab_id = self
-                    .pending
-                    .borrow_mut()
-                    .remove(&pending_key)
-                    .unwrap_or_else(|| self.add_tab(Some((port_id.to_string(), label.clone()))));
+                let tab_id = self.pending.borrow_mut().remove(&pending_key).unwrap_or_else(|| {
+                    self.add_tab(Some(TabPrefill {
+                        port_id: port_id.to_string(),
+                        remote: label.clone(),
+                        via: String::new(),
+                        unproto: false,
+                    }))
+                });
 
                 self.bound.borrow_mut().insert((port_id.to_string(), id), tab_id);
                 if let Some(tab) = self.tabs.borrow().get(&tab_id) {
@@ -414,6 +537,17 @@ impl Ui {
             }
             PortEvent::StationHeard { callsign } => {
                 self.state.record_heard(&callsign);
+            }
+        }
+    }
+
+    /// Unproto tabs have no live `ConnectionId` to key off of, so their
+    /// input sensitivity has to be refreshed explicitly whenever the
+    /// underlying port connects or disconnects.
+    fn refresh_unproto_tabs_for_port(&self, port_id: &str) {
+        for tab in self.tabs.borrow().values() {
+            if tab.unproto_toggle.is_active() && tab.selected_port().is_some_and(|p| p.id == port_id) {
+                self.update_mode_controls(tab);
             }
         }
     }
@@ -468,8 +602,11 @@ pub fn build_ui(app: &adw::Application) {
     let font = config.ui.font.clone().unwrap_or_else(|| "Monospace 11".to_string());
     let autoconnect_ids: Vec<String> =
         config.ports.iter().filter(|p| p.autoconnect).map(|p| p.id.clone()).collect();
-    let pinned_tabs: Vec<(String, String)> =
-        config.pinned_sessions.iter().map(|p| (p.port_id.clone(), p.remote.clone())).collect();
+    let pinned_tabs: Vec<TabPrefill> = config
+        .pinned_sessions
+        .iter()
+        .map(|p| TabPrefill { port_id: p.port_id.clone(), remote: p.remote.clone(), via: p.via.clone(), unproto: p.unproto })
+        .collect();
     apply_font(&font);
     let state = AppState::new(config);
 
@@ -582,8 +719,8 @@ pub fn build_ui(app: &adw::Application) {
 
     // Pinned tabs are recreated as disconnected shells; they never
     // auto-connect, even if their port also has autoconnect enabled.
-    for (port_id, remote) in pinned_tabs {
-        ui.add_tab(Some((port_id, remote)));
+    for prefill in pinned_tabs {
+        ui.add_tab(Some(prefill));
     }
 
     for id in autoconnect_ids {

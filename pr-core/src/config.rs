@@ -96,20 +96,31 @@ pub struct AddressBookEntry {
 /// A tab the user pinned: its (port, node) shell is recreated automatically
 /// at the next app startup, prefilled but disconnected — the user still has
 /// to press Connect. `remote` is empty for port kinds with no node concept
-/// (Telnet/SSH/KISS).
+/// (Telnet/SSH).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinnedSession {
     pub port_id: String,
     pub remote: String,
+    /// Digipeater path, e.g. "WIDE1-1,WIDE2-1". Empty for a direct path.
+    #[serde(default)]
+    pub via: String,
+    /// True if this tab sends unconnected (UI) traffic to `remote` instead
+    /// of opening a connected-mode session.
+    #[serde(default)]
+    pub unproto: bool,
 }
 
 /// Persisted scrollback for one (port, node) pair, so reconnecting to a
 /// station you've talked to before restores context. Trimmed to
-/// `UiPrefs.history_lines` lines on save.
+/// `UiPrefs.history_lines` lines on save. Kept separate from connected-mode
+/// history for the same (port, remote) via `unproto`, since the two are
+/// unrelated conversations that happen to share a destination callsign.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeHistory {
     pub port_id: String,
     pub remote: String,
+    #[serde(default)]
+    pub unproto: bool,
     #[serde(default)]
     pub lines: Vec<String>,
 }

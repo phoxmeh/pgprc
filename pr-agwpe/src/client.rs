@@ -104,7 +104,7 @@ impl PortRunner for AgwpeRunner {
         let my_call = self.my_call.clone();
         loop {
             match cmd_rx.recv() {
-                Ok(PortCommand::OpenConnection { remote }) => {
+                Ok(PortCommand::OpenConnection { remote, via }) => {
                     let id = {
                         let mut c = conns.lock().unwrap();
                         if let Some(existing) = c.id_for_call(&remote) {
@@ -124,7 +124,11 @@ impl PortRunner for AgwpeRunner {
                         id,
                         state: ConnState::Connecting,
                     });
-                    let frame = AgwFrame::new(radio_port, 'C', &my_call, &remote, vec![]);
+                    let frame = if via.is_empty() {
+                        AgwFrame::new(radio_port, 'C', &my_call, &remote, vec![])
+                    } else {
+                        AgwFrame::connect_via(radio_port, &my_call, &remote, &via)
+                    };
                     if writer.write_all(&frame.encode()).is_err() {
                         break;
                     }
@@ -145,11 +149,15 @@ impl PortRunner for AgwpeRunner {
                         let _ = writer.write_all(&frame.encode());
                     }
                 }
-                Ok(PortCommand::SendUnproto { dest, bytes }) => {
+                Ok(PortCommand::SendUnproto { dest, via, bytes }) => {
                     let _ = event_tx.send_blocking(PortEvent::Monitor {
                         line: format!("{my_call} > {dest} [unproto TX]: {}", text_from_bytes(&bytes)),
                     });
-                    let frame = AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes);
+                    let frame = if via.is_empty() {
+                        AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes)
+                    } else {
+                        AgwFrame::unproto_via(radio_port, &my_call, &dest, &via, bytes)
+                    };
                     if writer.write_all(&frame.encode()).is_err() {
                         break;
                     }

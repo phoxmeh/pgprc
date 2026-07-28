@@ -64,7 +64,7 @@ fn main() {
     println!("connected. sending unproto frame {my_call} > {dest_call}: {message}");
     handle
         .cmd_tx
-        .send(PortCommand::SendUnproto { dest: dest_call, bytes: message.into_bytes() })
+        .send(PortCommand::SendUnproto { dest: dest_call, via: Vec::new(), bytes: message.into_bytes() })
         .expect("send command");
 
     // Drain events for a bit so we see the engine's own log/monitor lines.

@@ -464,6 +464,9 @@ pub fn show_send_unproto(ui: &Rc<Ui>) {
     let dest_entry = gtk::Entry::builder().placeholder_text("BEACON").text("BEACON").build();
     root.append(&labeled("Destination", &dest_entry));
 
+    let via_entry = gtk::Entry::builder().placeholder_text("WIDE1-1,WIDE2-1 (optional)").build();
+    root.append(&labeled("Via", &via_entry));
+
     let message_entry = gtk::Entry::builder().placeholder_text("Message text").build();
     root.append(&labeled("Message", &message_entry));
 
@@ -485,9 +488,16 @@ pub fn show_send_unproto(ui: &Rc<Ui>) {
                 return;
             }
             let message = message_entry.text().to_string();
+            let via: Vec<String> = via_entry
+                .text()
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_uppercase())
+                .collect();
             let idx = port_dropdown.selected() as usize;
             if let Some(entry) = candidates.get(idx) {
-                ui.send_unproto(&entry.id, dest.to_uppercase(), message.into_bytes());
+                ui.send_unproto(&entry.id, dest.to_uppercase(), via, message.into_bytes());
             }
             win.close();
         });

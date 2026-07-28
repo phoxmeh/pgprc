@@ -36,7 +36,7 @@ impl PortRunner for Ax25RawSocketRunner {
 
         loop {
             match cmd_rx.recv() {
-                Ok(PortCommand::OpenConnection { remote }) => {
+                Ok(PortCommand::OpenConnection { remote, via }) => {
                     let id = next_id;
                     next_id += 1;
                     let _ = event_tx.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
@@ -48,7 +48,7 @@ impl PortRunner for Ax25RawSocketRunner {
                         id,
                         state: ConnState::Connecting,
                     });
-                    match open_connection(&local_call, &remote) {
+                    match open_connection(&local_call, &remote, &via) {
                         Ok(socket) => {
                             let reader_socket = match socket.try_clone() {
                                 Ok(s) => s,
@@ -120,9 +120,9 @@ fn resolve_local_call(device: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no '{device}' entry in /etc/ax25/axports"))
 }
 
-fn open_connection(local_call: &str, remote_call: &str) -> Result<RawAx25Socket, crate::raw_socket::Ax25Error> {
+fn open_connection(local_call: &str, remote_call: &str, via: &[String]) -> Result<RawAx25Socket, crate::raw_socket::Ax25Error> {
     let socket = RawAx25Socket::bind(local_call)?;
-    socket.connect(remote_call, &[])?;
+    socket.connect(remote_call, via)?;
     Ok(socket)
 }
 

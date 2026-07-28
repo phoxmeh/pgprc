@@ -20,7 +20,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use ax25::frame::{Address, Ax25Frame, FrameContent};
+use ax25::frame::{Address, Ax25Frame, FrameContent, RouteEntry};
 
 use pr_core::{PortCommand, PortEvent, PortRunner};
 
@@ -126,18 +126,20 @@ fn run_serial(device: &str, baud: u32, my_call: &str, cmd_rx: mpsc::Receiver<Por
 fn command_loop(writer: &mut impl Write, my_call: &str, cmd_rx: &mpsc::Receiver<PortCommand>, event_tx: &async_channel::Sender<PortEvent>) {
     loop {
         match cmd_rx.recv() {
-            Ok(PortCommand::SendUnproto { dest, bytes }) => {
+            Ok(PortCommand::SendUnproto { dest, via, bytes }) => {
                 // A raw KISS TNC (unlike AGWPE) won't echo our own
                 // transmission back to us, so log it locally.
                 let text = String::from_utf8_lossy(&bytes).replace('\0', "");
-                match build_ui_frame(my_call, &dest, bytes) {
+                match build_ui_frame(my_call, &dest, &via, bytes) {
                     Ok(frame) => {
                         let kiss_bytes = encode_data_frame(0, &frame.to_bytes());
                         if writer.write_all(&kiss_bytes).is_err() {
                             break;
                         }
+                        let via_suffix =
+                            if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
                         let _ = event_tx.send_blocking(PortEvent::Monitor {
-                            line: format!("{my_call} > {dest} [unproto TX]: {text}"),
+                            line: format!("{my_call} > {dest}{via_suffix} [unproto TX]: {text}"),
                         });
                     }
                     Err(e) => {
@@ -214,10 +216,14 @@ fn describe_frame(frame: &Ax25Frame) -> String {
     }
 }
 
-fn build_ui_frame(my_call: &str, dest: &str, info: Vec<u8>) -> Result<Ax25Frame, String> {
+fn build_ui_frame(my_call: &str, dest: &str, via: &[String], info: Vec<u8>) -> Result<Ax25Frame, String> {
     let source = parse_address(my_call)?;
     let destination = parse_address(dest)?;
-    Ok(Ax25Frame::new_simple_ui_frame(source, destination, info))
+    let mut frame = Ax25Frame::new_simple_ui_frame(source, destination, info);
+    for digi in via {
+        frame.route.push(RouteEntry { repeater: parse_address(digi)?, has_repeated: false });
+    }
+    Ok(frame)
 }
 
 fn parse_address(input: &str) -> Result<Address, String> {

@@ -11,10 +11,25 @@ use crate::highlight::{highlight_line, Highlighter, TagCache};
 pub type TabId = u64;
 
 /// True for port kinds that support opening a connected-mode session to a
-/// specific remote callsign (AGWPE, AX.25 raw socket). Telnet/SSH/KISS have
-/// no node concept — connecting the port *is* the whole session.
-pub fn port_needs_node(config: &PortConfig) -> bool {
+/// specific remote callsign (AGWPE, AX.25 raw socket). Telnet/SSH have no
+/// node concept — connecting the port *is* the whole session.
+pub fn port_supports_connect(config: &PortConfig) -> bool {
     matches!(config, PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. })
+}
+
+/// True for port kinds that can send one-shot unconnected (UI) traffic.
+/// AX.25 raw sockets only expose connected mode (`SOCK_SEQPACKET`); a
+/// separate `SOCK_DGRAM` socket would be needed for unproto and isn't
+/// implemented.
+pub fn port_supports_unproto(config: &PortConfig) -> bool {
+    matches!(config, PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. })
+}
+
+/// True for port kinds where entering a destination callsign makes sense at
+/// all — either connected-mode or unproto. Gates whether the tab shows its
+/// node/via/unproto row.
+pub fn port_needs_node(config: &PortConfig) -> bool {
+    port_supports_connect(config) || port_supports_unproto(config)
 }
 
 /// A user-managed session tab: pick a port (and, for node-capable ports, a
@@ -32,7 +47,13 @@ pub struct SessionTab {
     pub available_ports: Vec<PortEntry>,
     pub node_row: gtk::Box,
     pub node_entry: gtk::Entry,
+    /// Optional digipeater path, e.g. "WIDE1-1,WIDE2-1".
+    pub via_entry: gtk::Entry,
     pub address_book_button: gtk::Button,
+    /// When active, this tab sends unconnected (UI) traffic to `node_entry`
+    /// instead of opening a connected-mode session — Connect/Disconnect are
+    /// disabled and `input_entry` sends via `PortCommand::SendUnproto`.
+    pub unproto_toggle: gtk::CheckButton,
     pub connect_button: gtk::Button,
     pub disconnect_button: gtk::Button,
     pub input_entry: gtk::Entry,
@@ -40,10 +61,10 @@ pub struct SessionTab {
     /// Text received since the last completed line, for splitting arbitrary
     /// byte chunks into history lines.
     pending_line: RefCell<String>,
-    /// The (port_id, remote) currently persisted as pinned for this tab, if
-    /// any — lets us unpin the *old* identity when the user edits a pinned
-    /// tab's port/node instead of leaking an orphaned pin entry.
-    pub pinned_identity: RefCell<Option<(String, String)>>,
+    /// The (port_id, remote, unproto) currently persisted as pinned for this
+    /// tab, if any — lets us unpin the *old* identity when the user edits a
+    /// pinned tab's port/node/mode instead of leaking an orphaned pin entry.
+    pub pinned_identity: RefCell<Option<(String, String, bool)>>,
     buffer: gtk::TextBuffer,
     text_view: gtk::TextView,
     state: Rc<AppState>,
@@ -68,9 +89,13 @@ impl SessionTab {
 
         let node_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let node_entry = gtk::Entry::builder().placeholder_text("Node (callsign)").width_chars(12).build();
+        let via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(14).build();
         let address_book_button = gtk::Button::with_label("From Address Book\u{2026}");
+        let unproto_toggle = gtk::CheckButton::with_label("Unproto");
         node_row.append(&node_entry);
+        node_row.append(&via_entry);
         node_row.append(&address_book_button);
+        node_row.append(&unproto_toggle);
         controls.append(&node_row);
 
         let connect_button = gtk::Button::with_label("Connect");
@@ -115,7 +140,9 @@ impl SessionTab {
             available_ports,
             node_row,
             node_entry,
+            via_entry,
             address_book_button,
+            unproto_toggle,
             connect_button,
             disconnect_button,
             input_entry,
@@ -140,6 +167,19 @@ impl SessionTab {
         self.input_entry.set_sensitive(connected);
         self.port_dropdown.set_sensitive(!connected);
         self.node_entry.set_sensitive(!connected);
+        self.via_entry.set_sensitive(!connected);
+    }
+
+    /// The via digipeater path as an ordered, uppercased, non-empty list —
+    /// split on commas/whitespace.
+    pub fn via(&self) -> Vec<String> {
+        self.via_entry
+            .text()
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_uppercase())
+            .collect()
     }
 
     /// Insert raw text (NUL-sanitized) at the end of the buffer, scroll it
@@ -177,9 +217,11 @@ impl SessionTab {
         }
     }
 
-    fn history_key(&self) -> Option<(String, String)> {
+    /// `unproto` is part of the key so unproto traffic and a connected-mode
+    /// session to the same (port, remote) get separate history buckets.
+    fn history_key(&self) -> Option<(String, String, bool)> {
         let port = self.selected_port().filter(|p| port_needs_node(&p.config))?;
-        Some((port.id.clone(), self.node_entry.text().to_string()))
+        Some((port.id.clone(), self.node_entry.text().to_string(), self.unproto_toggle.is_active()))
     }
 
     /// Append a chunk of received bytes (already UTF8-decoded), highlighting
@@ -190,12 +232,12 @@ impl SessionTab {
         let (start_offset, sanitized) = self.insert(text);
         self.highlight_new_lines(start_offset, &sanitized);
 
-        if let Some((port_id, remote)) = self.history_key() {
+        if let Some((port_id, remote, unproto)) = self.history_key() {
             let mut pending = self.pending_line.borrow_mut();
             pending.push_str(&sanitized);
             while let Some(pos) = pending.find('\n') {
                 let line: String = pending.drain(..=pos).collect();
-                self.state.append_history_line(&port_id, &remote, line.trim_end_matches(['\r', '\n']));
+                self.state.append_history_line(&port_id, &remote, unproto, line.trim_end_matches(['\r', '\n']));
             }
         }
     }
@@ -203,10 +245,10 @@ impl SessionTab {
     /// Flush any trailing partial line to history (it'll never see a
     /// trailing `\n` otherwise) — call on disconnect.
     pub fn flush_pending(&self) {
-        let Some((port_id, remote)) = self.history_key() else { return };
+        let Some((port_id, remote, unproto)) = self.history_key() else { return };
         let mut pending = self.pending_line.borrow_mut();
         if !pending.is_empty() {
-            self.state.append_history_line(&port_id, &remote, pending.trim_end_matches(['\r', '\n']));
+            self.state.append_history_line(&port_id, &remote, unproto, pending.trim_end_matches(['\r', '\n']));
             pending.clear();
         }
     }
@@ -220,8 +262,8 @@ impl SessionTab {
         let (start_offset, sanitized) = self.insert(&formatted);
         self.highlight_new_lines(start_offset, &sanitized);
 
-        if let Some((port_id, remote)) = self.history_key() {
-            self.state.append_history_line(&port_id, &remote, &format!("\u{00BB} {text}"));
+        if let Some((port_id, remote, unproto)) = self.history_key() {
+            self.state.append_history_line(&port_id, &remote, unproto, &format!("\u{00BB} {text}"));
         }
     }
 

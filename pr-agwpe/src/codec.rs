@@ -55,6 +55,20 @@ impl AgwFrame {
         AgwFrame::new(0, 'P', "", "", data)
     }
 
+    /// Build a 'v' (Connect, Via Digipeater(s)) frame. `digis` is the ordered
+    /// digipeater path.
+    pub fn connect_via(port: u8, call_from: &str, call_to: &str, digis: &[String]) -> Self {
+        AgwFrame::new(port, 'v', call_from, call_to, encode_digi_path(digis))
+    }
+
+    /// Build a 'V' (Send UNPROTO Information, Via Digipeater(s)) frame:
+    /// same digipeater-path prefix as 'v', followed by the info payload.
+    pub fn unproto_via(port: u8, call_from: &str, call_to: &str, digis: &[String], info: Vec<u8>) -> Self {
+        let mut data = encode_digi_path(digis);
+        data.extend_from_slice(&info);
+        AgwFrame::new(port, 'V', call_from, call_to, data)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_LEN + self.data.len());
         buf.push(self.port);
@@ -104,6 +118,20 @@ fn write_padded(field: &mut [u8], value: &[u8]) {
     field[..n].copy_from_slice(&value[..n]);
 }
 
+/// Encodes a digipeater path the way AGWPE's 'v'/'V' (Connect/Unproto, Via
+/// Digipeater) frames expect it: a 1-byte count followed by each callsign in
+/// a 10-byte null-padded field, matching the header's `CallFrom`/`CallTo`
+/// field layout.
+fn encode_digi_path(digis: &[String]) -> Vec<u8> {
+    let mut data = vec![digis.len() as u8];
+    for digi in digis {
+        let mut field = [0u8; CALL_FIELD_LEN];
+        write_padded(&mut field, digi.as_bytes());
+        data.extend_from_slice(&field);
+    }
+    data
+}
+
 fn read_padded(field: &[u8]) -> String {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     String::from_utf8_lossy(&field[..end]).to_string()
@@ -144,6 +172,27 @@ mod tests {
         assert_eq!(decoded.call_from, "MYCALL-1");
         assert_eq!(decoded.call_to, "N0CALL-2");
         assert_eq!(decoded.data, b"hello");
+    }
+
+    #[test]
+    fn connect_via_encodes_digi_count_and_padded_calls() {
+        let digis = vec!["WIDE1-1".to_string(), "WIDE2-1".to_string()];
+        let frame = AgwFrame::connect_via(0, "MYCALL-1", "N0CALL-2", &digis);
+        assert_eq!(frame.kind(), 'v');
+        assert_eq!(frame.data[0], 2);
+        assert_eq!(read_padded(&frame.data[1..11]), "WIDE1-1");
+        assert_eq!(read_padded(&frame.data[11..21]), "WIDE2-1");
+        assert_eq!(frame.data.len(), 21);
+    }
+
+    #[test]
+    fn unproto_via_appends_info_after_digi_path() {
+        let digis = vec!["WIDE1-1".to_string()];
+        let frame = AgwFrame::unproto_via(0, "MYCALL-1", "BEACON", &digis, b"hello".to_vec());
+        assert_eq!(frame.kind(), 'V');
+        assert_eq!(frame.data[0], 1);
+        assert_eq!(read_padded(&frame.data[1..11]), "WIDE1-1");
+        assert_eq!(&frame.data[11..], b"hello");
     }
 
     #[test]

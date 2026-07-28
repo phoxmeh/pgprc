@@ -69,42 +69,53 @@ impl AppState {
         self.save_config();
     }
 
-    pub fn is_pinned(&self, port_id: &str, remote: &str) -> bool {
-        self.config.borrow().pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote)
+    pub fn is_pinned(&self, port_id: &str, remote: &str, unproto: bool) -> bool {
+        self.config
+            .borrow()
+            .pinned_sessions
+            .iter()
+            .any(|p| p.port_id == port_id && p.remote == remote && p.unproto == unproto)
     }
 
-    /// Pin or unpin a (port, node) tab so its shell (port + node prefilled,
-    /// disconnected) is recreated automatically at the next app startup.
-    pub fn set_pinned(&self, port_id: &str, remote: &str, pinned: bool) {
+    /// Pin or unpin a (port, node, mode) tab so its shell (port + node
+    /// prefilled, disconnected) is recreated automatically at the next app
+    /// startup. Unconditionally replaces any existing entry for the same
+    /// (port_id, remote, unproto) with the current `via`, so editing a
+    /// pinned tab's via path while pinned keeps it in sync.
+    pub fn set_pinned(&self, port_id: &str, remote: &str, unproto: bool, via: &str, pinned: bool) {
         let mut cfg = self.config.borrow_mut();
+        cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote && p.unproto == unproto));
         if pinned {
-            if !cfg.pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote) {
-                cfg.pinned_sessions
-                    .push(PinnedSession { port_id: port_id.to_string(), remote: remote.to_string() });
-            }
-        } else {
-            cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote));
+            cfg.pinned_sessions.push(PinnedSession {
+                port_id: port_id.to_string(),
+                remote: remote.to_string(),
+                via: via.to_string(),
+                unproto,
+            });
         }
         drop(cfg);
         self.save_config();
     }
 
-    pub fn history_for(&self, port_id: &str, remote: &str) -> Vec<String> {
+    /// `unproto` keeps connected-mode session history separate from unproto
+    /// traffic history to the same (port, remote) — they're unrelated
+    /// conversations that happen to share a destination callsign.
+    pub fn history_for(&self, port_id: &str, remote: &str, unproto: bool) -> Vec<String> {
         self.config
             .borrow()
             .node_history
             .iter()
-            .find(|h| h.port_id == port_id && h.remote == remote)
+            .find(|h| h.port_id == port_id && h.remote == remote && h.unproto == unproto)
             .map(|h| h.lines.clone())
             .unwrap_or_default()
     }
 
-    /// Append one completed line to a (port, node)'s persisted history,
-    /// trimming to the configured max line count.
-    pub fn append_history_line(&self, port_id: &str, remote: &str, line: &str) {
+    /// Append one completed line to a (port, node, mode)'s persisted
+    /// history, trimming to the configured max line count.
+    pub fn append_history_line(&self, port_id: &str, remote: &str, unproto: bool, line: &str) {
         let mut cfg = self.config.borrow_mut();
         let max_lines = cfg.ui.history_lines as usize;
-        match cfg.node_history.iter_mut().find(|h| h.port_id == port_id && h.remote == remote) {
+        match cfg.node_history.iter_mut().find(|h| h.port_id == port_id && h.remote == remote && h.unproto == unproto) {
             Some(entry) => {
                 entry.lines.push(line.to_string());
                 if entry.lines.len() > max_lines {
@@ -115,6 +126,7 @@ impl AppState {
             None => cfg.node_history.push(NodeHistory {
                 port_id: port_id.to_string(),
                 remote: remote.to_string(),
+                unproto,
                 lines: vec![line.to_string()],
             }),
         }

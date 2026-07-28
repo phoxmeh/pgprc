@@ -42,12 +42,16 @@ pub enum PortEvent {
 pub enum PortCommand {
     Connect,
     Disconnect,
-    OpenConnection { remote: String },
+    /// `via` is an optional digipeater path (e.g. `["WIDE1-1", "WIDE2-1"]`),
+    /// empty for a direct connection. Backends with no digipeating support
+    /// ignore a non-empty list.
+    OpenConnection { remote: String, via: Vec<String> },
     CloseConnection { id: ConnectionId },
     Send { id: ConnectionId, bytes: Vec<u8> },
     /// One-shot unconnected (UI) frame, e.g. a beacon. Backends that have no
-    /// notion of unproto traffic (Telnet, SSH) silently ignore this.
-    SendUnproto { dest: String, bytes: Vec<u8> },
+    /// notion of unproto traffic (Telnet, SSH) silently ignore this. `via` is
+    /// an optional digipeater path, same as `OpenConnection`.
+    SendUnproto { dest: String, via: Vec<String>, bytes: Vec<u8> },
 }
 
 pub struct PortHandle {
