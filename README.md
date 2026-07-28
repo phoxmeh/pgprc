@@ -113,6 +113,11 @@ makepkg -f
 sudo pacman -U packet-radio-*.pkg.tar.zst
 ```
 
+Optional dependencies: `direwolf` (sound-card TNC — required for the
+header's managed Direwolf process button to do anything) and `linux-lts`
+(a Linux kernel build with AX.25 support, for the `AF_AX25` raw-socket port
+kind — the mainline `linux` kernel package doesn't enable it).
+
 ## Workspace layout
 
 | Crate      | Purpose                                                          |

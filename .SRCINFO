@@ -1,8 +1,9 @@
 pkgbase = packet-radio
 	pkgdesc = Linux-native AGWPE/AX.25/KISS packet radio client
 	pkgver = 0.1.0
-	pkgrel = 2
+	pkgrel = 3
 	url = https://example.invalid/packet-radio
+	install = packet-radio.install
 	arch = x86_64
 	license = MIT
 	makedepends = cargo
@@ -10,6 +11,10 @@ pkgbase = packet-radio
 	depends = gtk4
 	depends = libadwaita
 	depends = systemd-libs
+	depends = hicolor-icon-theme
+	depends = desktop-file-utils
+	optdepends = direwolf: sound modem
+	optdepends = linux-lts: native Linux AX.25 modem support
 	options = !lto
 
 pkgname = packet-radio

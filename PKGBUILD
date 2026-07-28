@@ -6,14 +6,17 @@
 # tarball/git URL for a proper (e.g. AUR) submission.
 pkgname=packet-radio
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Linux-native AGWPE/AX.25/KISS packet radio client"
 arch=('x86_64')
 url="https://example.invalid/packet-radio" # TODO: replace once a remote exists
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'systemd-libs')
+depends=('gtk4' 'libadwaita' 'systemd-libs' 'hicolor-icon-theme' 'desktop-file-utils')
+optdepends=('direwolf: sound modem'
+            'linux-lts: native Linux AX.25 modem support')
 makedepends=('cargo' 'pkgconf')
 options=('!lto')
+install=packet-radio.install
 source=()
 sha256sums=()
 

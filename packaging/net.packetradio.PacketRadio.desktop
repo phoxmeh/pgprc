@@ -6,5 +6,5 @@ Comment=AGWPE/AX.25/KISS packet radio client
 Exec=packet-radio
 Icon=net.packetradio.PacketRadio
 Terminal=false
-Categories=Network;HamRadio;
+Categories=Network;X-HamRadio;
 StartupWMClass=net.packetradio.PacketRadio
