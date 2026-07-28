@@ -93,6 +93,18 @@ pub struct AddressBookEntry {
     pub heard_count: u32,
 }
 
+/// A connection tab the user pinned, so it's reopened automatically the
+/// next time its port connects (including at app startup, for an
+/// autoconnect port). Only meaningful for ports that support opening
+/// connections to a remote callsign (AGWPE, AX.25 raw socket) — pinning a
+/// Telnet/SSH tab is a harmless no-op since those ports auto-open their one
+/// connection already.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinnedSession {
+    pub port_id: String,
+    pub remote: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgwpeLogin {
     pub username: String,
@@ -147,6 +159,8 @@ pub struct AppConfig {
     pub ui: UiPrefs,
     #[serde(default)]
     pub address_book: Vec<AddressBookEntry>,
+    #[serde(default)]
+    pub pinned_sessions: Vec<PinnedSession>,
 }
 
 impl AppConfig {

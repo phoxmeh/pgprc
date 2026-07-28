@@ -6,7 +6,7 @@ use pr_agwpe::client::AgwpeRunner;
 use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
-use pr_core::{spawn_port, AddressBookEntry, AppConfig, PortConfig, PortEntry, PortHandle};
+use pr_core::{spawn_port, AddressBookEntry, AppConfig, PinnedSession, PortConfig, PortEntry, PortHandle};
 
 pub struct AppState {
     pub config: RefCell<AppConfig>,
@@ -64,6 +64,26 @@ impl AppState {
                 last_heard: Some(now),
                 heard_count: 1,
             }),
+        }
+        drop(cfg);
+        self.save_config();
+    }
+
+    pub fn is_pinned(&self, port_id: &str, remote: &str) -> bool {
+        self.config.borrow().pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote)
+    }
+
+    /// Pin or unpin a (port, remote callsign) session so it's reopened
+    /// automatically next time that port connects.
+    pub fn set_pinned(&self, port_id: &str, remote: &str, pinned: bool) {
+        let mut cfg = self.config.borrow_mut();
+        if pinned {
+            if !cfg.pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote) {
+                cfg.pinned_sessions
+                    .push(PinnedSession { port_id: port_id.to_string(), remote: remote.to_string() });
+            }
+        } else {
+            cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote));
         }
         drop(cfg);
         self.save_config();

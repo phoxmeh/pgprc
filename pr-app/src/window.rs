@@ -40,6 +40,23 @@ impl Ui {
         let events = handle.events.clone();
         self.state.active.borrow_mut().insert(id.to_string(), handle);
 
+        // Reopen any sessions the user pinned on this port (including at
+        // startup, for an autoconnect port). Commands queue on the port's
+        // channel even before its background thread reaches its command
+        // loop, so sending these immediately is safe.
+        let pinned_remotes: Vec<String> = self
+            .state
+            .config
+            .borrow()
+            .pinned_sessions
+            .iter()
+            .filter(|p| p.port_id == id)
+            .map(|p| p.remote.clone())
+            .collect();
+        for remote in pinned_remotes {
+            let _ = cmd_tx.send(PortCommand::OpenConnection { remote });
+        }
+
         let ui = self.clone();
         let port_id = id.to_string();
         glib::spawn_future_local(async move {
@@ -68,6 +85,40 @@ impl Ui {
         }
     }
 
+    /// Tab label with a title plus Pin/Close controls: Pin persists the
+    /// (port, remote) pair so the session reopens automatically next time
+    /// this port connects; Close ends just this one connection.
+    fn build_tab_label(self: &Rc<Self>, port_id: &str, conn_id: ConnectionId, remote: &str, cmd_tx: &mpsc::Sender<PortCommand>) -> gtk::Box {
+        let tab_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+
+        let title = gtk::Label::new(Some(&format!("{port_id}: {remote}")));
+        tab_box.append(&title);
+
+        let pin_toggle = gtk::ToggleButton::builder().label("Pin").active(self.state.is_pinned(port_id, remote)).build();
+        pin_toggle.add_css_class("flat");
+        {
+            let ui = self.clone();
+            let port_id = port_id.to_string();
+            let remote = remote.to_string();
+            pin_toggle.connect_toggled(move |btn| {
+                ui.state.set_pinned(&port_id, &remote, btn.is_active());
+            });
+        }
+        tab_box.append(&pin_toggle);
+
+        let close_button = gtk::Button::with_label("\u{2715}");
+        close_button.add_css_class("flat");
+        {
+            let cmd_tx = cmd_tx.clone();
+            close_button.connect_clicked(move |_| {
+                let _ = cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
+            });
+        }
+        tab_box.append(&close_button);
+
+        tab_box
+    }
+
     fn handle_event(self: &Rc<Self>, port_id: &str, cmd_tx: &mpsc::Sender<PortCommand>, event: PortEvent) {
         match event {
             PortEvent::PortConnected => {
@@ -76,6 +127,23 @@ impl Ui {
             PortEvent::PortDisconnected { reason } => {
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
                 self.monitor.append_line(&format!("[{port_id}] port disconnected{suffix}"));
+                // The port thread is gone, so any of its connection tabs are
+                // now stale (they'll never get a ConnectionClosed event) —
+                // close them, or reconnecting would leave duplicate tabs.
+                let stale: Vec<ConnectionId> = self
+                    .tabs
+                    .borrow()
+                    .keys()
+                    .filter(|(pid, _)| pid == port_id)
+                    .map(|(_, id)| *id)
+                    .collect();
+                for id in stale {
+                    if let Some(tab) = self.tabs.borrow_mut().remove(&(port_id.to_string(), id)) {
+                        if let Some(page) = self.notebook.page_num(&tab.root) {
+                            self.notebook.remove_page(Some(page));
+                        }
+                    }
+                }
             }
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
@@ -92,8 +160,10 @@ impl Ui {
                     let _ = cmd_tx2.send(PortCommand::Send { id, bytes });
                     entry.set_text("");
                 });
-                let tab_label = gtk::Label::new(Some(&format!("{port_id}: {label}")));
+
+                let tab_label = self.build_tab_label(port_id, id, &label, cmd_tx);
                 self.notebook.append_page(&tab.root, Some(&tab_label));
+                self.notebook.set_tab_reorderable(&tab.root, true);
                 let page_idx = self.notebook.page_num(&tab.root);
                 self.notebook.set_current_page(page_idx);
                 self.tabs.borrow_mut().insert((port_id.to_string(), id), tab);
@@ -184,7 +254,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let monitor = MonitorView::new();
     monitor.set_show_timestamps(show_timestamps);
-    let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).build();
+    let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).scrollable(true).build();
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
