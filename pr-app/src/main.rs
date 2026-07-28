@@ -1,5 +1,6 @@
 mod address_book_dialog;
 mod app_state;
+mod highlight;
 mod monitor_view;
 mod ports_dialog;
 mod preferences_dialog;

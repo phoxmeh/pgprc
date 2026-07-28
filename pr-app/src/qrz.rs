@@ -40,7 +40,7 @@ pub fn lookup(username: &str, password: &str, session: &mut Option<String>, call
 /// callsign) — strip a trailing "-<digits>" like the "-9" in "KD3BFP-9"
 /// before looking anything up. Non-numeric suffixes (there shouldn't be any
 /// for AX.25, but just in case) are left alone.
-fn strip_ssid(callsign: &str) -> &str {
+pub(crate) fn strip_ssid(callsign: &str) -> &str {
     match callsign.rsplit_once('-') {
         Some((base, ssid)) if !ssid.is_empty() && ssid.chars().all(|c| c.is_ascii_digit()) => base,
         _ => callsign,

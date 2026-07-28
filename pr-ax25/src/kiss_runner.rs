@@ -186,15 +186,31 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
     }
 }
 
+/// Describes a decoded frame with its standard AX.25 command/response
+/// mnemonic in brackets (matching the bracketed style AGWPE's monitor
+/// already uses), so both backends give the highlighter one consistent
+/// "frame tag" shape to color.
 fn describe_frame(frame: &Ax25Frame) -> String {
     let from = frame.source.to_string();
     let to = frame.destination.to_string();
     match &frame.content {
+        FrameContent::Information(i) => {
+            let text = String::from_utf8_lossy(&i.info).replace('\0', "");
+            format!("{from} > {to} [I N(S)={} N(R)={}]: {text}", i.send_sequence, i.receive_sequence)
+        }
         FrameContent::UnnumberedInformation(ui) => {
             let text = String::from_utf8_lossy(&ui.info).replace('\0', "");
             format!("{from} > {to} [UI]: {text}")
         }
-        other => format!("{from} > {to}: {other:?}"),
+        FrameContent::ReceiveReady(rr) => format!("{from} > {to} [RR N(R)={}]", rr.receive_sequence),
+        FrameContent::ReceiveNotReady(rnr) => format!("{from} > {to} [RNR N(R)={}]", rnr.receive_sequence),
+        FrameContent::Reject(rej) => format!("{from} > {to} [REJ N(R)={}]", rej.receive_sequence),
+        FrameContent::SetAsynchronousBalancedMode(_) => format!("{from} > {to} [SABM]"),
+        FrameContent::Disconnect(_) => format!("{from} > {to} [DISC]"),
+        FrameContent::DisconnectedMode(_) => format!("{from} > {to} [DM]"),
+        FrameContent::UnnumberedAcknowledge(_) => format!("{from} > {to} [UA]"),
+        FrameContent::FrameReject(_) => format!("{from} > {to} [FRMR]"),
+        FrameContent::UnknownContent(_) => format!("{from} > {to} [?]"),
     }
 }
 

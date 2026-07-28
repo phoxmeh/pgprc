@@ -1,8 +1,12 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use gtk::prelude::*;
 
 use pr_core::{ConnectionId, PortConfig, PortEntry};
+
+use crate::app_state::AppState;
+use crate::highlight::{highlight_line, Highlighter, TagCache};
 
 pub type TabId = u64;
 
@@ -35,17 +39,19 @@ pub struct SessionTab {
     pub conn_id: Cell<Option<ConnectionId>>,
     /// Text received since the last completed line, for splitting arbitrary
     /// byte chunks into history lines.
-    pub pending_line: RefCell<String>,
+    pending_line: RefCell<String>,
     /// The (port_id, remote) currently persisted as pinned for this tab, if
     /// any — lets us unpin the *old* identity when the user edits a pinned
     /// tab's port/node instead of leaking an orphaned pin entry.
     pub pinned_identity: RefCell<Option<(String, String)>>,
     buffer: gtk::TextBuffer,
     text_view: gtk::TextView,
+    state: Rc<AppState>,
+    tags: TagCache,
 }
 
 impl SessionTab {
-    pub fn new(available_ports: Vec<PortEntry>) -> Self {
+    pub fn new(available_ports: Vec<PortEntry>, state: Rc<AppState>) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         root.set_margin_top(4);
         root.set_margin_bottom(4);
@@ -118,6 +124,8 @@ impl SessionTab {
             pinned_identity: RefCell::new(None),
             buffer,
             text_view,
+            state,
+            tags: TagCache::new(),
         }
     }
 
@@ -134,25 +142,99 @@ impl SessionTab {
         self.node_entry.set_sensitive(!connected);
     }
 
-    pub fn append_text(&self, text: &str) {
+    /// Insert raw text (NUL-sanitized) at the end of the buffer, scroll it
+    /// into view, and return the char offset it was inserted at plus the
+    /// sanitized text actually inserted — callers use the offset to
+    /// highlight exactly the span they just added.
+    fn insert(&self, text: &str) -> (i32, String) {
         // GTK's string marshaling panics on embedded NUL bytes; a peer could
         // send arbitrary/binary data over a connection.
         let sanitized = if text.contains('\0') { text.replace('\0', "") } else { text.to_string() };
         let mut end = self.buffer.end_iter();
+        let start_offset = end.offset();
         self.buffer.insert(&mut end, &sanitized);
         let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
         self.text_view.scroll_mark_onscreen(&end_mark);
+        (start_offset, sanitized)
+    }
+
+    /// Highlight every *complete* line within the just-inserted span
+    /// starting at `start_offset` (a trailing partial line with no `\n` yet
+    /// is left for a later call, once it's completed by more text — matches
+    /// essentially never span a chunk boundary at packet-radio line rates,
+    /// so this is not worth the complexity of re-scanning on every chunk).
+    fn highlight_new_lines(&self, start_offset: i32, text: &str) {
+        let highlighter = Highlighter::build(&self.state.config.borrow());
+        let mut line_start = start_offset;
+        let mut line_start_byte = 0;
+        for (byte_idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                let line_text = &text[line_start_byte..byte_idx];
+                highlight_line(&highlighter, &self.buffer, &self.tags, line_start, line_text);
+                line_start += (line_text.chars().count() + 1) as i32; // +1 for the '\n' itself
+                line_start_byte = byte_idx + 1;
+            }
+        }
+    }
+
+    fn history_key(&self) -> Option<(String, String)> {
+        let port = self.selected_port().filter(|p| port_needs_node(&p.config))?;
+        Some((port.id.clone(), self.node_entry.text().to_string()))
+    }
+
+    /// Append a chunk of received bytes (already UTF8-decoded), highlighting
+    /// completed lines and splitting them off to persist to node history —
+    /// the backend gives us whatever it read off the wire, not necessarily
+    /// aligned to line boundaries.
+    pub fn receive_data(&self, text: &str) {
+        let (start_offset, sanitized) = self.insert(text);
+        self.highlight_new_lines(start_offset, &sanitized);
+
+        if let Some((port_id, remote)) = self.history_key() {
+            let mut pending = self.pending_line.borrow_mut();
+            pending.push_str(&sanitized);
+            while let Some(pos) = pending.find('\n') {
+                let line: String = pending.drain(..=pos).collect();
+                self.state.append_history_line(&port_id, &remote, line.trim_end_matches(['\r', '\n']));
+            }
+        }
+    }
+
+    /// Flush any trailing partial line to history (it'll never see a
+    /// trailing `\n` otherwise) — call on disconnect.
+    pub fn flush_pending(&self) {
+        let Some((port_id, remote)) = self.history_key() else { return };
+        let mut pending = self.pending_line.borrow_mut();
+        if !pending.is_empty() {
+            self.state.append_history_line(&port_id, &remote, pending.trim_end_matches(['\r', '\n']));
+            pending.clear();
+        }
+    }
+
+    /// Echo a locally-sent line (the operator's own typed text) into the
+    /// scrollback and history. Connected-mode AX.25/AGWPE backends don't
+    /// echo our own transmissions back to us, so without this the buffer
+    /// would only ever show what the *other* station sent.
+    pub fn append_sent_line(&self, text: &str) {
+        let formatted = format!("\u{00BB} {text}\n");
+        let (start_offset, sanitized) = self.insert(&formatted);
+        self.highlight_new_lines(start_offset, &sanitized);
+
+        if let Some((port_id, remote)) = self.history_key() {
+            self.state.append_history_line(&port_id, &remote, &format!("\u{00BB} {text}"));
+        }
     }
 
     /// Replace the whole scrollback with the given historical lines (used
     /// when previewing a previous node's history before connecting).
     pub fn load_history(&self, lines: &[String]) {
-        self.buffer.set_text(&lines.join("\n"));
-        if !lines.is_empty() {
-            self.buffer.insert(&mut self.buffer.end_iter(), "\n");
+        self.buffer.set_text("");
+        if lines.is_empty() {
+            return;
         }
-        let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
-        self.text_view.scroll_mark_onscreen(&end_mark);
+        let text = format!("{}\n", lines.join("\n"));
+        let (start_offset, sanitized) = self.insert(&text);
+        self.highlight_new_lines(start_offset, &sanitized);
     }
 
     pub fn clear_text(&self) {

@@ -74,7 +74,7 @@ impl Ui {
         self.next_tab_id.set(tab_id + 1);
 
         let ports = self.state.config.borrow().ports.clone();
-        let tab = SessionTab::new(ports);
+        let tab = SessionTab::new(ports, self.state.clone());
 
         if let Some((port_id, remote)) = &prefill {
             if let Some(idx) = tab.available_ports.iter().position(|p| &p.id == port_id) {
@@ -169,12 +169,23 @@ impl Ui {
         {
             let ui = self.clone();
             input_entry.connect_activate(move |entry| {
-                let mut bytes = entry.text().to_string().into_bytes();
+                let text = entry.text().to_string();
+                let mut bytes = text.clone().into_bytes();
                 bytes.push(b'\n');
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     if let (Some(conn_id), Some(port)) = (tab.conn_id.get(), tab.selected_port()) {
                         if let Some(handle) = ui.state.active.borrow().get(&port.id) {
                             let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
+                        }
+                        // Connected-mode AX.25/AGWPE backends don't echo our
+                        // own transmissions back, so log what we sent
+                        // ourselves. Telnet/SSH already get a remote echo
+                        // from the far end, so don't double it up there.
+                        if port_needs_node(&port.config) {
+                            let port_name = port.name.clone();
+                            let remote = tab.node_entry.text().to_string();
+                            tab.append_sent_line(&text);
+                            ui.monitor.append_line(&format!("[{port_name}] TX > {remote}: {text}"));
                         }
                     }
                 }
@@ -385,7 +396,7 @@ impl Ui {
                     if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                         tab.conn_id.set(None);
                         tab.set_connected(false);
-                        self.flush_pending_line(tab);
+                        tab.flush_pending();
                     }
                 }
             }
@@ -397,37 +408,13 @@ impl Ui {
                 if let Some(&tab_id) = self.bound.borrow().get(&(port_id.to_string(), id)) {
                     if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                         let text = String::from_utf8_lossy(&bytes).replace('\0', "");
-                        tab.append_text(&text);
-                        // Only node-capable ports have anything meaningful to
-                        // preview later (see `preview_history`), so don't
-                        // bother persisting history for the rest.
-                        if let Some(port) = tab.selected_port().filter(|p| port_needs_node(&p.config)) {
-                            let port_id = port.id.clone();
-                            let remote = tab.node_entry.text().to_string();
-                            let mut pending_line = tab.pending_line.borrow_mut();
-                            pending_line.push_str(&text);
-                            while let Some(pos) = pending_line.find('\n') {
-                                let line: String = pending_line.drain(..=pos).collect();
-                                self.state.append_history_line(&port_id, &remote, line.trim_end_matches(['\r', '\n']));
-                            }
-                        }
+                        tab.receive_data(&text);
                     }
                 }
             }
             PortEvent::StationHeard { callsign } => {
                 self.state.record_heard(&callsign);
             }
-        }
-    }
-
-    fn flush_pending_line(&self, tab: &SessionTab) {
-        let Some(port) = tab.selected_port().filter(|p| port_needs_node(&p.config)) else { return };
-        let port_id = port.id.clone();
-        let remote = tab.node_entry.text().to_string();
-        let mut pending_line = tab.pending_line.borrow_mut();
-        if !pending_line.is_empty() {
-            self.state.append_history_line(&port_id, &remote, pending_line.trim_end_matches(['\r', '\n']));
-            pending_line.clear();
         }
     }
 }
@@ -493,7 +480,7 @@ pub fn build_ui(app: &adw::Application) {
         .default_height(700)
         .build();
 
-    let monitor = MonitorView::new();
+    let monitor = MonitorView::new(state.clone());
     monitor.set_show_timestamps(show_timestamps);
     let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).scrollable(true).build();
 

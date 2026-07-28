@@ -120,6 +120,80 @@ pub struct AgwpeLogin {
     pub password: String,
 }
 
+/// A user-defined highlight: any line containing text matching `pattern`
+/// gets that span colored. Seeded by default with common traffic keywords
+/// (CQ, BEACON, IDENT); users add more of these for their own nets/bulletins
+/// — there's no separate mechanism for "custom" rules, just more entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighlightRule {
+    pub label: String,
+    /// Case-insensitive. Literal keywords separated by `,` or `|` unless
+    /// `regex` is set, in which case it's used as a regex directly.
+    pub pattern: String,
+    #[serde(default)]
+    pub regex: bool,
+    /// A CSS-style color, e.g. `"#FFD700"`.
+    pub color: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Monitor/session scrollback highlighting preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighlightPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Color for AX.25-style callsign tokens not in the address book.
+    #[serde(default = "default_callsign_color")]
+    pub callsign_color: String,
+    /// Color for callsign tokens matching an address book entry.
+    #[serde(default = "default_known_callsign_color")]
+    pub known_callsign_color: String,
+    /// Color for the bracketed frame/command tag on monitor lines, e.g.
+    /// `[UI]`, `[SABM]`, `[I N(S)=1 N(R)=0]`.
+    #[serde(default = "default_ax25_command_color")]
+    pub ax25_command_color: String,
+    #[serde(default = "default_rules")]
+    pub rules: Vec<HighlightRule>,
+}
+
+fn default_callsign_color() -> String {
+    "#4FC1FF".to_string()
+}
+
+fn default_known_callsign_color() -> String {
+    "#B5CEA8".to_string()
+}
+
+fn default_ax25_command_color() -> String {
+    "#C586C0".to_string()
+}
+
+fn default_rules() -> Vec<HighlightRule> {
+    vec![
+        HighlightRule { label: "CQ".to_string(), pattern: "CQ".to_string(), regex: false, color: "#FFD700".to_string(), enabled: true },
+        HighlightRule {
+            label: "BEACON/IDENT".to_string(),
+            pattern: "BEACON,IDENT".to_string(),
+            regex: false,
+            color: "#FF8C00".to_string(),
+            enabled: true,
+        },
+    ]
+}
+
+impl Default for HighlightPrefs {
+    fn default() -> Self {
+        HighlightPrefs {
+            enabled: true,
+            callsign_color: default_callsign_color(),
+            known_callsign_color: default_known_callsign_color(),
+            ax25_command_color: default_ax25_command_color(),
+            rules: default_rules(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPrefs {
     #[serde(default = "default_true")]
@@ -180,6 +254,8 @@ pub struct AppConfig {
     pub pinned_sessions: Vec<PinnedSession>,
     #[serde(default)]
     pub node_history: Vec<NodeHistory>,
+    #[serde(default)]
+    pub highlighting: HighlightPrefs,
 }
 
 impl AppConfig {
