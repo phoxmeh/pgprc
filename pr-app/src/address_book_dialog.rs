@@ -312,3 +312,60 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
 
     win.present();
 }
+
+/// Open a small picker listing address book entries; selecting one writes
+/// its callsign into `target` and closes the picker.
+pub fn pick(ui: &Rc<Ui>, target: &gtk::Entry) {
+    let (win, root) = dialog_window(&ui.window, "Choose a Station", 420);
+    win.set_default_height(360);
+
+    let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    list_box.add_css_class("boxed-list");
+    let scrolled = gtk::ScrolledWindow::builder().child(&list_box).vexpand(true).min_content_height(220).build();
+    root.append(&scrolled);
+
+    let mut entries: Vec<AddressBookEntry> = ui.state.config.borrow().address_book.clone();
+    entries.sort_by(|a, b| a.callsign.cmp(&b.callsign));
+    if entries.is_empty() {
+        let label = gtk::Label::new(Some("No address book entries yet."));
+        label.set_margin_top(12);
+        label.set_margin_bottom(12);
+        list_box.append(&label);
+    }
+    for entry in entries {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_top(6);
+        row.set_margin_bottom(6);
+        row.set_margin_start(6);
+        row.set_margin_end(6);
+
+        let mut summary = entry.callsign.clone();
+        if let Some(name) = &entry.name {
+            if !name.is_empty() {
+                summary.push_str(&format!("  \u{2014}  {name}"));
+            }
+        }
+        let label = gtk::Label::new(Some(&summary));
+        label.set_halign(gtk::Align::Start);
+        label.set_hexpand(true);
+        row.append(&label);
+
+        let use_button = gtk::Button::with_label("Use");
+        {
+            let ui = ui.clone();
+            let target = target.clone();
+            let win = win.clone();
+            let callsign = entry.callsign.clone();
+            use_button.connect_clicked(move |_| {
+                target.set_text(&callsign);
+                ui.refresh_tab_for_node_entry(&target);
+                win.close();
+            });
+        }
+        row.append(&use_button);
+
+        list_box.append(&row);
+    }
+
+    win.present();
+}

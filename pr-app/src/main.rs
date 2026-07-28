@@ -1,10 +1,10 @@
 mod address_book_dialog;
 mod app_state;
-mod connection_view;
 mod monitor_view;
 mod ports_dialog;
 mod preferences_dialog;
 mod qrz;
+mod session_tab;
 mod window;
 
 use adw::prelude::*;

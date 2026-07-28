@@ -1,7 +1,6 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -10,16 +9,23 @@ use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
 
 use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
-use crate::connection_view::ConnectionTab;
 use crate::monitor_view::MonitorView;
 use crate::ports_dialog;
 use crate::preferences_dialog;
+use crate::session_tab::{port_needs_node, SessionTab, TabId};
 
 pub struct Ui {
     pub state: Rc<AppState>,
     pub monitor: MonitorView,
     pub notebook: gtk::Notebook,
-    pub tabs: RefCell<HashMap<(String, ConnectionId), ConnectionTab>>,
+    pub tabs: RefCell<HashMap<TabId, SessionTab>>,
+    /// Live connection (port, id) -> the tab it's bound to.
+    bound: RefCell<HashMap<(String, ConnectionId), TabId>>,
+    /// A Connect click in progress, keyed by (port_id, remote) — remote is
+    /// empty for port kinds with no node concept (Telnet/SSH/KISS), since
+    /// those only ever have one connection to bind.
+    pending: RefCell<HashMap<(String, String), TabId>>,
+    next_tab_id: Cell<TabId>,
     pub window: adw::ApplicationWindow,
 }
 
@@ -36,32 +42,14 @@ impl Ui {
             .append_line(&format!("[{}] connecting ({})\u{2026}", entry.name, entry.config.kind_label()));
 
         let handle = spawn_for_config(&entry.config);
-        let cmd_tx = handle.cmd_tx.clone();
         let events = handle.events.clone();
         self.state.active.borrow_mut().insert(id.to_string(), handle);
-
-        // Reopen any sessions the user pinned on this port (including at
-        // startup, for an autoconnect port). Commands queue on the port's
-        // channel even before its background thread reaches its command
-        // loop, so sending these immediately is safe.
-        let pinned_remotes: Vec<String> = self
-            .state
-            .config
-            .borrow()
-            .pinned_sessions
-            .iter()
-            .filter(|p| p.port_id == id)
-            .map(|p| p.remote.clone())
-            .collect();
-        for remote in pinned_remotes {
-            let _ = cmd_tx.send(PortCommand::OpenConnection { remote });
-        }
 
         let ui = self.clone();
         let port_id = id.to_string();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
-                ui.handle_event(&port_id, &cmd_tx, event);
+                ui.handle_event(&port_id, event);
             }
             ui.state.active.borrow_mut().remove(&port_id);
         });
@@ -73,53 +61,276 @@ impl Ui {
         }
     }
 
-    pub fn open_connection(&self, id: &str, remote: String) {
-        if let Some(handle) = self.state.active.borrow().get(id) {
-            let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote });
-        }
-    }
-
     pub fn send_unproto(&self, id: &str, dest: String, bytes: Vec<u8>) {
         if let Some(handle) = self.state.active.borrow().get(id) {
             let _ = handle.cmd_tx.send(PortCommand::SendUnproto { dest, bytes });
         }
     }
 
-    /// Tab label with a title plus Pin/Close controls: Pin persists the
-    /// (port, remote) pair so the session reopens automatically next time
-    /// this port connects; Close ends just this one connection.
-    fn build_tab_label(self: &Rc<Self>, port_id: &str, conn_id: ConnectionId, remote: &str, cmd_tx: &mpsc::Sender<PortCommand>) -> gtk::Box {
-        let tab_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    /// Create a new, disconnected session tab — optionally prefilled with a
+    /// (port_id, remote) — and return its id.
+    pub fn add_tab(self: &Rc<Self>, prefill: Option<(String, String)>) -> TabId {
+        let tab_id = self.next_tab_id.get();
+        self.next_tab_id.set(tab_id + 1);
 
-        let title = gtk::Label::new(Some(&format!("{port_id}: {remote}")));
-        tab_box.append(&title);
+        let ports = self.state.config.borrow().ports.clone();
+        let tab = SessionTab::new(ports);
 
-        let pin_toggle = gtk::ToggleButton::builder().label("Pin").active(self.state.is_pinned(port_id, remote)).build();
-        pin_toggle.add_css_class("flat");
+        if let Some((port_id, remote)) = &prefill {
+            if let Some(idx) = tab.available_ports.iter().position(|p| &p.id == port_id) {
+                tab.port_dropdown.set_selected(idx as u32);
+            }
+            tab.node_entry.set_text(remote);
+            if self.state.is_pinned(port_id, remote) {
+                tab.pin_toggle.set_active(true);
+                *tab.pinned_identity.borrow_mut() = Some((port_id.clone(), remote.clone()));
+            }
+        }
+
+        // Clone out the specific widgets we need after moving `tab` into the map.
+        let root = tab.root.clone();
+        let tab_label = tab.tab_label.clone();
+        let pin_toggle = tab.pin_toggle.clone();
+        let port_dropdown = tab.port_dropdown.clone();
+        let node_entry = tab.node_entry.clone();
+        let address_book_button = tab.address_book_button.clone();
+        let connect_button = tab.connect_button.clone();
+        let disconnect_button = tab.disconnect_button.clone();
+        let input_entry = tab.input_entry.clone();
+
+        self.tabs.borrow_mut().insert(tab_id, tab);
+        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+            self.update_node_visibility(tab);
+            self.update_tab_title(tab);
+            self.preview_history(tab);
+        }
+
         {
             let ui = self.clone();
-            let port_id = port_id.to_string();
-            let remote = remote.to_string();
-            pin_toggle.connect_toggled(move |btn| {
-                ui.state.set_pinned(&port_id, &remote, btn.is_active());
+            port_dropdown.connect_selected_notify(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    ui.update_node_visibility(tab);
+                    ui.update_tab_title(tab);
+                    ui.preview_history(tab);
+                    ui.sync_pin(tab);
+                }
             });
         }
-        tab_box.append(&pin_toggle);
+        {
+            let ui = self.clone();
+            node_entry.connect_changed(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    ui.update_tab_title(tab);
+                    ui.sync_pin(tab);
+                }
+            });
+        }
+        {
+            let ui = self.clone();
+            let focus = gtk::EventControllerFocus::new();
+            focus.connect_leave(move |_| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    ui.preview_history(tab);
+                }
+            });
+            node_entry.add_controller(focus);
+        }
+        {
+            let ui = self.clone();
+            let node_entry = node_entry.clone();
+            address_book_button.connect_clicked(move |_| {
+                address_book_dialog::pick(&ui, &node_entry);
+            });
+        }
+        {
+            let ui = self.clone();
+            pin_toggle.connect_toggled(move |btn| {
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    if btn.is_active() {
+                        ui.sync_pin(tab);
+                    } else if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
+                        ui.state.set_pinned(&old_port, &old_remote, false);
+                    }
+                }
+            });
+        }
+        {
+            let ui = self.clone();
+            connect_button.connect_clicked(move |_| {
+                ui.connect_tab(tab_id);
+            });
+        }
+        {
+            let ui = self.clone();
+            disconnect_button.connect_clicked(move |_| {
+                ui.disconnect_tab(tab_id);
+            });
+        }
+        {
+            let ui = self.clone();
+            input_entry.connect_activate(move |entry| {
+                let mut bytes = entry.text().to_string().into_bytes();
+                bytes.push(b'\n');
+                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    if let (Some(conn_id), Some(port)) = (tab.conn_id.get(), tab.selected_port()) {
+                        if let Some(handle) = ui.state.active.borrow().get(&port.id) {
+                            let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
+                        }
+                    }
+                }
+                entry.set_text("");
+            });
+        }
 
         let close_button = gtk::Button::with_label("\u{2715}");
         close_button.add_css_class("flat");
         {
-            let cmd_tx = cmd_tx.clone();
+            let ui = self.clone();
             close_button.connect_clicked(move |_| {
-                let _ = cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
+                ui.close_tab(tab_id);
             });
         }
-        tab_box.append(&close_button);
 
-        tab_box
+        let tab_label_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        tab_label_box.append(&tab_label);
+        tab_label_box.append(&pin_toggle);
+        tab_label_box.append(&close_button);
+
+        self.notebook.append_page(&root, Some(&tab_label_box));
+        self.notebook.set_tab_reorderable(&root, true);
+        let page_idx = self.notebook.page_num(&root);
+        self.notebook.set_current_page(page_idx);
+
+        tab_id
     }
 
-    fn handle_event(self: &Rc<Self>, port_id: &str, cmd_tx: &mpsc::Sender<PortCommand>, event: PortEvent) {
+    /// Connect the tab's selected port (if not already active) and, for
+    /// node-capable ports, open a session to the entered node.
+    pub fn connect_tab(self: &Rc<Self>, tab_id: TabId) {
+        let Some((port_id, remote, needs_node)) = self.tabs.borrow().get(&tab_id).and_then(|tab| {
+            let port = tab.selected_port()?;
+            Some((port.id.clone(), tab.node_entry.text().trim().to_uppercase(), port_needs_node(&port.config)))
+        }) else {
+            return;
+        };
+
+        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+            self.preview_history(tab);
+        }
+
+        if needs_node && remote.is_empty() {
+            self.monitor.append_line("Enter a node/callsign before connecting.");
+            return;
+        }
+
+        let pending_key = if needs_node { (port_id.clone(), remote.clone()) } else { (port_id.clone(), String::new()) };
+        self.pending.borrow_mut().insert(pending_key, tab_id);
+
+        if !self.state.is_active(&port_id) {
+            self.connect_port(&port_id);
+        }
+        if needs_node {
+            if let Some(handle) = self.state.active.borrow().get(&port_id) {
+                let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote });
+            }
+        }
+    }
+
+    pub fn disconnect_tab(&self, tab_id: TabId) {
+        let Some((port_id, conn_id)) = self.tabs.borrow().get(&tab_id).and_then(|tab| Some((tab.selected_port()?.id.clone(), tab.conn_id.get()?)))
+        else {
+            return;
+        };
+        if let Some(handle) = self.state.active.borrow().get(&port_id) {
+            let _ = handle.cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
+        }
+    }
+
+    /// Remove a tab entirely: disconnect it if live, unpin it, and drop its
+    /// notebook page.
+    pub fn close_tab(self: &Rc<Self>, tab_id: TabId) {
+        self.disconnect_tab(tab_id);
+
+        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+            if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
+                self.state.set_pinned(&old_port, &old_remote, false);
+            }
+        }
+        self.bound.borrow_mut().retain(|_, v| *v != tab_id);
+        self.pending.borrow_mut().retain(|_, v| *v != tab_id);
+
+        if let Some(tab) = self.tabs.borrow_mut().remove(&tab_id) {
+            if let Some(page) = self.notebook.page_num(&tab.root) {
+                self.notebook.remove_page(Some(page));
+            }
+        }
+    }
+
+    /// Called after something outside the tab's own signal handlers sets its
+    /// node text programmatically (the address-book picker) — the normal
+    /// `connect_changed`/focus-out wiring wouldn't otherwise fire for that.
+    pub fn refresh_tab_for_node_entry(&self, node_entry: &gtk::Entry) {
+        if let Some(tab) = self.tabs.borrow().values().find(|t| &t.node_entry == node_entry) {
+            self.update_tab_title(tab);
+            self.preview_history(tab);
+            self.sync_pin(tab);
+        }
+    }
+
+    fn update_node_visibility(&self, tab: &SessionTab) {
+        let needs_node = tab.selected_port().map(|p| port_needs_node(&p.config)).unwrap_or(false);
+        tab.node_row.set_visible(needs_node);
+    }
+
+    fn update_tab_title(&self, tab: &SessionTab) {
+        let port_name = tab.selected_port().map(|p| p.name.as_str()).unwrap_or("(no port)");
+        let remote = tab.node_entry.text();
+        let title = if remote.trim().is_empty() { port_name.to_string() } else { format!("{port_name}: {remote}") };
+        tab.tab_label.set_text(&title);
+    }
+
+    /// Load a previous node's history into the scrollback, but only while
+    /// disconnected — never clobber a live session's display.
+    fn preview_history(&self, tab: &SessionTab) {
+        if tab.conn_id.get().is_some() {
+            return;
+        }
+        let Some(port) = tab.selected_port() else {
+            tab.clear_text();
+            return;
+        };
+        let remote = tab.node_entry.text().trim().to_uppercase();
+        if remote.is_empty() {
+            tab.clear_text();
+            return;
+        }
+        let history = self.state.history_for(&port.id, &remote);
+        tab.load_history(&history);
+    }
+
+    /// Keep a pinned tab's persisted (port, node) identity in sync as the
+    /// user edits its fields, unpinning the stale identity in the process.
+    fn sync_pin(&self, tab: &SessionTab) {
+        if !tab.pin_toggle.is_active() {
+            return;
+        }
+        let Some(port) = tab.selected_port() else { return };
+        let remote = tab.node_entry.text().trim().to_uppercase();
+        if remote.is_empty() {
+            return;
+        }
+        let new_id = (port.id.clone(), remote);
+        let mut current = tab.pinned_identity.borrow_mut();
+        if current.as_ref() != Some(&new_id) {
+            if let Some((old_port, old_remote)) = current.take() {
+                self.state.set_pinned(&old_port, &old_remote, false);
+            }
+            self.state.set_pinned(&new_id.0, &new_id.1, true);
+            *current = Some(new_id);
+        }
+    }
+
+    fn handle_event(self: &Rc<Self>, port_id: &str, event: PortEvent) {
         match event {
             PortEvent::PortConnected => {
                 self.monitor.append_line(&format!("[{port_id}] port connected"));
@@ -127,23 +338,19 @@ impl Ui {
             PortEvent::PortDisconnected { reason } => {
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
                 self.monitor.append_line(&format!("[{port_id}] port disconnected{suffix}"));
-                // The port thread is gone, so any of its connection tabs are
-                // now stale (they'll never get a ConnectionClosed event) —
-                // close them, or reconnecting would leave duplicate tabs.
-                let stale: Vec<ConnectionId> = self
-                    .tabs
-                    .borrow()
-                    .keys()
-                    .filter(|(pid, _)| pid == port_id)
-                    .map(|(_, id)| *id)
-                    .collect();
-                for id in stale {
-                    if let Some(tab) = self.tabs.borrow_mut().remove(&(port_id.to_string(), id)) {
-                        if let Some(page) = self.notebook.page_num(&tab.root) {
-                            self.notebook.remove_page(Some(page));
+
+                // Unbind (not remove — tabs persist) every tab this port had.
+                let affected: Vec<(String, ConnectionId)> =
+                    self.bound.borrow().keys().filter(|(pid, _)| pid == port_id).cloned().collect();
+                for key in affected {
+                    if let Some(tab_id) = self.bound.borrow_mut().remove(&key) {
+                        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                            tab.conn_id.set(None);
+                            tab.set_connected(false);
                         }
                     }
                 }
+                self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
             }
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
@@ -152,27 +359,33 @@ impl Ui {
                 self.monitor.append_line(&format!("[{port_id}] {line}"));
             }
             PortEvent::ConnectionOpened { id, label } => {
-                let tab = ConnectionTab::new();
-                let cmd_tx2 = cmd_tx.clone();
-                tab.entry.connect_activate(move |entry| {
-                    let mut bytes = entry.text().to_string().into_bytes();
-                    bytes.push(b'\n');
-                    let _ = cmd_tx2.send(PortCommand::Send { id, bytes });
-                    entry.set_text("");
-                });
+                let needs_node =
+                    find_entry(&self.state.config.borrow(), port_id).map(|e| port_needs_node(&e.config)).unwrap_or(false);
+                let pending_key =
+                    if needs_node { (port_id.to_string(), label.clone()) } else { (port_id.to_string(), String::new()) };
 
-                let tab_label = self.build_tab_label(port_id, id, &label, cmd_tx);
-                self.notebook.append_page(&tab.root, Some(&tab_label));
-                self.notebook.set_tab_reorderable(&tab.root, true);
-                let page_idx = self.notebook.page_num(&tab.root);
-                self.notebook.set_current_page(page_idx);
-                self.tabs.borrow_mut().insert((port_id.to_string(), id), tab);
+                let tab_id = self
+                    .pending
+                    .borrow_mut()
+                    .remove(&pending_key)
+                    .unwrap_or_else(|| self.add_tab(Some((port_id.to_string(), label.clone()))));
+
+                self.bound.borrow_mut().insert((port_id.to_string(), id), tab_id);
+                if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                    tab.conn_id.set(Some(id));
+                    tab.set_connected(true);
+                    if needs_node && tab.node_entry.text().is_empty() {
+                        tab.node_entry.set_text(&label);
+                    }
+                    self.update_tab_title(tab);
+                }
             }
             PortEvent::ConnectionClosed { id } => {
-                let key = (port_id.to_string(), id);
-                if let Some(tab) = self.tabs.borrow_mut().remove(&key) {
-                    if let Some(page) = self.notebook.page_num(&tab.root) {
-                        self.notebook.remove_page(Some(page));
+                if let Some(tab_id) = self.bound.borrow_mut().remove(&(port_id.to_string(), id)) {
+                    if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                        tab.conn_id.set(None);
+                        tab.set_connected(false);
+                        self.flush_pending_line(tab);
                     }
                 }
             }
@@ -181,14 +394,40 @@ impl Ui {
                     .append_line(&format!("[{port_id}] connection {id}: {}", describe_state(state)));
             }
             PortEvent::Data { id, bytes } => {
-                let key = (port_id.to_string(), id);
-                if let Some(tab) = self.tabs.borrow().get(&key) {
-                    tab.append_text(&String::from_utf8_lossy(&bytes));
+                if let Some(&tab_id) = self.bound.borrow().get(&(port_id.to_string(), id)) {
+                    if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                        let text = String::from_utf8_lossy(&bytes).replace('\0', "");
+                        tab.append_text(&text);
+                        // Only node-capable ports have anything meaningful to
+                        // preview later (see `preview_history`), so don't
+                        // bother persisting history for the rest.
+                        if let Some(port) = tab.selected_port().filter(|p| port_needs_node(&p.config)) {
+                            let port_id = port.id.clone();
+                            let remote = tab.node_entry.text().to_string();
+                            let mut pending_line = tab.pending_line.borrow_mut();
+                            pending_line.push_str(&text);
+                            while let Some(pos) = pending_line.find('\n') {
+                                let line: String = pending_line.drain(..=pos).collect();
+                                self.state.append_history_line(&port_id, &remote, line.trim_end_matches(['\r', '\n']));
+                            }
+                        }
+                    }
                 }
             }
             PortEvent::StationHeard { callsign } => {
                 self.state.record_heard(&callsign);
             }
+        }
+    }
+
+    fn flush_pending_line(&self, tab: &SessionTab) {
+        let Some(port) = tab.selected_port().filter(|p| port_needs_node(&p.config)) else { return };
+        let port_id = port.id.clone();
+        let remote = tab.node_entry.text().to_string();
+        let mut pending_line = tab.pending_line.borrow_mut();
+        if !pending_line.is_empty() {
+            self.state.append_history_line(&port_id, &remote, pending_line.trim_end_matches(['\r', '\n']));
+            pending_line.clear();
         }
     }
 }
@@ -242,6 +481,8 @@ pub fn build_ui(app: &adw::Application) {
     let font = config.ui.font.clone().unwrap_or_else(|| "Monospace 11".to_string());
     let autoconnect_ids: Vec<String> =
         config.ports.iter().filter(|p| p.autoconnect).map(|p| p.id.clone()).collect();
+    let pinned_tabs: Vec<(String, String)> =
+        config.pinned_sessions.iter().map(|p| (p.port_id.clone(), p.remote.clone())).collect();
     apply_font(&font);
     let state = AppState::new(config);
 
@@ -277,6 +518,9 @@ pub fn build_ui(app: &adw::Application) {
         monitor,
         notebook,
         tabs: RefCell::new(HashMap::new()),
+        bound: RefCell::new(HashMap::new()),
+        pending: RefCell::new(HashMap::new()),
+        next_tab_id: Cell::new(0),
         window: window.clone(),
     });
 
@@ -290,19 +534,19 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&ports_button);
 
-    // "New Connection\u{2026}" opens a connection to a remote station over
-    // an already-connected AGWPE/AX.25 port.
-    let new_conn_button = gtk::Button::with_label("New Connection\u{2026}");
+    // "+ New Tab" creates a disconnected session tab: pick a port, a node
+    // (if the port supports one), then Connect explicitly.
+    let new_tab_button = gtk::Button::with_label("+ New Tab");
     {
         let ui = ui.clone();
-        new_conn_button.connect_clicked(move |_| {
-            ports_dialog::show_new_connection(&ui);
+        new_tab_button.connect_clicked(move |_| {
+            ui.add_tab(None);
         });
     }
-    header.pack_start(&new_conn_button);
+    header.pack_start(&new_tab_button);
 
     // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
-    // already-connected AGWPE port.
+    // already-connected AGWPE/KISS port.
     let beacon_button = gtk::Button::with_label("Send Beacon\u{2026}");
     {
         let ui = ui.clone();
@@ -322,7 +566,7 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&address_book_button);
 
-    // "Preferences\u{2026}" opens font/timestamp/default-callsign settings.
+    // "Preferences\u{2026}" opens font/timestamp/history/default-callsign settings.
     let prefs_button = gtk::Button::with_label("Preferences\u{2026}");
     {
         let ui = ui.clone();
@@ -348,6 +592,12 @@ pub fn build_ui(app: &adw::Application) {
     window.set_content(Some(&toolbar_view));
 
     window.present();
+
+    // Pinned tabs are recreated as disconnected shells; they never
+    // auto-connect, even if their port also has autoconnect enabled.
+    for (port_id, remote) in pinned_tabs {
+        ui.add_tab(Some((port_id, remote)));
+    }
 
     for id in autoconnect_ids {
         ui.connect_port(&id);

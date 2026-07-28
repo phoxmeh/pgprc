@@ -6,7 +6,7 @@ use pr_agwpe::client::AgwpeRunner;
 use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
-use pr_core::{spawn_port, AddressBookEntry, AppConfig, PinnedSession, PortConfig, PortEntry, PortHandle};
+use pr_core::{spawn_port, AddressBookEntry, AppConfig, NodeHistory, PinnedSession, PortConfig, PortEntry, PortHandle};
 
 pub struct AppState {
     pub config: RefCell<AppConfig>,
@@ -73,8 +73,8 @@ impl AppState {
         self.config.borrow().pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote)
     }
 
-    /// Pin or unpin a (port, remote callsign) session so it's reopened
-    /// automatically next time that port connects.
+    /// Pin or unpin a (port, node) tab so its shell (port + node prefilled,
+    /// disconnected) is recreated automatically at the next app startup.
     pub fn set_pinned(&self, port_id: &str, remote: &str, pinned: bool) {
         let mut cfg = self.config.borrow_mut();
         if pinned {
@@ -84,6 +84,39 @@ impl AppState {
             }
         } else {
             cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote));
+        }
+        drop(cfg);
+        self.save_config();
+    }
+
+    pub fn history_for(&self, port_id: &str, remote: &str) -> Vec<String> {
+        self.config
+            .borrow()
+            .node_history
+            .iter()
+            .find(|h| h.port_id == port_id && h.remote == remote)
+            .map(|h| h.lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// Append one completed line to a (port, node)'s persisted history,
+    /// trimming to the configured max line count.
+    pub fn append_history_line(&self, port_id: &str, remote: &str, line: &str) {
+        let mut cfg = self.config.borrow_mut();
+        let max_lines = cfg.ui.history_lines as usize;
+        match cfg.node_history.iter_mut().find(|h| h.port_id == port_id && h.remote == remote) {
+            Some(entry) => {
+                entry.lines.push(line.to_string());
+                if entry.lines.len() > max_lines {
+                    let excess = entry.lines.len() - max_lines;
+                    entry.lines.drain(0..excess);
+                }
+            }
+            None => cfg.node_history.push(NodeHistory {
+                port_id: port_id.to_string(),
+                remote: remote.to_string(),
+                lines: vec![line.to_string()],
+            }),
         }
         drop(cfg);
         self.save_config();

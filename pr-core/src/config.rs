@@ -93,16 +93,25 @@ pub struct AddressBookEntry {
     pub heard_count: u32,
 }
 
-/// A connection tab the user pinned, so it's reopened automatically the
-/// next time its port connects (including at app startup, for an
-/// autoconnect port). Only meaningful for ports that support opening
-/// connections to a remote callsign (AGWPE, AX.25 raw socket) — pinning a
-/// Telnet/SSH tab is a harmless no-op since those ports auto-open their one
-/// connection already.
+/// A tab the user pinned: its (port, node) shell is recreated automatically
+/// at the next app startup, prefilled but disconnected — the user still has
+/// to press Connect. `remote` is empty for port kinds with no node concept
+/// (Telnet/SSH/KISS).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinnedSession {
     pub port_id: String,
     pub remote: String,
+}
+
+/// Persisted scrollback for one (port, node) pair, so reconnecting to a
+/// station you've talked to before restores context. Trimmed to
+/// `UiPrefs.history_lines` lines on save.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeHistory {
+    pub port_id: String,
+    pub remote: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +141,13 @@ pub struct UiPrefs {
     pub qrz_username: Option<String>,
     #[serde(default)]
     pub qrz_password: Option<String>,
+    /// Max lines of scrollback kept per (port, node) in `NodeHistory`.
+    #[serde(default = "default_history_lines")]
+    pub history_lines: u32,
+}
+
+fn default_history_lines() -> u32 {
+    1000
 }
 
 fn default_true() -> bool {
@@ -147,6 +163,7 @@ impl Default for UiPrefs {
             default_call: None,
             qrz_username: None,
             qrz_password: None,
+            history_lines: default_history_lines(),
         }
     }
 }
@@ -161,6 +178,8 @@ pub struct AppConfig {
     pub address_book: Vec<AddressBookEntry>,
     #[serde(default)]
     pub pinned_sessions: Vec<PinnedSession>,
+    #[serde(default)]
+    pub node_history: Vec<NodeHistory>,
 }
 
 impl AppConfig {

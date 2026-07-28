@@ -38,6 +38,13 @@ pub fn show(ui: &Rc<Ui>) {
     }
     root.append(&labeled_widget("QRZ Password", qrz_pass_entry.clone().upcast()));
 
+    let history_lines_entry = gtk::Entry::builder().text(current.history_lines.to_string()).build();
+    root.append(&labeled("History Lines", &history_lines_entry));
+
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("error");
+    root.append(&error_label);
+
     let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     button_row.set_halign(gtk::Align::End);
     let cancel_button = gtk::Button::with_label("Cancel");
@@ -56,6 +63,13 @@ pub fn show(ui: &Rc<Ui>) {
             let default_call = default_call_entry.text().to_string();
             let qrz_username = qrz_user_entry.text().to_string();
             let qrz_password = qrz_pass_entry.text().to_string();
+            let history_lines = match history_lines_entry.text().trim().parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    error_label.set_text("History Lines must be a positive number.");
+                    return;
+                }
+            };
 
             {
                 let mut cfg = ui.state.config.borrow_mut();
@@ -65,6 +79,7 @@ pub fn show(ui: &Rc<Ui>) {
                     if default_call.trim().is_empty() { None } else { Some(default_call.to_uppercase()) };
                 cfg.ui.qrz_username = if qrz_username.trim().is_empty() { None } else { Some(qrz_username) };
                 cfg.ui.qrz_password = if qrz_password.is_empty() { None } else { Some(qrz_password) };
+                cfg.ui.history_lines = history_lines;
             }
             // Credentials may have changed; force a fresh login next lookup.
             *ui.state.qrz_session.borrow_mut() = None;
