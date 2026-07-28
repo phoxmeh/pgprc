@@ -119,7 +119,9 @@ managed entirely through the UI — there's normally no need to hand-edit it.
    opening a session, optionally via a digipeater path.
 5. Use the menu for **Address Book**, **Mailbox**, **Beacons**, and
    **Preferences** (fonts, QRZ credentials, highlighting colors, the
-   personal mailbox toggle, and keyword/bulletin highlight rules).
+   personal mailbox and notification toggles). Preferences' **Custom
+   Rules** button opens a dedicated editor for the keyword/bulletin
+   highlight rules and notification destination rules.
 
 ## License
 
