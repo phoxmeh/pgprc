@@ -6,7 +6,7 @@
 # tarball/git URL for a proper (e.g. AUR) submission.
 pkgname=packet-radio
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Linux-native AGWPE/AX.25/KISS packet radio client"
 arch=('x86_64')
 url="https://example.invalid/packet-radio" # TODO: replace once a remote exists
