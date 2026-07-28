@@ -887,6 +887,23 @@ fn parse_font_desc(desc: &str) -> (String, u32) {
     (desc.to_string(), 11)
 }
 
+/// Bind a keyboard accelerator (standard GTK format, e.g. `"<Control>n"`) on
+/// `controller` to a callback taking the `Ui`. Logs and no-ops on an
+/// unparseable accelerator string rather than panicking, since that's a
+/// static typo in this file, not a runtime condition worth crashing over.
+fn add_shortcut(controller: &gtk::ShortcutController, accel: &str, ui: &Rc<Ui>, action: impl Fn(&Rc<Ui>) + 'static) {
+    let Some(trigger) = gtk::ShortcutTrigger::parse_string(accel) else {
+        tracing::warn!("failed to parse shortcut accelerator {accel:?}");
+        return;
+    };
+    let ui = ui.clone();
+    let callback_action = gtk::CallbackAction::new(move |_, _| {
+        action(&ui);
+        glib::Propagation::Stop
+    });
+    controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(callback_action)));
+}
+
 fn describe_state(state: ConnState) -> &'static str {
     match state {
         ConnState::Connecting => "connecting",
@@ -992,7 +1009,34 @@ pub fn build_ui(app: &adw::Application) {
     content_box.append(&status_bar);
 
     let toolbar_view = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
+
+    // A plain custom title bar instead of `adw::HeaderBar`: HeaderBar always
+    // keeps its title dead-center in the *whole* bar (reserving equal space
+    // on each side, regardless of how wide the packed content actually is),
+    // which reads as off-center here since the left group (menu/mailbox/
+    // beacon/filter) is much wider than the right group (Save Monitor Log/
+    // Monitor toggle). A plain `Box` with a hexpand+center title between two
+    // natural-width side boxes centers it in the *actual* leftover space
+    // instead. Wrapped in `WindowHandle` to keep click-drag-to-move and
+    // double-click-to-maximize, and `WindowControls` restores the
+    // minimize/maximize/close buttons `HeaderBar` provided automatically.
+    let header_start = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let header_end = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let header_title = gtk::Label::new(Some("Packet Radio"));
+    header_title.add_css_class("title");
+    header_title.set_hexpand(true);
+    header_title.set_halign(gtk::Align::Center);
+    header_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_row.set_margin_start(6);
+    header_row.set_margin_end(6);
+    header_row.set_margin_top(6);
+    header_row.set_margin_bottom(6);
+    header_row.add_css_class("titlebar");
+    header_row.append(&header_start);
+    header_row.append(&header_title);
+    header_row.append(&header_end);
+    let header_handle = gtk::WindowHandle::builder().child(&header_row).build();
 
     let ui = Rc::new(Ui {
         state,
@@ -1026,6 +1070,37 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
     ui.refresh_status_bar();
+
+    // A starter set of keyboard shortcuts mirroring existing mouse actions.
+    // `gtk::ShortcutController` (rather than a hand-rolled `EventControllerKey`
+    // matching on raw modifier bits) is the GTK4-recommended way to bind
+    // these: it parses standard accelerator strings and correctly resolves
+    // against whatever descendant widget currently has focus (e.g. a session
+    // tab's input entry) via `ShortcutScope::Global`, whereas a manual bubble-
+    // phase key handler can lose the race against a focused widget's own
+    // default key handling. Ctrl+Tab/Shift+Ctrl+Tab aren't included since
+    // `gtk::Notebook` already binds those itself. Escape-closing dialogs is
+    // handled separately, per dialog window, in `ports_dialog::dialog_window`.
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_scope(gtk::ShortcutScope::Global);
+    add_shortcut(&shortcuts, "<Control>n", &ui, |ui| {
+        ui.add_tab(None);
+    });
+    add_shortcut(&shortcuts, "<Control>w", &ui, |ui| {
+        if let Some(tab_id) = ui.current_tab_id() {
+            ui.close_tab(tab_id);
+        }
+    });
+    add_shortcut(&shortcuts, "<Control>comma", &ui, |ui| {
+        preferences_dialog::show(ui);
+    });
+    add_shortcut(&shortcuts, "<Control>f", &ui, |ui| {
+        ui.monitor.filter_entry.grab_focus();
+    });
+    add_shortcut(&shortcuts, "<Control>q", &ui, |ui| {
+        ui.window.close();
+    });
+    ui.window.add_controller(shortcuts);
 
     // A plain "+" button on the notebook's own tab bar creates a new,
     // disconnected session tab: pick a port, a node (if the port supports
@@ -1086,7 +1161,7 @@ pub fn build_ui(app: &adw::Application) {
         }
         menu_box.append(&item_button);
     }
-    header.pack_start(&menu_button);
+    header_start.append(&menu_button);
 
     // Quick-access icon button for the Mailbox dialog, same tier of
     // frequent-use action as "Send Beacon...", so it lives in the header
@@ -1100,7 +1175,7 @@ pub fn build_ui(app: &adw::Application) {
             mailbox_dialog::show(&ui);
         });
     }
-    header.pack_start(&mailbox_button);
+    header_start.append(&mailbox_button);
 
     // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
     // already-connected AGWPE/KISS port.
@@ -1111,8 +1186,8 @@ pub fn build_ui(app: &adw::Application) {
             ports_dialog::show_send_unproto(&ui);
         });
     }
-    header.pack_start(&beacon_button);
-    header.pack_start(&ui.monitor.filter_entry);
+    header_start.append(&beacon_button);
+    header_start.append(&ui.monitor.filter_entry);
 
     // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered)
     // view — packed at the end, next to the Monitor toggle it relates to.
@@ -1124,7 +1199,7 @@ pub fn build_ui(app: &adw::Application) {
             crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text(), history_dir.as_deref());
         });
     }
-    header.pack_end(&save_monitor_button);
+    header_end.append(&save_monitor_button);
 
     let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
     {
@@ -1135,9 +1210,10 @@ pub fn build_ui(app: &adw::Application) {
             ui.state.save_config();
         });
     }
-    header.pack_end(&monitor_toggle);
+    header_end.append(&monitor_toggle);
+    header_end.append(&gtk::WindowControls::new(gtk::PackType::End));
 
-    toolbar_view.add_top_bar(&header);
+    toolbar_view.add_top_bar(&header_handle);
     toolbar_view.set_content(Some(&content_box));
     window.set_content(Some(&toolbar_view));
 

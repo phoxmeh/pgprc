@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use gtk::glib::object::IsA;
 
 use pr_core::{AgwpeLogin, AppConfig, KissParams, PortConfig, PortEntry};
@@ -9,6 +10,11 @@ use crate::window::Ui;
 
 /// Build a modal dialog window with a native header bar (so it always has a
 /// title and a close button) and return it along with its content box.
+///
+/// Escape closes it, same as clicking Cancel/the close button — every one of
+/// these dialogs requires an explicit "Save"/"Send" click to actually
+/// persist anything, so closing (by any means) never discards a save that
+/// already happened; it's always safe to bail out with Escape.
 pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: i32) -> (adw::Window, gtk::Box) {
     let win = adw::Window::builder()
         .transient_for(parent)
@@ -27,6 +33,20 @@ pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: 
     toolbar.add_top_bar(&adw::HeaderBar::new());
     toolbar.set_content(Some(&root));
     win.set_content(Some(&toolbar));
+
+    let escape_controller = gtk::EventControllerKey::new();
+    {
+        let win = win.clone();
+        escape_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape {
+                win.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
+    win.add_controller(escape_controller);
 
     (win, root)
 }

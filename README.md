@@ -156,6 +156,17 @@ in-file node history into these per-node text files.
    list — destination addresses to highlight, each with a bell toggle to
    also raise a desktop notification on a match).
 
+## Keyboard shortcuts
+
+| Shortcut       | Action                                           |
+|----------------|--------------------------------------------------|
+| `Escape`       | Close the frontmost dialog (Ports, Address Book, Preferences, etc.) — always safe, since none of them save on close, only on an explicit Save/Send click. |
+| `Ctrl+N`       | New session tab.                                  |
+| `Ctrl+W`       | Close the current session tab.                    |
+| `Ctrl+,`       | Open Preferences.                                 |
+| `Ctrl+F`       | Focus the Monitor filter.                         |
+| `Ctrl+Q`       | Quit.                                             |
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
