@@ -28,12 +28,13 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
 - **Per-node history**: every (port, node, mode) conversation gets its own
   plain-text scrollback file under `history/<port>/`, shown (tail-capped to a
   configurable line count) as a read-only preview whenever that tab isn't
-  currently connected. A per-tab **Capture** checkbox next to "Save..." can
-  also continuously append everything shown in that tab to a separate, dated
-  capture-log file in the same directory — a running transcript distinct
-  from the auto-managed history file.
+  currently connected. A per-tab **Capture** checkbox (left of "Save...")
+  can also continuously append everything shown in that tab to a separate,
+  dated capture-log file in the same directory — a running transcript
+  distinct from the auto-managed history file.
 - **Monitor view**: a live log of all port/frame activity across every
-  connected port, with a substring filter and "Save Monitor Log..." export.
+  connected port, with a small substring filter in the header (next to
+  "Send Beacon...") and "Save Monitor Log..." export.
 - **Configurable highlighting**: callsigns, known (address-book) callsigns,
   your own callsign (the Default Callsign in Preferences) in its own color,
   AX.25 frame-type tags, and user-defined destination-address rules (e.g.
@@ -41,17 +42,23 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   scrollback — each rule's bell toggle can also raise a desktop
   notification on a match.
 - **Address Book**: tracks "last heard" automatically as callsigns show up
-  on the air, plus manually-entered name/alias/location/notes. Includes an
-  online **QRZ.com lookup** and **ADIF export** of logged QSOs.
+  on the air, plus manually-entered name/alias/location/notes/**via path**.
+  Picking an entry from a session tab's address-book dropdown fills in both
+  its callsign and via path, since a station usually needs the same
+  digipeater route every time. Includes an online **QRZ.com lookup** and
+  **ADIF export** of logged QSOs.
 - **Scheduled beacons**: configure one or more periodic unproto beacons
   (port, destination, via path, message, interval) that fire automatically
   while their port is connected.
 - **Personal packet mailbox** (off by default): a minimal BBS-style
   auto-responder (`L`ist / `R`ead / `S`end / `B`ye) for unsolicited incoming
   connections — a local message store, not real Winlink/RMS interop.
-- **Per-tab TX/RX byte counters**, **KISS TNC parameter** configuration
-  (TXDELAY/persistence/slot-time/full-duplex), and **PID labeling** of
-  monitored frames (NET/ROM, ARPA IP, etc.).
+- **Status bar**: shows the currently selected tab's connect/disconnect
+  state (icon + subtle text) on the left and its packet count/byte totals,
+  sent and received, on the right.
+- **KISS TNC parameter** configuration (TXDELAY/persistence/slot-time/
+  full-duplex) and **PID labeling** of monitored frames (NET/ROM, ARPA IP,
+  etc.).
 - **Pinning**: pin a tab to have its shell (port + node prefilled,
   disconnected) recreated automatically the next time the app starts. It
   never auto-connects — you still press Connect.
@@ -137,7 +144,8 @@ in-file node history into these per-node text files.
 2. Click **+** on the tab bar (or the empty-state's **+ New Tab** button) to
    open a new session tab, pick the port, and (for AGWPE/AX.25/KISS ports)
    enter a destination callsign — either type it in or pick one from the
-   Address Book via the small arrow next to the node field.
+   Address Book via the small arrow next to the node field (also fills in
+   its via path, if it has one).
 3. Press **Connect**. Type in the input box at the bottom and press Enter
    or click **Send**.
 4. Check **Unproto** in a tab to send one-shot unconnected frames instead of

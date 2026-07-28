@@ -50,14 +50,14 @@ pub struct SessionTab {
     pub node_entry: gtk::Entry,
     /// Optional digipeater path, e.g. "WIDE1-1,WIDE2-1".
     pub via_entry: gtk::Entry,
-    /// A one-shot picker: index 0 is a placeholder, indices 1.. correspond
-    /// positionally to `available_address_book`. Selecting a real entry
-    /// copies its callsign into `node_entry` and resets back to 0 (wired in
+    /// A one-shot picker: indices correspond positionally to
+    /// `available_address_book`. Selecting an entry copies its callsign
+    /// (and, if set, its via path) into `node_entry`/`via_entry` (wired in
     /// `window.rs`, mirroring `port_dropdown`/`available_ports`). Snapshot
     /// taken at tab-creation time like the port list — reopen a new tab to
     /// see address book entries added since.
     pub address_book_dropdown: gtk::DropDown,
-    available_address_book: Vec<String>,
+    available_address_book: Vec<AddressBookEntry>,
     /// When active, this tab sends unconnected (UI) traffic to `node_entry`
     /// instead of opening a connected-mode session — Connect/Disconnect are
     /// disabled and `input_entry` sends via `PortCommand::SendUnproto`.
@@ -82,13 +82,16 @@ pub struct SessionTab {
     /// tab, if any — lets us unpin the *old* identity when the user edits a
     /// pinned tab's port/node/mode instead of leaking an orphaned pin entry.
     pub pinned_identity: RefCell<Option<(String, String, bool)>>,
-    /// Bytes actually sent/received over the wire — the only traffic stats
-    /// honestly available here, since the AX.25 ARQ state machine (and any
-    /// retry/timer counts) lives in the AGWPE host or the kernel, not in
-    /// this app, for every backend we support.
+    /// Bytes/packets actually sent/received over the wire — the only
+    /// traffic stats honestly available here, since the AX.25 ARQ state
+    /// machine (and any retry/timer counts) lives in the AGWPE host or the
+    /// kernel, not in this app, for every backend we support. Displayed in
+    /// the window's status bar (`Ui::refresh_status_bar`) for whichever tab
+    /// is currently selected, not in the tab itself.
     bytes_sent: Cell<u64>,
     bytes_received: Cell<u64>,
-    stats_label: gtk::Label,
+    packets_sent: Cell<u64>,
+    packets_received: Cell<u64>,
     /// `Some` when this tab's replies are being driven by the personal
     /// mailbox's auto-responder instead of the user typing — set on an
     /// unsolicited incoming connection while the mailbox is enabled.
@@ -123,17 +126,18 @@ impl SessionTab {
         let node_entry = gtk::Entry::builder().placeholder_text("Node (callsign)").width_chars(12).build();
         let via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(14).build();
 
-        let mut available_address_book: Vec<String> = address_book.iter().map(|e| e.callsign.clone()).collect();
-        available_address_book.sort();
-        let mut address_book_names: Vec<String> = vec!["From Address Book\u{2026}".to_string()];
-        for callsign in &available_address_book {
-            let entry = address_book.iter().find(|e| &e.callsign == callsign);
-            let extra = entry.and_then(|e| e.name.as_deref().or(e.alias.as_deref()));
-            match extra {
-                Some(extra) if !extra.is_empty() => address_book_names.push(format!("{callsign} \u{2014} {extra}")),
-                _ => address_book_names.push(callsign.clone()),
-            }
-        }
+        let mut available_address_book: Vec<AddressBookEntry> = address_book;
+        available_address_book.sort_by(|a, b| a.callsign.cmp(&b.callsign));
+        let address_book_names: Vec<String> = available_address_book
+            .iter()
+            .map(|e| {
+                let extra = e.name.as_deref().or(e.alias.as_deref());
+                match extra {
+                    Some(extra) if !extra.is_empty() => format!("{} \u{2014} {extra}", e.callsign),
+                    _ => e.callsign.clone(),
+                }
+            })
+            .collect();
         let address_book_refs: Vec<&str> = address_book_names.iter().map(String::as_str).collect();
         let address_book_model = gtk::StringList::new(&address_book_refs);
         let address_book_dropdown = gtk::DropDown::builder().model(&address_book_model).build();
@@ -181,20 +185,16 @@ impl SessionTab {
         controls_spacer.set_hexpand(true);
         controls.append(&controls_spacer);
 
-        let save_button = gtk::Button::with_label("Save\u{2026}");
-        controls.append(&save_button);
-
         let capture_toggle = gtk::CheckButton::with_label("Capture");
         capture_toggle
             .set_tooltip_text(Some("Continuously append this session's traffic to a dated log file while checked"));
         controls.append(&capture_toggle);
 
+        let save_button = gtk::Button::with_label("Save\u{2026}");
+        controls.append(&save_button);
+
         let clear_history_button = gtk::Button::with_label("Clear History\u{2026}");
         controls.append(&clear_history_button);
-
-        let stats_label = gtk::Label::new(Some("\u{2191}0 B \u{2193}0 B"));
-        stats_label.add_css_class("dim-label");
-        controls.append(&stats_label);
 
         root.append(&controls);
         root.append(&node_row);
@@ -260,7 +260,8 @@ impl SessionTab {
             pinned_identity: RefCell::new(None),
             bytes_sent: Cell::new(0),
             bytes_received: Cell::new(0),
-            stats_label,
+            packets_sent: Cell::new(0),
+            packets_received: Cell::new(0),
             mailbox_state: RefCell::new(None),
             mailbox_input: RefCell::new(String::new()),
             buffer,
@@ -275,14 +276,9 @@ impl SessionTab {
         self.available_ports.get(self.port_dropdown.selected() as usize)
     }
 
-    /// The callsign for the currently selected address-book dropdown entry,
-    /// if the selection isn't the "From Address Book..." placeholder (index 0).
-    pub fn selected_address_book_call(&self) -> Option<&str> {
-        let idx = self.address_book_dropdown.selected();
-        if idx == 0 {
-            return None;
-        }
-        self.available_address_book.get(idx as usize - 1).map(String::as_str)
+    /// The currently selected address-book dropdown entry, if any.
+    pub fn selected_address_book_entry(&self) -> Option<&AddressBookEntry> {
+        self.available_address_book.get(self.address_book_dropdown.selected() as usize)
     }
 
     pub fn set_connected(&self, connected: bool) {
@@ -432,7 +428,7 @@ impl SessionTab {
     /// aligned to line boundaries.
     pub fn receive_data(&self, text: &str) {
         self.bytes_received.set(self.bytes_received.get() + text.len() as u64);
-        self.update_stats_label();
+        self.packets_received.set(self.packets_received.get() + 1);
 
         let (start_offset, sanitized) = self.insert(text);
         self.highlight_new_lines(start_offset, &sanitized);
@@ -464,7 +460,7 @@ impl SessionTab {
     /// would only ever show what the *other* station sent.
     pub fn append_sent_line(&self, text: &str) {
         self.bytes_sent.set(self.bytes_sent.get() + text.len() as u64);
-        self.update_stats_label();
+        self.packets_sent.set(self.packets_sent.get() + 1);
 
         let formatted = format!("\u{00BB} {text}\n");
         let (start_offset, sanitized) = self.insert(&formatted);
@@ -496,12 +492,28 @@ impl SessionTab {
         self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true).to_string()
     }
 
-    fn update_stats_label(&self) {
-        self.stats_label.set_text(&format!(
-            "\u{2191}{} \u{2193}{}",
+    /// Whether this tab currently has live traffic flowing — a connected-
+    /// mode session for a normal tab, or (for an Unproto tab, which has no
+    /// `ConnectionId` of its own) whether the underlying port is active.
+    /// Drives the status bar's connect/disconnect indicator.
+    pub fn is_live(&self) -> bool {
+        if self.unproto_toggle.is_active() {
+            self.selected_port().is_some_and(|p| self.state.is_active(&p.id))
+        } else {
+            self.conn_id.get().is_some()
+        }
+    }
+
+    /// Formatted for the window's status bar: packet count and total bytes,
+    /// sent and received.
+    pub fn stats_text(&self) -> String {
+        format!(
+            "\u{2191}{} pkt / {}   \u{2193}{} pkt / {}",
+            self.packets_sent.get(),
             format_bytes(self.bytes_sent.get()),
+            self.packets_received.get(),
             format_bytes(self.bytes_received.get())
-        ));
+        )
     }
 }
 

@@ -47,6 +47,12 @@ pub struct Ui {
     /// Scheduled beacon timers, keyed by `Beacon.id` — reset in full by
     /// `reschedule_beacons` whenever the beacon list changes.
     beacon_timers: RefCell<HashMap<String, glib::SourceId>>,
+    /// Bottom status bar: left side shows the currently selected tab's
+    /// connect/disconnect state (icon + subtle-colored text), right side its
+    /// packet/byte counters — see `refresh_status_bar`.
+    status_conn_icon: gtk::Image,
+    status_conn_label: gtk::Label,
+    status_stats_label: gtk::Label,
     pub window: adw::ApplicationWindow,
 }
 
@@ -203,11 +209,17 @@ impl Ui {
         }
         {
             let ui = self.clone();
-            address_book_dropdown.connect_selected_notify(move |dropdown| {
+            address_book_dropdown.connect_selected_notify(move |_dropdown| {
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    if let Some(callsign) = tab.selected_address_book_call() {
-                        tab.node_entry.set_text(callsign);
-                        dropdown.set_selected(0);
+                    if let Some(entry) = tab.selected_address_book_entry() {
+                        tab.node_entry.set_text(&entry.callsign);
+                        // A station usually needs the same digipeater path
+                        // every time, so fill it in too — but only if the
+                        // entry actually has one, so picking a direct-path
+                        // station doesn't clobber a via the user already typed.
+                        if !entry.via.trim().is_empty() {
+                            tab.via_entry.set_text(&entry.via);
+                        }
                         ui.refresh_tab_for_node_entry(&tab.node_entry);
                     }
                 }
@@ -322,6 +334,7 @@ impl Ui {
         let page_idx = self.notebook.page_num(&root);
         self.notebook.set_current_page(page_idx);
         self.update_notebook_stack();
+        self.refresh_status_bar();
 
         tab_id
     }
@@ -395,6 +408,7 @@ impl Ui {
                 let remote = tab.node_entry.text().to_string();
                 tab.append_sent_line(text);
                 self.monitor.append_line(&format!("[{port_name}] TX > {remote}: {text}"));
+                self.refresh_status_bar();
             }
         }
     }
@@ -425,6 +439,7 @@ impl Ui {
         tab.append_sent_line(text);
         let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
         self.monitor.append_line(&format!("[{port_name}] TX unproto > {dest}{via_suffix}: {text}"));
+        self.refresh_status_bar();
     }
 
     /// Send arbitrary text over a tab's live connection on the mailbox's
@@ -437,6 +452,7 @@ impl Ui {
             }
         }
         tab.append_sent_line(text);
+        self.refresh_status_bar();
     }
 
     /// Feed a chunk of received bytes to a mailbox-driven tab's command
@@ -534,6 +550,7 @@ impl Ui {
             }
         }
         self.update_notebook_stack();
+        self.refresh_status_bar();
     }
 
     /// Called after something outside the tab's own signal handlers sets its
@@ -586,6 +603,37 @@ impl Ui {
             tab.send_input_button.set_sensitive(active);
         } else {
             tab.set_connected(tab.conn_id.get().is_some());
+        }
+    }
+
+    /// The tab backing the notebook's currently visible page, if any.
+    fn current_tab_id(&self) -> Option<TabId> {
+        let current = self.notebook.current_page()?;
+        self.tabs.borrow().iter().find(|(_, t)| self.notebook.page_num(&t.root) == Some(current)).map(|(id, _)| *id)
+    }
+
+    /// Refresh the status bar's connect-state (left) and packet/byte stats
+    /// (right) for whichever tab is currently selected. Call this whenever
+    /// the selected tab changes, connects/disconnects, or sends/receives —
+    /// cheap enough to call liberally rather than track precisely.
+    pub fn refresh_status_bar(&self) {
+        let tabs = self.tabs.borrow();
+        match self.current_tab_id().and_then(|id| tabs.get(&id)) {
+            Some(tab) => {
+                let live = tab.is_live();
+                self.status_conn_icon.set_icon_name(Some(if live {
+                    "network-transmit-receive-symbolic"
+                } else {
+                    "network-offline-symbolic"
+                }));
+                self.status_conn_label.set_text(if live { "Connected" } else { "Disconnected" });
+                self.status_stats_label.set_text(&tab.stats_text());
+            }
+            None => {
+                self.status_conn_icon.set_icon_name(Some("network-offline-symbolic"));
+                self.status_conn_label.set_text("No tab selected");
+                self.status_stats_label.set_text("");
+            }
         }
     }
 
@@ -648,6 +696,7 @@ impl Ui {
             PortEvent::PortConnected => {
                 self.monitor.append_line(&format!("[{port_id}] port connected"));
                 self.refresh_unproto_tabs_for_port(port_id);
+                self.refresh_status_bar();
             }
             PortEvent::PortDisconnected { reason } => {
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
@@ -666,6 +715,7 @@ impl Ui {
                 }
                 self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
                 self.refresh_unproto_tabs_for_port(port_id);
+                self.refresh_status_bar();
             }
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
@@ -726,6 +776,7 @@ impl Ui {
                 if needs_node {
                     self.state.log_qso_started(port_id, &label);
                 }
+                self.refresh_status_bar();
             }
             PortEvent::ConnectionClosed { id } => {
                 if let Some(tab_id) = self.bound.borrow_mut().remove(&(port_id.to_string(), id)) {
@@ -741,6 +792,7 @@ impl Ui {
                         *tab.mailbox_state.borrow_mut() = None;
                     }
                 }
+                self.refresh_status_bar();
             }
             PortEvent::ConnState { id, state } => {
                 self.monitor
@@ -754,6 +806,7 @@ impl Ui {
                         self.drive_mailbox(tab, port_id, &text);
                     }
                 }
+                self.refresh_status_bar();
             }
             PortEvent::StationHeard { callsign } => {
                 self.state.record_heard(&callsign);
@@ -906,9 +959,37 @@ pub fn build_ui(app: &adw::Application) {
         .shrink_start_child(false)
         .shrink_end_child(false)
         .position(220)
+        .vexpand(true)
         .build();
     paned.set_visible(true);
     monitor.container.set_visible(show_monitor);
+
+    // Bottom status bar: connect/disconnect state for the selected tab on
+    // the left (icon + subtle-colored text), its packet/byte counters on
+    // the right — see `Ui::refresh_status_bar`.
+    let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    status_bar.set_margin_start(8);
+    status_bar.set_margin_end(8);
+    status_bar.set_margin_top(2);
+    status_bar.set_margin_bottom(2);
+    let status_conn_icon = gtk::Image::from_icon_name("network-offline-symbolic");
+    status_conn_icon.add_css_class("dim-label");
+    let status_conn_label = gtk::Label::new(Some("No tab selected"));
+    status_conn_label.add_css_class("dim-label");
+    status_conn_label.add_css_class("caption");
+    status_bar.append(&status_conn_icon);
+    status_bar.append(&status_conn_label);
+    let status_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    status_spacer.set_hexpand(true);
+    status_bar.append(&status_spacer);
+    let status_stats_label = gtk::Label::new(None);
+    status_stats_label.add_css_class("dim-label");
+    status_stats_label.add_css_class("caption");
+    status_bar.append(&status_stats_label);
+
+    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&paned);
+    content_box.append(&status_bar);
 
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -923,6 +1004,9 @@ pub fn build_ui(app: &adw::Application) {
         pending: RefCell::new(HashMap::new()),
         next_tab_id: Cell::new(0),
         beacon_timers: RefCell::new(HashMap::new()),
+        status_conn_icon,
+        status_conn_label,
+        status_stats_label,
         window: window.clone(),
     });
 
@@ -933,6 +1017,15 @@ pub fn build_ui(app: &adw::Application) {
             ui.monitor.set_filter(&entry.text());
         });
     }
+
+    {
+        let ui = ui.clone();
+        let notebook = ui.notebook.clone();
+        notebook.connect_switch_page(move |_, _, _| {
+            ui.refresh_status_bar();
+        });
+    }
+    ui.refresh_status_bar();
 
     // A plain "+" button on the notebook's own tab bar creates a new,
     // disconnected session tab: pick a port, a node (if the port supports
@@ -1019,6 +1112,7 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
     header.pack_start(&beacon_button);
+    header.pack_start(&ui.monitor.filter_entry);
 
     // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered)
     // view — packed at the end, next to the Monitor toggle it relates to.
@@ -1044,7 +1138,7 @@ pub fn build_ui(app: &adw::Application) {
     header.pack_end(&monitor_toggle);
 
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&paned));
+    toolbar_view.set_content(Some(&content_box));
     window.set_content(Some(&toolbar_view));
 
     window.present();

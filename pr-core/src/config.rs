@@ -113,6 +113,13 @@ pub struct AddressBookEntry {
     pub last_heard: Option<String>,
     #[serde(default)]
     pub heard_count: u32,
+    /// Digipeater path, e.g. "WIDE1-1,WIDE2-1" — same comma/space-separated
+    /// convention as `Beacon.via`/`PinnedSession.via`. Empty for a direct
+    /// path. Picking this station from a session tab's address-book dropdown
+    /// fills the tab's Via field from here, since a station usually needs
+    /// the same path every time.
+    #[serde(default)]
+    pub via: String,
 }
 
 /// A tab the user pinned: its (port, node) shell is recreated automatically

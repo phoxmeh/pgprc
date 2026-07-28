@@ -63,6 +63,7 @@ impl AppState {
                 notes: None,
                 last_heard: Some(now),
                 heard_count: 1,
+                via: String::new(),
             }),
         }
         drop(cfg);

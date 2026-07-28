@@ -21,8 +21,9 @@ struct StoredLine {
 /// The live-traffic Monitor panel: a read-only, auto-scrolling log with an
 /// optional substring filter.
 pub struct MonitorView {
-    /// The whole panel (filter entry + scrollback) — show/hide this, not
-    /// `widget`, so the filter entry follows the "Monitor" visibility toggle.
+    /// The scrollback panel — show/hide this, not `widget`, to follow the
+    /// "Monitor" visibility toggle. `filter_entry` lives in the header
+    /// instead (next to "Send Beacon..."), so it stays visible either way.
     pub container: gtk::Box,
     pub filter_entry: gtk::Entry,
     buffer: gtk::TextBuffer,
@@ -55,9 +56,19 @@ impl MonitorView {
             .hexpand(true)
             .build();
 
-        let filter_entry = gtk::Entry::builder().placeholder_text("Filter (callsign or keyword)\u{2026}").build();
+        // Deliberately small rather than stretched wide — this is a
+        // rarely-needed filter, not a primary control, and lives in the
+        // header (see `build_ui`) rather than this panel.
+        let filter_entry = gtk::Entry::builder().placeholder_text("Filter\u{2026}").width_chars(16).build();
+        filter_entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some("edit-clear-symbolic"));
+        filter_entry.set_icon_activatable(gtk::EntryIconPosition::Secondary, true);
+        filter_entry.set_icon_tooltip_text(gtk::EntryIconPosition::Secondary, Some("Clear filter"));
+        filter_entry.connect_icon_release(|entry, pos| {
+            if pos == gtk::EntryIconPosition::Secondary {
+                entry.set_text("");
+            }
+        });
         let container = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        container.append(&filter_entry);
         container.append(&widget);
 
         MonitorView {
