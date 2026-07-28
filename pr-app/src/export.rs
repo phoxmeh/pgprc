@@ -6,8 +6,21 @@ use gtk::prelude::*;
 /// Opens a native Save dialog and, if the user picks a location, writes
 /// `text` there. Errors are logged, not surfaced to the user — this mirrors
 /// how `AppState::save_config` already handles its own I/O failures.
-pub fn save_text(parent: &impl IsA<gtk::Window>, suggested_name: &str, text: String) {
-    let dialog = gtk::FileDialog::builder().title("Save").initial_name(suggested_name).build();
+/// `initial_folder`, when given, defaults the dialog into that directory
+/// (created first if needed) — used so manual saves start out in the same
+/// `history/` tree the app organizes its own archives under.
+pub fn save_text(
+    parent: &impl IsA<gtk::Window>,
+    suggested_name: &str,
+    text: String,
+    initial_folder: Option<&std::path::Path>,
+) {
+    let mut builder = gtk::FileDialog::builder().title("Save").initial_name(suggested_name);
+    if let Some(dir) = initial_folder {
+        let _ = std::fs::create_dir_all(dir);
+        builder = builder.initial_folder(&gtk::gio::File::for_path(dir));
+    }
+    let dialog = builder.build();
     dialog.save(Some(parent), gtk::gio::Cancellable::NONE, move |result| {
         let file = match result {
             Ok(file) => file,

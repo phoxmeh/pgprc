@@ -7,8 +7,8 @@ use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
 use pr_core::{
-    spawn_port, AddressBookEntry, AppConfig, NodeHistory, NotifiedPacket, PinnedSession, PortConfig, PortEntry,
-    PortHandle, QsoLogEntry,
+    spawn_port, AddressBookEntry, AppConfig, NotifiedPacket, PinnedSession, PortConfig, PortEntry, PortHandle,
+    QsoLogEntry,
 };
 
 pub struct AppState {
@@ -127,48 +127,67 @@ impl AppState {
 
     /// `unproto` keeps connected-mode session history separate from unproto
     /// traffic history to the same (port, remote) — they're unrelated
-    /// conversations that happen to share a destination callsign.
+    /// conversations that happen to share a destination callsign. Backed by
+    /// a plain-text file under `history/<port>/`, not `AppConfig` — see
+    /// `history_path`.
     pub fn history_for(&self, port_id: &str, remote: &str, unproto: bool) -> Vec<String> {
-        self.config
-            .borrow()
-            .node_history
-            .iter()
-            .find(|h| h.port_id == port_id && h.remote == remote && h.unproto == unproto)
-            .map(|h| h.lines.clone())
-            .unwrap_or_default()
+        let cfg = self.config.borrow();
+        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+            return Vec::new();
+        };
+        let max_lines = cfg.ui.history_lines as usize;
+        drop(cfg);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        if lines.len() > max_lines {
+            lines[lines.len() - max_lines..].to_vec()
+        } else {
+            lines
+        }
     }
 
     /// Permanently delete the persisted history for one (port, node, mode) —
     /// used by the tab's "Clear History" action.
     pub fn clear_history(&self, port_id: &str, remote: &str, unproto: bool) {
-        let mut cfg = self.config.borrow_mut();
-        cfg.node_history.retain(|h| !(h.port_id == port_id && h.remote == remote && h.unproto == unproto));
+        let cfg = self.config.borrow();
+        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+            return;
+        };
         drop(cfg);
-        self.save_config();
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to remove history file {}: {e}", path.display());
+            }
+        }
     }
 
     /// Append one completed line to a (port, node, mode)'s persisted
-    /// history, trimming to the configured max line count.
+    /// history file. Unlike the old in-config storage, this is an unbounded
+    /// archive — `history_for` applies the line-count cap at read time
+    /// instead.
     pub fn append_history_line(&self, port_id: &str, remote: &str, unproto: bool, line: &str) {
-        let mut cfg = self.config.borrow_mut();
-        let max_lines = cfg.ui.history_lines as usize;
-        match cfg.node_history.iter_mut().find(|h| h.port_id == port_id && h.remote == remote && h.unproto == unproto) {
-            Some(entry) => {
-                entry.lines.push(line.to_string());
-                if entry.lines.len() > max_lines {
-                    let excess = entry.lines.len() - max_lines;
-                    entry.lines.drain(0..excess);
+        let cfg = self.config.borrow();
+        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+            return;
+        };
+        drop(cfg);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("failed to create history dir {}: {e}", parent.display());
+                return;
+            }
+        }
+        use std::io::Write;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{line}") {
+                    tracing::warn!("failed to append history line to {}: {e}", path.display());
                 }
             }
-            None => cfg.node_history.push(NodeHistory {
-                port_id: port_id.to_string(),
-                remote: remote.to_string(),
-                unproto,
-                lines: vec![line.to_string()],
-            }),
+            Err(e) => tracing::warn!("failed to open history file {}: {e}", path.display()),
         }
-        drop(cfg);
-        self.save_config();
     }
 
     /// Record a packet whose destination triggered a desktop notification,
@@ -232,6 +251,14 @@ pub fn spawn_for_config(config: &PortConfig) -> PortHandle {
 
 pub fn find_entry(config: &AppConfig, id: &str) -> Option<PortEntry> {
     config.ports.iter().find(|p| p.id == id).cloned()
+}
+
+/// Resolve the on-disk path for one (port, node, mode)'s history file —
+/// `None` only if the config directory itself can't be determined.
+fn history_path(config: &AppConfig, port_id: &str, remote: &str, unproto: bool) -> Option<std::path::PathBuf> {
+    let dir = AppConfig::config_dir()?;
+    let port_name = find_entry(config, port_id).map(|p| p.name).unwrap_or_else(|| port_id.to_string());
+    Some(pr_core::history_file_path(&dir, &port_name, remote, unproto))
 }
 
 pub(crate) fn now_timestamp() -> String {

@@ -132,11 +132,11 @@ pub struct PinnedSession {
     pub unproto: bool,
 }
 
-/// Persisted scrollback for one (port, node) pair, so reconnecting to a
-/// station you've talked to before restores context. Trimmed to
-/// `UiPrefs.history_lines` lines on save. Kept separate from connected-mode
-/// history for the same (port, remote) via `unproto`, since the two are
-/// unrelated conversations that happen to share a destination callsign.
+/// The old (pre-split) shape of persisted scrollback for one (port, node)
+/// pair — kept only so `AppConfig::load`'s one-time legacy migration can
+/// parse it back out of an un-split `config.toml` and materialize it into
+/// the new per-node history files under `history/`. No longer part of
+/// `AppConfig` itself; nothing else in the app constructs one of these.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeHistory {
     pub port_id: String,
@@ -165,12 +165,14 @@ pub struct MailboxMessage {
 /// Personal packet mailbox preferences. Off by default: when enabled, any
 /// unsolicited incoming connection on a connect-capable port is answered
 /// automatically by a small BBS-style command prompt instead of waiting for
-/// a human to type back.
+/// a human to type back. `messages` lives in its own `mailbox.toml` (see
+/// `AppConfig::load`/`save`), since it's data, not a preference — only
+/// `enabled` belongs in the general `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MailboxPrefs {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(skip)]
     pub messages: Vec<MailboxMessage>,
 }
 
@@ -281,7 +283,10 @@ pub struct HighlightPrefs {
     /// `[UI]`, `[SABM]`, `[I N(S)=1 N(R)=0]`.
     #[serde(default = "default_ax25_command_color")]
     pub ax25_command_color: String,
-    #[serde(default = "default_rules")]
+    /// Lives in its own `rules.toml` (see `AppConfig::load`/`save`) — a
+    /// user-managed list, not a preference toggle, so it gets the same
+    /// "own file" treatment as ports/address book/etc.
+    #[serde(skip)]
     pub rules: Vec<HighlightRule>,
 }
 
@@ -385,57 +390,264 @@ impl Default for UiPrefs {
     }
 }
 
+/// General preferences persisted in `config.toml`. Every other data type
+/// (ports, address book, QSO log, notified packets, highlight rules, pinned
+/// sessions, beacons, mailbox messages) lives in its own single-purpose file
+/// under the same config directory — see `AppConfig::load`/`save` — so a
+/// human poking around `~/.config/packet-radio/` finds one small file per
+/// concern instead of one large one. Each such field keeps its original name
+/// and type here (just marked `#[serde(skip)]`) purely so the rest of the
+/// app can keep reading `cfg.ports`, `cfg.address_book`, etc. unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    #[serde(default)]
+    #[serde(skip)]
     pub ports: Vec<PortEntry>,
     #[serde(default)]
     pub ui: UiPrefs,
-    #[serde(default)]
+    #[serde(skip)]
     pub address_book: Vec<AddressBookEntry>,
-    #[serde(default)]
+    #[serde(skip)]
     pub pinned_sessions: Vec<PinnedSession>,
     #[serde(default)]
-    pub node_history: Vec<NodeHistory>,
-    #[serde(default)]
     pub highlighting: HighlightPrefs,
-    #[serde(default)]
+    #[serde(skip)]
     pub beacons: Vec<Beacon>,
-    #[serde(default)]
+    #[serde(skip)]
     pub qso_log: Vec<QsoLogEntry>,
     #[serde(default)]
     pub mailbox: MailboxPrefs,
     #[serde(default)]
     pub notify: NotifyPrefs,
-    #[serde(default)]
+    #[serde(skip)]
     pub notified_packets: Vec<NotifiedPacket>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PortsFile {
+    #[serde(default)]
+    ports: Vec<PortEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AddressBookFile {
+    #[serde(default)]
+    address_book: Vec<AddressBookEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct QsoLogFile {
+    #[serde(default)]
+    qso_log: Vec<QsoLogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotifiedPacketsFile {
+    #[serde(default)]
+    notified_packets: Vec<NotifiedPacket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RulesFile {
+    #[serde(default)]
+    rules: Vec<HighlightRule>,
+}
+
+impl Default for RulesFile {
+    fn default() -> Self {
+        RulesFile { rules: default_rules() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PinnedSessionsFile {
+    #[serde(default)]
+    pinned_sessions: Vec<PinnedSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BeaconsFile {
+    #[serde(default)]
+    beacons: Vec<Beacon>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MailboxFile {
+    #[serde(default)]
+    messages: Vec<MailboxMessage>,
+}
+
+fn load_part<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> anyhow::Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok(toml::from_str(&text)?)
+}
+
+fn save_part<T: Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = toml::to_string_pretty(value)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Best-effort extraction of one top-level (or `section.key`) array out of a
+/// legacy, un-split `config.toml`, parsed generically. Used only by
+/// `migrate_legacy_config`, once, for a file this app itself wrote — falls
+/// back to an empty/default value rather than failing the whole migration if
+/// a section is missing or doesn't parse.
+fn extract<T: serde::de::DeserializeOwned + Default>(value: &toml::Value, key: &str) -> T {
+    value.get(key).cloned().and_then(|v| v.try_into().ok()).unwrap_or_default()
+}
+
+fn extract_nested<T: serde::de::DeserializeOwned + Default>(value: &toml::Value, section: &str, key: &str) -> T {
+    value
+        .get(section)
+        .and_then(|s| s.get(key))
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default()
+}
+
 impl AppConfig {
+    pub fn config_dir() -> Option<PathBuf> {
+        ProjectDirs::from("net", "packetradio", "packet-radio").map(|dirs| dirs.config_dir().to_path_buf())
+    }
+
     pub fn config_path() -> Option<PathBuf> {
-        ProjectDirs::from("net", "packetradio", "packet-radio")
-            .map(|dirs| dirs.config_dir().join("config.toml"))
+        Self::config_dir().map(|dir| dir.join("config.toml"))
+    }
+
+    fn ports_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("ports.toml")
+    }
+    fn address_book_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("address_book.toml")
+    }
+    fn qso_log_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("qso_log.toml")
+    }
+    fn notified_packets_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("notified_packets.toml")
+    }
+    fn rules_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("rules.toml")
+    }
+    fn pinned_sessions_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("pinned_sessions.toml")
+    }
+    fn beacons_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("beacons.toml")
+    }
+    fn mailbox_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("mailbox.toml")
+    }
+
+    /// One-time migration from the old single-`config.toml` layout: detected
+    /// by `config.toml` existing but `ports.toml` not existing yet. Splits
+    /// every data section out into its own file (including `node_history`,
+    /// which becomes plain-text per-node files under `history/`), then
+    /// overwrites `config.toml` with just the general-preferences subset.
+    fn migrate_legacy_config(dir: &std::path::Path, main_path: &std::path::Path) -> anyhow::Result<()> {
+        let text = std::fs::read_to_string(main_path)?;
+        let value: toml::Value = toml::from_str(&text)?;
+
+        let ports: Vec<PortEntry> = extract(&value, "ports");
+        let address_book: Vec<AddressBookEntry> = extract(&value, "address_book");
+        let qso_log: Vec<QsoLogEntry> = extract(&value, "qso_log");
+        let notified_packets: Vec<NotifiedPacket> = extract(&value, "notified_packets");
+        let rules: Vec<HighlightRule> = extract_nested(&value, "highlighting", "rules");
+        let pinned_sessions: Vec<PinnedSession> = extract(&value, "pinned_sessions");
+        let beacons: Vec<Beacon> = extract(&value, "beacons");
+        let mailbox_messages: Vec<MailboxMessage> = extract_nested(&value, "mailbox", "messages");
+        let node_history: Vec<NodeHistory> = extract(&value, "node_history");
+
+        save_part(&Self::ports_path(dir), &PortsFile { ports: ports.clone() })?;
+        save_part(&Self::address_book_path(dir), &AddressBookFile { address_book })?;
+        save_part(&Self::qso_log_path(dir), &QsoLogFile { qso_log })?;
+        save_part(&Self::notified_packets_path(dir), &NotifiedPacketsFile { notified_packets })?;
+        save_part(&Self::rules_path(dir), &RulesFile { rules })?;
+        save_part(&Self::pinned_sessions_path(dir), &PinnedSessionsFile { pinned_sessions })?;
+        save_part(&Self::beacons_path(dir), &BeaconsFile { beacons })?;
+        save_part(&Self::mailbox_path(dir), &MailboxFile { messages: mailbox_messages })?;
+
+        for h in &node_history {
+            let port_name = ports.iter().find(|p| p.id == h.port_id).map(|p| p.name.as_str()).unwrap_or(&h.port_id);
+            let path = crate::history_paths::history_file_path(dir, port_name, &h.remote, h.unproto);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut content = h.lines.join("\n");
+            if !h.lines.is_empty() {
+                content.push('\n');
+            }
+            std::fs::write(&path, content)?;
+        }
+
+        // Re-parsing the same legacy text through the normal typed path
+        // yields exactly the general-preferences subset for free: every
+        // now-`#[serde(skip)]`/removed field is simply ignored.
+        let slimmed: AppConfig = toml::from_str(&text)?;
+        let slimmed_text = toml::to_string_pretty(&slimmed)?;
+        std::fs::write(main_path, slimmed_text)?;
+
+        Ok(())
     }
 
     pub fn load() -> anyhow::Result<AppConfig> {
-        let Some(path) = Self::config_path() else {
+        let Some(dir) = Self::config_dir() else {
             return Ok(AppConfig::default());
         };
-        if !path.exists() {
-            return Ok(AppConfig::default());
+        let main_path = dir.join("config.toml");
+
+        if main_path.exists() && !Self::ports_path(&dir).exists() {
+            Self::migrate_legacy_config(&dir, &main_path)?;
         }
-        let text = std::fs::read_to_string(&path)?;
-        Ok(toml::from_str(&text)?)
+
+        let mut cfg: AppConfig = if main_path.exists() {
+            let text = std::fs::read_to_string(&main_path)?;
+            toml::from_str(&text)?
+        } else {
+            AppConfig::default()
+        };
+
+        cfg.ports = load_part::<PortsFile>(&Self::ports_path(&dir))?.ports;
+        cfg.address_book = load_part::<AddressBookFile>(&Self::address_book_path(&dir))?.address_book;
+        cfg.qso_log = load_part::<QsoLogFile>(&Self::qso_log_path(&dir))?.qso_log;
+        cfg.notified_packets = load_part::<NotifiedPacketsFile>(&Self::notified_packets_path(&dir))?.notified_packets;
+        cfg.highlighting.rules = load_part::<RulesFile>(&Self::rules_path(&dir))?.rules;
+        cfg.pinned_sessions = load_part::<PinnedSessionsFile>(&Self::pinned_sessions_path(&dir))?.pinned_sessions;
+        cfg.beacons = load_part::<BeaconsFile>(&Self::beacons_path(&dir))?.beacons;
+        cfg.mailbox.messages = load_part::<MailboxFile>(&Self::mailbox_path(&dir))?.messages;
+
+        Ok(cfg)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::config_path()
-            .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let dir = Self::config_dir().ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
+        std::fs::create_dir_all(&dir)?;
+
+        let main_path = dir.join("config.toml");
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text)?;
+        std::fs::write(&main_path, text)?;
+
+        save_part(&Self::ports_path(&dir), &PortsFile { ports: self.ports.clone() })?;
+        save_part(&Self::address_book_path(&dir), &AddressBookFile { address_book: self.address_book.clone() })?;
+        save_part(&Self::qso_log_path(&dir), &QsoLogFile { qso_log: self.qso_log.clone() })?;
+        save_part(
+            &Self::notified_packets_path(&dir),
+            &NotifiedPacketsFile { notified_packets: self.notified_packets.clone() },
+        )?;
+        save_part(&Self::rules_path(&dir), &RulesFile { rules: self.highlighting.rules.clone() })?;
+        save_part(
+            &Self::pinned_sessions_path(&dir),
+            &PinnedSessionsFile { pinned_sessions: self.pinned_sessions.clone() },
+        )?;
+        save_part(&Self::beacons_path(&dir), &BeaconsFile { beacons: self.beacons.clone() })?;
+        save_part(&Self::mailbox_path(&dir), &MailboxFile { messages: self.mailbox.messages.clone() })?;
+
         Ok(())
     }
 }

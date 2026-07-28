@@ -26,8 +26,12 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   Each tab can also run in **Unproto mode** to send one-shot unconnected
   frames instead of opening a session, with its own digipeater `via` field.
 - **Per-node history**: every (port, node, mode) conversation gets its own
-  persisted scrollback, capped to a configurable line count, shown as a
-  read-only preview whenever that tab isn't currently connected.
+  plain-text scrollback file under `history/<port>/`, shown (tail-capped to a
+  configurable line count) as a read-only preview whenever that tab isn't
+  currently connected. A per-tab **Capture** checkbox next to "Save..." can
+  also continuously append everything shown in that tab to a separate, dated
+  capture-log file in the same directory — a running transcript distinct
+  from the auto-managed history file.
 - **Monitor view**: a live log of all port/frame activity across every
   connected port, with a substring filter and "Save Monitor Log..." export.
 - **Configurable highlighting**: callsigns, known (address-book) callsigns,
@@ -97,16 +101,33 @@ sudo pacman -U packet-radio-*.pkg.tar.zst
 
 | Crate      | Purpose                                                          |
 |------------|-------------------------------------------------------------------|
-| `pr-core`  | Config model (`~/.config/packet-radio/config.toml`), the `Port` trait, and shared event/command types. |
+| `pr-core`  | Config model (`~/.config/packet-radio/`, split across several files), the `Port` trait, and shared event/command types. |
 | `pr-ax25`  | AX.25 raw-socket (`AF_AX25`) and KISS (TCP/serial) transports.   |
 | `pr-agwpe` | AGWPE frame codec and client actor.                              |
 | `pr-app`   | The GTK4/libadwaita UI.                                          |
 
 ## Configuration
 
-All state (ports, address book, history, preferences, beacons, mailbox
-messages) lives in a single TOML file at `~/.config/packet-radio/config.toml`,
-managed entirely through the UI — there's normally no need to hand-edit it.
+State is split across `~/.config/packet-radio/` so it stays human-navigable —
+managed entirely through the UI, but each piece is easy to find or back up
+individually if you ever need to:
+
+| File                    | Contents                                              |
+|-------------------------|--------------------------------------------------------|
+| `config.toml`            | General preferences only (font, timestamps, QRZ creds, highlight colors, mailbox/notify toggles). |
+| `ports.toml`             | Configured ports.                                      |
+| `address_book.toml`      | Address book entries.                                  |
+| `qso_log.toml`           | Logged connected-mode QSOs (for ADIF export).           |
+| `notified_packets.toml`  | Packets that raised a desktop notification.             |
+| `rules.toml`             | Custom highlight/notification destination rules.        |
+| `pinned_sessions.toml`   | Pinned tab shells recreated at startup.                  |
+| `beacons.toml`           | Scheduled beacons.                                      |
+| `mailbox.toml`           | Stored personal-mailbox messages (received only).        |
+| `history/<port>/`        | One plain-text file per (node, mode) — the auto-managed scrollback archive — plus any dated capture-log files from the per-tab Capture checkbox (`<node>_<date>_<time>.txt`). |
+
+Upgrading from an older single-`config.toml` install migrates automatically
+and losslessly the first time the app starts, including converting the old
+in-file node history into these per-node text files.
 
 ## Basic usage
 

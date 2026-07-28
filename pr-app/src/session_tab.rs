@@ -65,6 +65,12 @@ pub struct SessionTab {
     pub connect_button: gtk::Button,
     pub disconnect_button: gtk::Button,
     pub save_button: gtk::Button,
+    /// Continuously appends this tab's traffic (exactly what's shown in the
+    /// scrollback) to a dated plain-text file under `history/<port>/`, from
+    /// the moment it's checked until it's unchecked — a running capture log
+    /// distinct from the auto-managed per-node history file.
+    pub capture_toggle: gtk::CheckButton,
+    capture_file: RefCell<Option<std::fs::File>>,
     pub clear_history_button: gtk::Button,
     pub input_entry: gtk::Entry,
     pub send_input_button: gtk::Button,
@@ -178,6 +184,11 @@ impl SessionTab {
         let save_button = gtk::Button::with_label("Save\u{2026}");
         controls.append(&save_button);
 
+        let capture_toggle = gtk::CheckButton::with_label("Capture");
+        capture_toggle
+            .set_tooltip_text(Some("Continuously append this session's traffic to a dated log file while checked"));
+        controls.append(&capture_toggle);
+
         let clear_history_button = gtk::Button::with_label("Clear History\u{2026}");
         controls.append(&clear_history_button);
 
@@ -239,6 +250,8 @@ impl SessionTab {
             connect_button,
             disconnect_button,
             save_button,
+            capture_toggle,
+            capture_file: RefCell::new(None),
             clear_history_button,
             input_entry,
             send_input_button,
@@ -322,7 +335,69 @@ impl SessionTab {
         self.buffer.insert(&mut end, &sanitized);
         let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
         self.text_view.scroll_mark_onscreen(&end_mark);
+
+        if let Some(file) = self.capture_file.borrow_mut().as_mut() {
+            use std::io::Write;
+            if let Err(e) = file.write_all(sanitized.as_bytes()) {
+                tracing::warn!("failed to write capture log: {e}");
+            }
+        }
+
         (start_offset, sanitized)
+    }
+
+    /// The (port name, node label) pair used to name a capture file — for
+    /// node-capable ports this is the entered destination callsign;
+    /// otherwise (Telnet/SSH) there's no node concept, so the port's own
+    /// name stands in for it.
+    fn capture_identity(&self) -> Option<(String, String)> {
+        let port = self.selected_port()?;
+        let node = if port_needs_node(&port.config) {
+            let node = self.node_entry.text().trim().to_string();
+            if node.is_empty() {
+                return None;
+            }
+            node
+        } else {
+            port.name.clone()
+        };
+        Some((port.name.clone(), node))
+    }
+
+    /// Start live-capturing this tab's traffic (everything shown in the
+    /// scrollback from this point on) to a new dated file under the same
+    /// per-port history directory as the auto-managed history — named
+    /// `<node>_<date>_<start time>.txt` so repeated captures never collide.
+    /// Returns the path on success; `None` if the port/node isn't set up
+    /// yet or the file couldn't be created (logged).
+    pub fn start_capture(&self) -> Option<std::path::PathBuf> {
+        let (port_name, node) = self.capture_identity()?;
+        let dir = pr_core::AppConfig::config_dir()?;
+        let now = gtk::glib::DateTime::now_local().ok()?;
+        let date = now.format("%Y-%m-%d").ok()?.to_string();
+        let time = now.format("%H%M%S").ok()?.to_string();
+        let path = pr_core::capture_file_path(&dir, &port_name, &node, &date, &time);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("failed to create capture dir {}: {e}", parent.display());
+                return None;
+            }
+        }
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => {
+                *self.capture_file.borrow_mut() = Some(f);
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!("failed to open capture file {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Stop live-capturing (closes the file handle).
+    pub fn stop_capture(&self) {
+        *self.capture_file.borrow_mut() = None;
     }
 
     /// Highlight every *complete* line within the just-inserted span

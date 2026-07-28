@@ -46,7 +46,7 @@ pub fn show(ui: &Rc<Ui>) {
         let ui = ui.clone();
         export_button.connect_clicked(move |_| {
             let adif = crate::adif::format_adif(&ui.state.config.borrow().qso_log);
-            crate::export::save_text(&ui.window, "log.adi", adif);
+            crate::export::save_text(&ui.window, "log.adi", adif, None);
         });
     }
     button_row.append(&export_button);

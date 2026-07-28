@@ -149,6 +149,7 @@ impl Ui {
         let connect_button = tab.connect_button.clone();
         let disconnect_button = tab.disconnect_button.clone();
         let save_button = tab.save_button.clone();
+        let capture_toggle = tab.capture_toggle.clone();
         let clear_history_button = tab.clear_history_button.clone();
         let input_entry = tab.input_entry.clone();
         let send_input_button = tab.send_input_button.clone();
@@ -261,7 +262,26 @@ impl Ui {
             save_button.connect_clicked(move |_| {
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     let name = tab.tab_label.text().to_string().replace([':', ' ', '/'], "_");
-                    crate::export::save_text(&ui.window, &format!("{name}.txt"), tab.full_text());
+                    let history_dir = pr_core::AppConfig::config_dir()
+                        .and_then(|dir| tab.selected_port().map(|p| pr_core::history_dir(&dir, &p.name)));
+                    crate::export::save_text(&ui.window, &format!("{name}.txt"), tab.full_text(), history_dir.as_deref());
+                }
+            });
+        }
+        {
+            let ui = self.clone();
+            capture_toggle.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    let started = ui.tabs.borrow().get(&tab_id).and_then(|tab| tab.start_capture());
+                    match started {
+                        Some(path) => ui.monitor.append_line(&format!("Capturing to {}", path.display())),
+                        None => {
+                            ui.monitor.append_line("Can't start capture \u{2014} pick a port and node first.");
+                            btn.set_active(false);
+                        }
+                    }
+                } else if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                    tab.stop_capture();
                 }
             });
         }
@@ -1006,7 +1026,8 @@ pub fn build_ui(app: &adw::Application) {
     {
         let ui = ui.clone();
         save_monitor_button.connect_clicked(move |_| {
-            crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text());
+            let history_dir = pr_core::AppConfig::config_dir().map(|dir| dir.join("history"));
+            crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text(), history_dir.as_deref());
         });
     }
     header.pack_end(&save_monitor_button);
