@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pr_agwpe::client::AgwpeRunner;
-use pr_ax25::Ax25RawSocketRunner;
+use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
 use pr_core::{spawn_port, AppConfig, PortConfig, PortEntry, PortHandle};
@@ -53,6 +53,14 @@ pub fn spawn_for_config(config: &PortConfig) -> PortHandle {
             login: login.as_ref().map(|l| (l.username.clone(), l.password.clone())),
         }),
         PortConfig::Ax25RawSocket { device } => spawn_port(Ax25RawSocketRunner { device: device.clone() }),
+        PortConfig::KissTcp { host, port, my_call } => spawn_port(KissRunner {
+            transport: KissTransport::Tcp { host: host.clone(), port: *port },
+            my_call: my_call.clone(),
+        }),
+        PortConfig::KissSerial { device, baud, my_call } => spawn_port(KissRunner {
+            transport: KissTransport::Serial { device: device.clone(), baud: *baud },
+            my_call: my_call.clone(),
+        }),
     }
 }
 

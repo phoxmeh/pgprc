@@ -36,6 +36,21 @@ pub enum PortConfig {
     Ax25RawSocket {
         device: String,
     },
+    /// KISS TNC reachable over TCP (e.g. Direwolf's/UZ7HO's raw KISS port).
+    /// Unconnected (UI/beacon) traffic only — connected-mode AX.25 over bare
+    /// KISS would require reimplementing the modulus-8 ARQ state machine,
+    /// which AGWPE and AF_AX25 raw sockets otherwise offload for us.
+    KissTcp {
+        host: String,
+        port: u16,
+        my_call: String,
+    },
+    /// KISS TNC on a serial/USB port.
+    KissSerial {
+        device: String,
+        baud: u32,
+        my_call: String,
+    },
 }
 
 impl PortConfig {
@@ -45,6 +60,8 @@ impl PortConfig {
             PortConfig::Ssh { .. } => "SSH",
             PortConfig::Agwpe { .. } => "AGWPE",
             PortConfig::Ax25RawSocket { .. } => "AX.25 raw socket",
+            PortConfig::KissTcp { .. } => "KISS (TCP)",
+            PortConfig::KissSerial { .. } => "KISS (Serial)",
         }
     }
 }

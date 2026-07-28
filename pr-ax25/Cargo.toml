@@ -11,3 +11,4 @@ libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-channel.workspace = true
+serialport = "4"

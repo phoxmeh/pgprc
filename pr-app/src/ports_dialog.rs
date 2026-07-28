@@ -46,10 +46,15 @@ fn next_id(config: &AppConfig) -> String {
 /// connect/disconnect each one.
 pub fn show(ui: &Rc<Ui>) {
     let (win, root) = dialog_window(&ui.window, "Ports", 560);
+    win.set_default_height(420);
 
     let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
     list_box.add_css_class("boxed-list");
-    let scrolled = gtk::ScrolledWindow::builder().child(&list_box).vexpand(true).build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&list_box)
+        .vexpand(true)
+        .min_content_height(240)
+        .build();
     root.append(&scrolled);
 
     rebuild_list(ui, &list_box);
@@ -139,7 +144,8 @@ fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, list_box: &gtk::ListBox) -> gtk
     row.upcast()
 }
 
-const KIND_NAMES: [&str; 4] = ["Telnet", "SSH", "AGWPE", "AX.25 raw socket"];
+const KIND_NAMES: [&str; 6] =
+    ["Telnet", "SSH", "AGWPE", "AX.25 raw socket", "KISS (TCP)", "KISS (Serial)"];
 
 fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntry>, list_box: &gtk::ListBox) {
     let (win, root) = dialog_window(parent, if existing.is_some() { "Edit Port" } else { "Add Port" }, 420);
@@ -196,6 +202,26 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     ax25_box.append(&labeled("Device", &ax25_device));
     stack.add_named(&ax25_box, Some("AX.25 raw socket"));
 
+    // KISS (TCP)
+    let kt_host = gtk::Entry::builder().placeholder_text("host").text("127.0.0.1").build();
+    let kt_port = gtk::Entry::builder().placeholder_text("port").text("8001").build();
+    let kt_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
+    let kt_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    kt_box.append(&labeled("Host", &kt_host));
+    kt_box.append(&labeled("Port", &kt_port));
+    kt_box.append(&labeled("My Callsign", &kt_my_call));
+    stack.add_named(&kt_box, Some("KISS (TCP)"));
+
+    // KISS (Serial)
+    let ks_device = gtk::Entry::builder().placeholder_text("/dev/ttyUSB0").build();
+    let ks_baud = gtk::Entry::builder().placeholder_text("baud").text("9600").build();
+    let ks_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
+    let ks_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    ks_box.append(&labeled("Device", &ks_device));
+    ks_box.append(&labeled("Baud", &ks_baud));
+    ks_box.append(&labeled("My Callsign", &ks_my_call));
+    stack.add_named(&ks_box, Some("KISS (Serial)"));
+
     let initial_kind = match &existing {
         Some(e) => e.config.kind_label(),
         None => "Telnet",
@@ -236,6 +262,16 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
             }
             PortConfig::Ax25RawSocket { device } => {
                 ax25_device.set_text(device);
+            }
+            PortConfig::KissTcp { host, port, my_call } => {
+                kt_host.set_text(host);
+                kt_port.set_text(&port.to_string());
+                kt_my_call.set_text(my_call);
+            }
+            PortConfig::KissSerial { device, baud, my_call } => {
+                ks_device.set_text(device);
+                ks_baud.set_text(&baud.to_string());
+                ks_my_call.set_text(my_call);
             }
         }
     }
@@ -330,7 +366,35 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                         login,
                     }
                 }
-                _ => PortConfig::Ax25RawSocket { device: ax25_device.text().to_string() },
+                "AX.25 raw socket" => PortConfig::Ax25RawSocket { device: ax25_device.text().to_string() },
+                "KISS (TCP)" => {
+                    let port = match kt_port.text().parse::<u16>() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            error_label.set_text("KISS TCP port must be a number 0-65535.");
+                            return;
+                        }
+                    };
+                    PortConfig::KissTcp {
+                        host: kt_host.text().to_string(),
+                        port,
+                        my_call: kt_my_call.text().to_string(),
+                    }
+                }
+                _ => {
+                    let baud = match ks_baud.text().parse::<u32>() {
+                        Ok(b) => b,
+                        Err(_) => {
+                            error_label.set_text("Baud rate must be a number.");
+                            return;
+                        }
+                    };
+                    PortConfig::KissSerial {
+                        device: ks_device.text().to_string(),
+                        baud,
+                        my_call: ks_my_call.text().to_string(),
+                    }
+                }
             };
 
             let autoconnect = autoconnect_check.is_active();
@@ -429,14 +493,22 @@ pub fn show_send_unproto(ui: &Rc<Ui>) {
         .borrow()
         .ports
         .iter()
-        .filter(|p| ui.state.is_active(&p.id) && matches!(p.config, PortConfig::Agwpe { .. }))
+        .filter(|p| {
+            ui.state.is_active(&p.id)
+                && matches!(
+                    p.config,
+                    PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. }
+                )
+        })
         .cloned()
         .collect();
 
     let (win, root) = dialog_window(&ui.window, "Send Beacon", 400);
 
     if candidates.is_empty() {
-        root.append(&gtk::Label::new(Some("No connected AGWPE ports. Connect one first via Ports\u{2026}")));
+        root.append(&gtk::Label::new(Some(
+            "No connected AGWPE or KISS ports. Connect one first via Ports\u{2026}",
+        )));
         win.present();
         return;
     }
