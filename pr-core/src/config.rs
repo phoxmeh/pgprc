@@ -66,6 +66,25 @@ impl PortConfig {
     }
 }
 
+/// A known station: either entered manually, or auto-created/updated the
+/// first time we hear that callsign on any port (see `PortEvent::StationHeard`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressBookEntry {
+    /// Primary key, e.g. "KD3BFP-9". Always stored uppercase.
+    pub callsign: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Local time of the most recent time this callsign was heard, formatted
+    /// for display (e.g. "2026-07-27 20:34:21"). `None` for manually-added
+    /// entries that haven't actually been heard yet.
+    #[serde(default)]
+    pub last_heard: Option<String>,
+    #[serde(default)]
+    pub heard_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgwpeLogin {
     pub username: String,
@@ -109,6 +128,8 @@ pub struct AppConfig {
     pub ports: Vec<PortEntry>,
     #[serde(default)]
     pub ui: UiPrefs,
+    #[serde(default)]
+    pub address_book: Vec<AddressBookEntry>,
 }
 
 impl AppConfig {

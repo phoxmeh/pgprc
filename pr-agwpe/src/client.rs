@@ -194,6 +194,15 @@ fn text_from_bytes(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace('\0', "").trim().to_string()
 }
 
+fn emit_heard(events: &async_channel::Sender<PortEvent>, callsign: &str) -> Result<(), ()> {
+    if callsign.is_empty() {
+        return Ok(());
+    }
+    events
+        .send_blocking(PortEvent::StationHeard { callsign: callsign.to_string() })
+        .map_err(|_| ())
+}
+
 /// `Err(())` signals the UI side has gone away and the reader loop should stop.
 fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conns: &Arc<Mutex<ConnMap>>) -> Result<(), ()> {
     let kind = frame.kind();
@@ -222,6 +231,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
                 }
             };
             let text = text_from_bytes(&frame.data);
+            emit_heard(events, &remote)?;
             events
                 .send_blocking(PortEvent::ConnectionOpened { id, label: remote })
                 .map_err(|_| ())?;
@@ -258,6 +268,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
         }
         'U' | 'S' | 'I' | 'T' => {
             let text = text_from_bytes(&frame.data);
+            emit_heard(events, &frame.call_from)?;
             events
                 .send_blocking(PortEvent::Monitor {
                     line: format!("{} > {} [{kind}]: {text}", frame.call_from, frame.call_to),

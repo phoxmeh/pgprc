@@ -1,3 +1,4 @@
+mod address_book_dialog;
 mod app_state;
 mod connection_view;
 mod monitor_view;

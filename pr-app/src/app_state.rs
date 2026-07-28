@@ -6,7 +6,7 @@ use pr_agwpe::client::AgwpeRunner;
 use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
-use pr_core::{spawn_port, AppConfig, PortConfig, PortEntry, PortHandle};
+use pr_core::{spawn_port, AddressBookEntry, AppConfig, PortConfig, PortEntry, PortHandle};
 
 pub struct AppState {
     pub config: RefCell<AppConfig>,
@@ -30,6 +30,37 @@ impl AppState {
         if let Err(e) = self.config.borrow().save() {
             tracing::warn!("failed to save config: {e}");
         }
+    }
+
+    /// Record that `callsign` was just heard: bump its entry's `last_heard`
+    /// timestamp and `heard_count`, creating the entry if this is the first
+    /// time. Manually-entered name/notes on an existing entry are preserved.
+    pub fn record_heard(&self, callsign: &str) {
+        let callsign = callsign.trim().to_uppercase();
+        if callsign.is_empty() {
+            return;
+        }
+        let now = gtk::glib::DateTime::now_local()
+            .and_then(|t| t.format("%Y-%m-%d %H:%M:%S"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let mut cfg = self.config.borrow_mut();
+        match cfg.address_book.iter_mut().find(|e| e.callsign == callsign) {
+            Some(entry) => {
+                entry.last_heard = Some(now);
+                entry.heard_count += 1;
+            }
+            None => cfg.address_book.push(AddressBookEntry {
+                callsign,
+                name: None,
+                notes: None,
+                last_heard: Some(now),
+                heard_count: 1,
+            }),
+        }
+        drop(cfg);
+        self.save_config();
     }
 }
 

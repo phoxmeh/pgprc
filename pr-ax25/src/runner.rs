@@ -39,6 +39,7 @@ impl PortRunner for Ax25RawSocketRunner {
                 Ok(PortCommand::OpenConnection { remote }) => {
                     let id = next_id;
                     next_id += 1;
+                    let _ = event_tx.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
                     let _ = event_tx.send_blocking(PortEvent::ConnectionOpened {
                         id,
                         label: remote.clone(),

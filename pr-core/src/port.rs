@@ -25,6 +25,11 @@ pub enum PortEvent {
     ConnectionClosed { id: ConnectionId },
     ConnState { id: ConnectionId, state: ConnState },
     Data { id: ConnectionId, bytes: Vec<u8> },
+    /// A definite station callsign was observed (a monitored frame's source,
+    /// a connect notification, ...), for address-book "last heard" tracking.
+    /// Separate from `Monitor` (which is just display text) so the UI
+    /// doesn't need to re-parse callsigns back out of formatted strings.
+    StationHeard { callsign: String },
 }
 
 /// Commands flowing from the UI to a port's background thread.

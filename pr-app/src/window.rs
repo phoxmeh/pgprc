@@ -8,6 +8,7 @@ use gtk::glib;
 
 use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
 
+use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::connection_view::ConnectionTab;
 use crate::monitor_view::MonitorView;
@@ -114,6 +115,9 @@ impl Ui {
                 if let Some(tab) = self.tabs.borrow().get(&key) {
                     tab.append_text(&String::from_utf8_lossy(&bytes));
                 }
+            }
+            PortEvent::StationHeard { callsign } => {
+                self.state.record_heard(&callsign);
             }
         }
     }
@@ -237,6 +241,16 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
     header.pack_start(&beacon_button);
+
+    // "Address Book\u{2026}" lists stations heard automatically plus manual entries.
+    let address_book_button = gtk::Button::with_label("Address Book\u{2026}");
+    {
+        let ui = ui.clone();
+        address_book_button.connect_clicked(move |_| {
+            address_book_dialog::show(&ui);
+        });
+    }
+    header.pack_start(&address_book_button);
 
     // "Preferences\u{2026}" opens font/timestamp/default-callsign settings.
     let prefs_button = gtk::Button::with_label("Preferences\u{2026}");

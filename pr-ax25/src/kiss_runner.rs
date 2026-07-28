@@ -168,6 +168,7 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
                         continue; // only interested in data frames
                     }
                     if let Ok(frame) = Ax25Frame::from_bytes(&payload) {
+                        let _ = events.send_blocking(PortEvent::StationHeard { callsign: frame.source.to_string() });
                         let _ = events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame) });
                     }
                 }
