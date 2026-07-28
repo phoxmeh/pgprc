@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Packet Radio
+GenericName=Packet Radio Client
+Comment=AGWPE/AX.25/KISS packet radio client
+Exec=packet-radio
+Icon=net.packetradio.PacketRadio
+Terminal=false
+Categories=Network;HamRadio;
+StartupWMClass=net.packetradio.PacketRadio

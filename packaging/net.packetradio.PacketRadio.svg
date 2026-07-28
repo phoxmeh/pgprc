@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#1a5fb4"/>
+
+  <!-- signal waves -->
+  <g stroke="#99c1f1" stroke-width="10" stroke-linecap="round" fill="none">
+    <path d="M 78 108 A 60 60 0 0 1 178 108"/>
+    <path d="M 60 92 A 88 88 0 0 1 196 92"/>
+  </g>
+
+  <!-- antenna mast -->
+  <g stroke="#f6f5f4" stroke-width="12" stroke-linecap="round">
+    <line x1="128" y1="108" x2="128" y2="208"/>
+    <line x1="96" y1="208" x2="160" y2="208"/>
+  </g>
+  <circle cx="128" cy="108" r="14" fill="#f6f5f4"/>
+</svg>
