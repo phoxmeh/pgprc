@@ -49,6 +49,10 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
 - **Pinning**: pin a tab to have its shell (port + node prefilled,
   disconnected) recreated automatically the next time the app starts. It
   never auto-connects — you still press Connect.
+- **Desktop notifications** (off by default): an unsolicited incoming
+  connection, a monitored frame addressed to your Default Callsign, or a
+  frame matching a user-defined destination rule (e.g. a bulletin address or
+  a digipeater alias) each raise a notification.
 
 ## Not supported (by design, for now)
 
