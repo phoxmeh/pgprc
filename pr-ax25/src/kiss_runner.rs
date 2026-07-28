@@ -218,10 +218,14 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
                     }
                     if let Ok(frame) = Ax25Frame::from_bytes(&payload) {
                         let _ = events.send_blocking(PortEvent::StationHeard { callsign: frame.source.to_string() });
-                        let _ = events.send_blocking(PortEvent::Monitor {
-                            line: describe_frame(&frame),
-                            to: Some(frame.destination.to_string()),
-                        });
+                        // Only UI frames are notification-eligible — I/S/etc
+                        // frames belong to someone else's connected-mode
+                        // session we're passively monitoring, not a
+                        // standalone directed message, and would otherwise
+                        // fire once per frame of an ongoing conversation.
+                        let to = matches!(frame.content, FrameContent::UnnumberedInformation(_))
+                            .then(|| frame.destination.to_string());
+                        let _ = events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame), to });
                     }
                 }
             }

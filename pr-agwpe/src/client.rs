@@ -251,9 +251,11 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
                 .send_blocking(PortEvent::ConnState { id, state: ConnState::Connected })
                 .map_err(|_| ())?;
             if !text.is_empty() {
-                events
-                    .send_blocking(PortEvent::Monitor { line: text, to: Some(frame.call_to.clone()) })
-                    .map_err(|_| ())?;
+                // `to: None` — a connect isn't a UI frame, and an incoming
+                // connection already gets its own "connected to you"
+                // notification; piggybacking another one here would just
+                // double up.
+                events.send_blocking(PortEvent::Monitor { line: text, to: None }).map_err(|_| ())?;
             }
         }
         'd' => {
@@ -282,10 +284,16 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             let text = text_from_bytes(&frame.data);
             let pid_suffix = pr_ax25::pid_label(frame.pid).map(|l| format!(" [PID: {l}]")).unwrap_or_default();
             emit_heard(events, &frame.call_from)?;
+            // Only 'U' (UI/unproto) is notification-eligible. 'I'/'S' belong
+            // to an active connected-mode conversation (already visible in
+            // its own tab — notifying on every reply would just be noise),
+            // and 'T' is our own transmission being monitored, not something
+            // received.
+            let to = (kind == 'U').then(|| frame.call_to.clone());
             events
                 .send_blocking(PortEvent::Monitor {
                     line: format!("{} > {} [{kind}]{pid_suffix}: {text}", frame.call_from, frame.call_to),
-                    to: Some(frame.call_to.clone()),
+                    to,
                 })
                 .map_err(|_| ())?;
         }
