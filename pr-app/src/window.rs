@@ -877,19 +877,9 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
 
-    // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
-    // already-connected AGWPE/KISS port.
-    let beacon_button = gtk::Button::with_label("Send Beacon\u{2026}");
-    {
-        let ui = ui.clone();
-        beacon_button.connect_clicked(move |_| {
-            ports_dialog::show_send_unproto(&ui);
-        });
-    }
-    header.pack_start(&beacon_button);
-
     // A single hamburger menu holds the less-frequently-used management
-    // dialogs, instead of a header button apiece.
+    // dialogs, instead of a header button apiece. Placed first so it's the
+    // leftmost header control.
     let menu_button = gtk::MenuButton::builder().icon_name("open-menu-symbolic").tooltip_text("Menu").build();
     let menu_popover = gtk::Popover::new();
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -926,7 +916,19 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&menu_button);
 
-    // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered) view.
+    // "Send Beacon\u{2026}" sends a one-shot unconnected (UI) frame over an
+    // already-connected AGWPE/KISS port.
+    let beacon_button = gtk::Button::with_label("Send Beacon\u{2026}");
+    {
+        let ui = ui.clone();
+        beacon_button.connect_clicked(move |_| {
+            ports_dialog::show_send_unproto(&ui);
+        });
+    }
+    header.pack_start(&beacon_button);
+
+    // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered)
+    // view — packed at the end, next to the Monitor toggle it relates to.
     let save_monitor_button = gtk::Button::with_label("Save Monitor Log\u{2026}");
     {
         let ui = ui.clone();
@@ -934,7 +936,7 @@ pub fn build_ui(app: &adw::Application) {
             crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text());
         });
     }
-    header.pack_start(&save_monitor_button);
+    header.pack_end(&save_monitor_button);
 
     let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
     {

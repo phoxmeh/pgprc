@@ -131,13 +131,36 @@ impl SessionTab {
         let address_book_refs: Vec<&str> = address_book_names.iter().map(String::as_str).collect();
         let address_book_model = gtk::StringList::new(&address_book_refs);
         let address_book_dropdown = gtk::DropDown::builder().model(&address_book_model).build();
+        address_book_dropdown.set_tooltip_text(Some("From Address Book\u{2026}"));
+        // Blank factory for the closed button (leaves just the dropdown's own
+        // arrow visible) but a real text factory for the popup list, so the
+        // picker reads as a small arrow next to the node entry instead of a
+        // wide "From Address Book..." button.
+        let button_factory = gtk::SignalListItemFactory::new();
+        button_factory.connect_setup(|_, _list_item| {});
+        address_book_dropdown.set_factory(Some(&button_factory));
+        let list_factory = gtk::SignalListItemFactory::new();
+        list_factory.connect_setup(|_, list_item| {
+            let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
+            let label = gtk::Label::new(None);
+            label.set_halign(gtk::Align::Start);
+            list_item.set_child(Some(&label));
+        });
+        list_factory.connect_bind(|_, list_item| {
+            let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
+            let label = list_item.child().and_then(|c| c.downcast::<gtk::Label>().ok());
+            let text = list_item.item().and_then(|o| o.downcast::<gtk::StringObject>().ok());
+            if let (Some(label), Some(text)) = (label, text) {
+                label.set_text(&text.string());
+            }
+        });
+        address_book_dropdown.set_list_factory(Some(&list_factory));
 
         let unproto_toggle = gtk::CheckButton::with_label("Unproto");
         node_row.append(&node_entry);
-        node_row.append(&via_entry);
         node_row.append(&address_book_dropdown);
+        node_row.append(&via_entry);
         node_row.append(&unproto_toggle);
-        controls.append(&node_row);
 
         let connect_button = gtk::Button::with_label("Connect");
         connect_button.add_css_class("suggested-action");
@@ -157,6 +180,7 @@ impl SessionTab {
         controls.append(&stats_label);
 
         root.append(&controls);
+        root.append(&node_row);
 
         // --- scrollback + input ---
         let text_view = gtk::TextView::builder()
