@@ -76,8 +76,16 @@ pub struct AgwpeLogin {
 pub struct UiPrefs {
     #[serde(default = "default_true")]
     pub show_monitor: bool,
+    /// A font description string like `"Monospace 11"`: everything but a
+    /// trailing numeric token is the family name, the trailing number (if
+    /// present) is the point size.
     #[serde(default)]
     pub font: Option<String>,
+    #[serde(default = "default_true")]
+    pub show_timestamps: bool,
+    /// Pre-fills the "My Callsign" field when adding a new AGWPE/KISS port.
+    #[serde(default)]
+    pub default_call: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -89,6 +97,8 @@ impl Default for UiPrefs {
         UiPrefs {
             show_monitor: true,
             font: None,
+            show_timestamps: true,
+            default_call: None,
         }
     }
 }

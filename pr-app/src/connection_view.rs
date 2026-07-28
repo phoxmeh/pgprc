@@ -20,6 +20,7 @@ impl ConnectionTab {
             .left_margin(6)
             .right_margin(6)
             .build();
+        text_view.add_css_class("pr-mono");
         let buffer = text_view.buffer();
         let scrolled = gtk::ScrolledWindow::builder()
             .child(&text_view)

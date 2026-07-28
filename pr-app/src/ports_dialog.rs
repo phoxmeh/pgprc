@@ -9,7 +9,7 @@ use crate::window::Ui;
 
 /// Build a modal dialog window with a native header bar (so it always has a
 /// title and a close button) and return it along with its content box.
-fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: i32) -> (adw::Window, gtk::Box) {
+pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: i32) -> (adw::Window, gtk::Box) {
     let win = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
@@ -221,6 +221,14 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     ks_box.append(&labeled("Baud", &ks_baud));
     ks_box.append(&labeled("My Callsign", &ks_my_call));
     stack.add_named(&ks_box, Some("KISS (Serial)"));
+
+    if existing.is_none() {
+        if let Some(default_call) = &ui.state.config.borrow().ui.default_call {
+            agw_my_call.set_text(default_call);
+            kt_my_call.set_text(default_call);
+            ks_my_call.set_text(default_call);
+        }
+    }
 
     let initial_kind = match &existing {
         Some(e) => e.config.kind_label(),
@@ -556,11 +564,11 @@ pub fn show_send_unproto(ui: &Rc<Ui>) {
     win.present();
 }
 
-fn labeled(text: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
+pub(crate) fn labeled(text: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     labeled_widget(text, widget.clone().upcast())
 }
 
-fn labeled_widget(text: &str, widget: gtk::Widget) -> gtk::Box {
+pub(crate) fn labeled_widget(text: &str, widget: gtk::Widget) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let label = gtk::Label::new(Some(text));
     label.set_width_chars(12);

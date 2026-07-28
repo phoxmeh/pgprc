@@ -12,6 +12,7 @@ use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::connection_view::ConnectionTab;
 use crate::monitor_view::MonitorView;
 use crate::ports_dialog;
+use crate::preferences_dialog;
 
 pub struct Ui {
     pub state: Rc<AppState>,
@@ -118,6 +119,36 @@ impl Ui {
     }
 }
 
+/// Apply a font description string (e.g. `"Monospace 11"`) to the Monitor
+/// and Connection scrollback views via a CSS provider. GTK4 gives widgets no
+/// direct "set font" API anymore, only CSS, and `TextView`'s content lives
+/// on an internal `text` child node, so the rule targets both it and the
+/// widget itself to make sure the font actually takes effect.
+pub fn apply_font(font_desc: &str) {
+    let (family, size) = parse_font_desc(font_desc);
+    let escaped_family = family.replace('"', "");
+    let css = format!(".pr-mono, .pr-mono text {{ font-family: \"{escaped_family}\"; font-size: {size}pt; }}");
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
+fn parse_font_desc(desc: &str) -> (String, u32) {
+    let desc = desc.trim();
+    if desc.is_empty() {
+        return ("Monospace".to_string(), 11);
+    }
+    if let Some(idx) = desc.rfind(' ') {
+        let (family, size_str) = desc.split_at(idx);
+        if let Ok(size) = size_str.trim().parse::<u32>() {
+            return (family.to_string(), size);
+        }
+    }
+    (desc.to_string(), 11)
+}
+
 fn describe_state(state: ConnState) -> &'static str {
     match state {
         ConnState::Connecting => "connecting",
@@ -133,6 +164,11 @@ pub fn build_ui(app: &adw::Application) {
         AppConfig::default()
     });
     let show_monitor = config.ui.show_monitor;
+    let show_timestamps = config.ui.show_timestamps;
+    let font = config.ui.font.clone().unwrap_or_else(|| "Monospace 11".to_string());
+    let autoconnect_ids: Vec<String> =
+        config.ports.iter().filter(|p| p.autoconnect).map(|p| p.id.clone()).collect();
+    apply_font(&font);
     let state = AppState::new(config);
 
     let window = adw::ApplicationWindow::builder()
@@ -143,6 +179,7 @@ pub fn build_ui(app: &adw::Application) {
         .build();
 
     let monitor = MonitorView::new();
+    monitor.set_show_timestamps(show_timestamps);
     let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).build();
 
     let paned = gtk::Paned::builder()
@@ -201,6 +238,16 @@ pub fn build_ui(app: &adw::Application) {
     }
     header.pack_start(&beacon_button);
 
+    // "Preferences\u{2026}" opens font/timestamp/default-callsign settings.
+    let prefs_button = gtk::Button::with_label("Preferences\u{2026}");
+    {
+        let ui = ui.clone();
+        prefs_button.connect_clicked(move |_| {
+            preferences_dialog::show(&ui);
+        });
+    }
+    header.pack_start(&prefs_button);
+
     let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
     {
         let ui = ui.clone();
@@ -217,4 +264,8 @@ pub fn build_ui(app: &adw::Application) {
     window.set_content(Some(&toolbar_view));
 
     window.present();
+
+    for id in autoconnect_ids {
+        ui.connect_port(&id);
+    }
 }
