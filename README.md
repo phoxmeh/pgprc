@@ -120,6 +120,31 @@ header's managed Direwolf process button to do anything) and `linux-lts`
 (a Linux kernel build with AX.25 support, for the `AF_AX25` raw-socket port
 kind — the mainline `linux` kernel package doesn't enable it).
 
+## Building a portable AppImage
+
+`appimage/build.sh` builds a self-contained `pgprc-*-x86_64.AppImage` that
+runs on most x86_64 Linux distros without installing anything:
+
+```sh
+./appimage/build.sh
+```
+
+It needs `linuxdeploy`, `linuxdeploy-plugin-gtk.sh`, and `appimagetool` —
+use copies already on `PATH`, or drop them (executable) into
+`appimage/tools/` next to the script:
+
+- <https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage>
+- <https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh>
+- <https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage>
+
+The script works around two issues seen building on a bleeding-edge glibc/
+binutils toolchain (both documented inline): the `gtk` plugin unconditionally
+copying a `gtk-4.0` module directory that GTK4 doesn't ship on every distro
+(Arch included), and `patchelf` corrupting bundled libraries that carry RELR
+relocations (`DT_RELR`/`.relr.dyn`) when rewriting their runpath, which
+crashes the dynamic linker at runtime. Neither should affect older/more
+conservative toolchains, but the workarounds are harmless either way.
+
 ## Workspace layout
 
 | Crate      | Purpose                                                          |

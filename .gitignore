@@ -6,3 +6,9 @@
 /src/
 *.pkg.tar.*
 *.log
+
+# AppImage build artifacts (see appimage/build.sh)
+/appimage/AppDir/
+/appimage/tools/
+/appimage/*.AppImage
+*.AppImage
