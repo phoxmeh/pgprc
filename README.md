@@ -32,8 +32,10 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   connected port, with a substring filter and "Save Monitor Log..." export.
 - **Configurable highlighting**: callsigns, known (address-book) callsigns,
   your own callsign (the Default Callsign in Preferences) in its own color,
-  AX.25 frame-type tags, and user-defined keyword/bulletin rules (regex or
-  plain substring) are colored in both the Monitor and session scrollback.
+  AX.25 frame-type tags, and user-defined destination-address rules (e.g.
+  CQ or a digipeater alias) are colored in both the Monitor and session
+  scrollback — each rule's bell toggle can also raise a desktop
+  notification on a match.
 - **Address Book**: tracks "last heard" automatically as callsigns show up
   on the air, plus manually-entered name/alias/location/notes. Includes an
   online **QRZ.com lookup** and **ADIF export** of logged QSOs.
@@ -51,8 +53,8 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   never auto-connects — you still press Connect.
 - **Desktop notifications** (off by default): an unsolicited incoming
   connection, a monitored frame addressed to your Default Callsign, or a
-  frame matching a user-defined destination rule (e.g. a bulletin address or
-  a digipeater alias) each raise a notification.
+  frame matching a Custom Rule with its bell toggle on, each raise a
+  notification.
 
 ## Not supported (by design, for now)
 
@@ -119,9 +121,9 @@ managed entirely through the UI — there's normally no need to hand-edit it.
    opening a session, optionally via a digipeater path.
 5. Use the menu for **Address Book**, **Mailbox**, **Beacons**, and
    **Preferences** (fonts, QRZ credentials, highlighting colors, the
-   personal mailbox and notification toggles). Preferences' **Custom
-   Rules** button opens a dedicated editor for the keyword/bulletin
-   highlight rules and notification destination rules.
+   personal mailbox and notification toggles, and the **Custom Rules**
+   list — destination addresses to highlight, each with a bell toggle to
+   also raise a desktop notification on a match).
 
 ## License
 
