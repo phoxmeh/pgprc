@@ -20,7 +20,11 @@ pub enum PortEvent {
     PortDisconnected { reason: Option<String> },
     PortError { message: String },
     /// A line to show in the live traffic Monitor view (already formatted).
-    Monitor { line: String },
+    /// `to` is the frame's destination callsign when this represents
+    /// received/monitored traffic (not our own transmissions), letting the
+    /// UI decide whether it was "directed at" a configured callsign without
+    /// re-parsing `line`.
+    Monitor { line: String, to: Option<String> },
     ConnectionOpened { id: ConnectionId, label: String },
     ConnectionClosed { id: ConnectionId },
     ConnState { id: ConnectionId, state: ConnState },

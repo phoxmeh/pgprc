@@ -150,8 +150,12 @@ impl PortRunner for AgwpeRunner {
                     }
                 }
                 Ok(PortCommand::SendUnproto { dest, via, bytes }) => {
+                    // `to: None` — this is our own transmission, not
+                    // received traffic, so it never counts as "directed at
+                    // me" even if `dest` happens to be our own callsign.
                     let _ = event_tx.send_blocking(PortEvent::Monitor {
                         line: format!("{my_call} > {dest} [unproto TX]: {}", text_from_bytes(&bytes)),
+                        to: None,
                     });
                     let frame = if via.is_empty() {
                         AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes)
@@ -218,7 +222,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
         'G' | 'R' | 'H' | 'g' => {
             let text = text_from_bytes(&frame.data);
             events
-                .send_blocking(PortEvent::Monitor { line: format!("[{kind}] {text}") })
+                .send_blocking(PortEvent::Monitor { line: format!("[{kind}] {text}"), to: None })
                 .map_err(|_| ())?;
         }
         'C' => {
@@ -248,7 +252,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
                 .map_err(|_| ())?;
             if !text.is_empty() {
                 events
-                    .send_blocking(PortEvent::Monitor { line: text })
+                    .send_blocking(PortEvent::Monitor { line: text, to: Some(frame.call_to.clone()) })
                     .map_err(|_| ())?;
             }
         }
@@ -281,6 +285,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             events
                 .send_blocking(PortEvent::Monitor {
                     line: format!("{} > {} [{kind}]{pid_suffix}: {text}", frame.call_from, frame.call_to),
+                    to: Some(frame.call_to.clone()),
                 })
                 .map_err(|_| ())?;
         }

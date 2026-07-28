@@ -174,6 +174,33 @@ pub struct MailboxPrefs {
     pub messages: Vec<MailboxMessage>,
 }
 
+/// A user-defined destination match for desktop notifications: any frame
+/// whose destination callsign matches `pattern` triggers one, independent of
+/// (and in addition to) the built-in "directed to my callsign" check.
+/// Mirrors `HighlightRule`'s shape, but matches an address field instead of
+/// message content — no color, since this doesn't touch the scrollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyRule {
+    pub label: String,
+    /// Case-insensitive. Literal callsigns separated by `,`/`|` unless
+    /// `regex` is set, in which case it's used as a regex directly.
+    pub pattern: String,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Desktop notification preferences. Off by default, like the mailbox —
+/// firing OS notifications is a side effect the user should opt into.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotifyPrefs {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<NotifyRule>,
+}
+
 /// One real connected-mode QSO, logged for ADIF export. Distinct from the
 /// address book's "heard" tracking, which includes any monitored traffic,
 /// not just two-way contacts we actually opened/received a connection for.
@@ -374,6 +401,8 @@ pub struct AppConfig {
     pub qso_log: Vec<QsoLogEntry>,
     #[serde(default)]
     pub mailbox: MailboxPrefs,
+    #[serde(default)]
+    pub notify: NotifyPrefs,
 }
 
 impl AppConfig {

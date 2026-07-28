@@ -182,8 +182,11 @@ fn command_loop(writer: &mut impl Write, my_call: &str, cmd_rx: &mpsc::Receiver<
                         }
                         let via_suffix =
                             if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
+                        // `to: None` — our own transmission, never "directed
+                        // at me" regardless of `dest`.
                         let _ = event_tx.send_blocking(PortEvent::Monitor {
                             line: format!("{my_call} > {dest}{via_suffix} [unproto TX]: {text}"),
+                            to: None,
                         });
                     }
                     Err(e) => {
@@ -215,7 +218,10 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
                     }
                     if let Ok(frame) = Ax25Frame::from_bytes(&payload) {
                         let _ = events.send_blocking(PortEvent::StationHeard { callsign: frame.source.to_string() });
-                        let _ = events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame) });
+                        let _ = events.send_blocking(PortEvent::Monitor {
+                            line: describe_frame(&frame),
+                            to: Some(frame.destination.to_string()),
+                        });
                     }
                 }
             }

@@ -649,8 +649,11 @@ impl Ui {
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
             }
-            PortEvent::Monitor { line } => {
+            PortEvent::Monitor { line, to } => {
                 self.monitor.append_line(&format!("[{port_id}] {line}"));
+                if let Some(to) = to.as_deref() {
+                    self.maybe_notify_directed(port_id, to, &line);
+                }
             }
             PortEvent::ConnectionOpened { id, label } => {
                 let needs_node =
@@ -678,13 +681,27 @@ impl Ui {
                     }
                     self.update_tab_title(tab);
 
-                    // An unsolicited connect while the mailbox is enabled is
-                    // answered automatically instead of waiting for a human
-                    // to type back.
-                    if needs_node && is_new_incoming && self.state.config.borrow().mailbox.enabled {
-                        *tab.mailbox_state.borrow_mut() = Some(crate::mailbox::MailboxState::Command);
-                        let my_call = self.state.config.borrow().ui.default_call.clone().unwrap_or_else(|| "MAILBOX".to_string());
-                        self.send_tab_text(tab, port_id, &crate::mailbox::welcome_banner(&my_call));
+                    if needs_node && is_new_incoming {
+                        // An unsolicited connect while the mailbox is enabled
+                        // is answered automatically instead of waiting for a
+                        // human to type back.
+                        if self.state.config.borrow().mailbox.enabled {
+                            *tab.mailbox_state.borrow_mut() = Some(crate::mailbox::MailboxState::Command);
+                            let my_call = self.state.config.borrow().ui.default_call.clone().unwrap_or_else(|| "MAILBOX".to_string());
+                            self.send_tab_text(tab, port_id, &crate::mailbox::welcome_banner(&my_call));
+                        }
+                        // An incoming connection is inherently "directed at
+                        // me" (that's what accepting it means), so this
+                        // doesn't need `NotifyMatcher` at all — just the
+                        // feature's on/off switch.
+                        if self.state.config.borrow().notify.enabled {
+                            let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
+                            crate::notify::send(
+                                &self.window,
+                                &format!("Packet Radio \u{2014} {port_name}"),
+                                &format!("{label} connected to you"),
+                            );
+                        }
                     }
                 }
                 if needs_node {
@@ -734,6 +751,16 @@ impl Ui {
                 self.update_mode_controls(tab);
             }
         }
+    }
+
+    /// Fire a desktop notification if `to` is directed at the configured
+    /// default callsign or matches a user `NotifyRule` — no-op if
+    /// notifications are disabled or nothing matches.
+    fn maybe_notify_directed(&self, port_id: &str, to: &str, line: &str) {
+        let matcher = crate::notify::NotifyMatcher::build(&self.state.config.borrow());
+        let Some(reason) = matcher.match_destination(to) else { return };
+        let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
+        crate::notify::send(&self.window, &format!("Packet Radio \u{2014} {port_name}"), &format!("{reason}\n{line}"));
     }
 }
 

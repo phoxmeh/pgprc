@@ -7,6 +7,7 @@ mod highlight;
 mod mailbox;
 mod mailbox_dialog;
 mod monitor_view;
+mod notify;
 mod ports_dialog;
 mod preferences_dialog;
 mod qrz;
