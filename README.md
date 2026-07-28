@@ -31,6 +31,7 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
 - **Monitor view**: a live log of all port/frame activity across every
   connected port, with a substring filter and "Save Monitor Log..." export.
 - **Configurable highlighting**: callsigns, known (address-book) callsigns,
+  your own callsign (the Default Callsign in Preferences) in its own color,
   AX.25 frame-type tags, and user-defined keyword/bulletin rules (regex or
   plain substring) are colored in both the Monitor and session scrollback.
 - **Address Book**: tracks "last heard" automatically as callsigns show up
