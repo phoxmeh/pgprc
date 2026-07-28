@@ -1,14 +1,15 @@
 //! Desktop notifications for "directed at me" packet traffic: an unsolicited
 //! incoming connection, a monitored/received frame whose destination matches
-//! the configured default callsign, or a user-defined `NotifyRule` matching
-//! some other destination (e.g. a bulletin address). Off by default
-//! (`NotifyPrefs.enabled`) — firing OS notifications is a side effect the
-//! user should opt into, same precedent as the personal mailbox.
+//! the configured default callsign, or a user's `HighlightRule` with its
+//! `notify` flag set (the same destination-address rules used for
+//! highlighting also drive notifications — one rule list, two effects). Off
+//! by default (`NotifyPrefs.enabled`) — firing OS notifications is a side
+//! effect the user should opt into, same precedent as the personal mailbox.
 
 use gtk::prelude::*;
 use regex::{Regex, RegexBuilder};
 
-use pr_core::{AppConfig, NotifyRule};
+use pr_core::{AppConfig, HighlightRule};
 
 use crate::qrz::strip_ssid;
 
@@ -30,7 +31,8 @@ impl NotifyMatcher {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| strip_ssid(s).to_uppercase());
-        let rules = config.notify.rules.iter().filter(|r| r.enabled).filter_map(build_rule).collect();
+        let rules =
+            config.highlighting.rules.iter().filter(|r| r.enabled && r.notify).filter_map(build_rule).collect();
         NotifyMatcher { enabled: config.notify.enabled, my_call_base, rules }
     }
 
@@ -55,18 +57,14 @@ impl NotifyMatcher {
     }
 }
 
-fn build_rule(rule: &NotifyRule) -> Option<(Regex, String)> {
-    let pattern = if rule.regex {
-        rule.pattern.clone()
-    } else {
-        let alts: Vec<String> = rule.pattern.split([',', '|']).map(str::trim).filter(|s| !s.is_empty()).map(regex::escape).collect();
-        if alts.is_empty() {
-            return None;
-        }
-        // Exact match against the base callsign — a destination *is* the
-        // whole address field, not a substring to search within.
-        format!("^({})$", alts.join("|"))
-    };
+fn build_rule(rule: &HighlightRule) -> Option<(Regex, String)> {
+    let alts: Vec<String> = rule.pattern.split([',', '|']).map(str::trim).filter(|s| !s.is_empty()).map(regex::escape).collect();
+    if alts.is_empty() {
+        return None;
+    }
+    // Exact match against the base callsign — a destination *is* the
+    // whole address field, not a substring to search within.
+    let pattern = format!("^({})$", alts.join("|"));
     RegexBuilder::new(&pattern).case_insensitive(true).build().ok().map(|re| (re, rule.label.clone()))
 }
 
@@ -85,12 +83,16 @@ mod tests {
     use super::*;
     use pr_core::AppConfig;
 
-    fn config_with(default_call: Option<&str>, notify_enabled: bool, rules: Vec<NotifyRule>) -> AppConfig {
+    fn config_with(default_call: Option<&str>, notify_enabled: bool, rules: Vec<HighlightRule>) -> AppConfig {
         let mut cfg = AppConfig::default();
         cfg.ui.default_call = default_call.map(str::to_string);
         cfg.notify.enabled = notify_enabled;
-        cfg.notify.rules = rules;
+        cfg.highlighting.rules = rules;
         cfg
+    }
+
+    fn rule(label: &str, pattern: &str, notify: bool, enabled: bool) -> HighlightRule {
+        HighlightRule { label: label.to_string(), pattern: pattern.to_string(), color: "#FFFFFF".to_string(), notify, enabled }
     }
 
     #[test]
@@ -111,8 +113,7 @@ mod tests {
 
     #[test]
     fn matches_custom_destination_rule() {
-        let rule = NotifyRule { label: "Wide digi".to_string(), pattern: "WIDE1-1, WIDE2-1".to_string(), regex: false, enabled: true };
-        let cfg = config_with(None, true, vec![rule]);
+        let cfg = config_with(None, true, vec![rule("Wide digi", "WIDE1-1, WIDE2-1", true, true)]);
         let matcher = NotifyMatcher::build(&cfg);
         let reason = matcher.match_destination("wide1-1").expect("should match case-insensitively");
         assert!(reason.contains("Wide digi"));
@@ -120,9 +121,17 @@ mod tests {
     }
 
     #[test]
+    fn rule_without_notify_flag_is_ignored() {
+        // notify: false — a highlight-only rule shouldn't also fire
+        // notifications.
+        let cfg = config_with(None, true, vec![rule("CQ", "CQ", false, true)]);
+        let matcher = NotifyMatcher::build(&cfg);
+        assert!(matcher.match_destination("CQ").is_none());
+    }
+
+    #[test]
     fn disabled_rule_is_ignored() {
-        let rule = NotifyRule { label: "Off".to_string(), pattern: "CQ".to_string(), regex: false, enabled: false };
-        let cfg = config_with(None, true, vec![rule]);
+        let cfg = config_with(None, true, vec![rule("Off", "CQ", true, false)]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("CQ").is_none());
     }
@@ -131,8 +140,7 @@ mod tests {
     fn rule_pattern_is_exact_not_substring() {
         // "CQ" shouldn't match "CQD" or vice versa — a destination field is
         // the whole address, not text to search within.
-        let rule = NotifyRule { label: "CQ".to_string(), pattern: "CQ".to_string(), regex: false, enabled: true };
-        let cfg = config_with(None, true, vec![rule]);
+        let cfg = config_with(None, true, vec![rule("CQ", "CQ", true, true)]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("CQD").is_none());
     }

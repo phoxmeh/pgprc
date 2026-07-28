@@ -1,6 +1,9 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+
+use pr_core::HighlightRule;
 
 use crate::ports_dialog::dialog_window;
 use crate::window::{apply_font, Ui};
@@ -107,26 +110,41 @@ pub fn show(ui: &Rc<Ui>) {
 
     content.append(&hl_group);
 
-    // --- Custom Rules (its own dialog, since editing a list of keyword/
-    // destination rules needs a lot more room than fits comfortably here) ---
+    // --- Custom Rules: one list of destination-address rules that both
+    // highlight matching traffic and (via the bell toggle) can also raise a
+    // desktop notification ---
     let rules_group = adw::PreferencesGroup::builder()
         .title("Custom Rules")
-        .description("Keyword highlighting and notification destination rules share one editor")
+        .description("Destination addresses to highlight, e.g. CQ or a digipeater alias \u{2014} tap the bell to also notify on a match")
         .build();
-    let rules_row = adw::ActionRow::builder()
-        .title("Highlighting \u{0026} Notification Rules")
-        .subtitle("Add, edit, or remove keyword and destination rules")
-        .build();
-    let manage_rules_button = gtk::Button::with_label("Manage\u{2026}");
-    manage_rules_button.set_valign(gtk::Align::Center);
+
+    let rules_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    rules_list.add_css_class("boxed-list");
+    let rules_scrolled = gtk::ScrolledWindow::builder().child(&rules_list).min_content_height(200).vexpand(false).build();
+    rules_group.add(&rules_scrolled);
+
+    let rules: Rc<RefCell<Vec<HighlightRule>>> = Rc::new(RefCell::new(current_hl.rules.clone()));
+    rebuild_rules_list(&rules_list, &rules);
+
+    let add_rule_button = gtk::Button::with_label("Add Rule\u{2026}");
+    add_rule_button.set_margin_top(8);
+    add_rule_button.set_halign(gtk::Align::Start);
     {
-        let ui = ui.clone();
-        manage_rules_button.connect_clicked(move |_| {
-            crate::rules_dialog::show(&ui);
+        let rules = rules.clone();
+        let rules_list = rules_list.clone();
+        let default_color = current_hl.callsign_color.clone();
+        add_rule_button.connect_clicked(move |_| {
+            rules.borrow_mut().push(HighlightRule {
+                label: "New Rule".to_string(),
+                pattern: String::new(),
+                color: default_color.clone(),
+                notify: false,
+                enabled: true,
+            });
+            rebuild_rules_list(&rules_list, &rules);
         });
     }
-    rules_row.add_suffix(&manage_rules_button);
-    rules_group.add(&rules_row);
+    rules_group.add(&add_rule_button);
     content.append(&rules_group);
 
     root.append(&scrolled);
@@ -147,6 +165,7 @@ pub fn show(ui: &Rc<Ui>) {
     {
         let ui = ui.clone();
         let win = win.clone();
+        let rules = rules.clone();
         save_button.connect_clicked(move |_| {
             let font = font_row.text().to_string();
             let show_timestamps = timestamps_row.is_active();
@@ -176,6 +195,7 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.highlighting.known_callsign_color = rgba_to_hex(&known_color_btn.rgba());
                 cfg.highlighting.my_call_color = rgba_to_hex(&my_call_color_btn.rgba());
                 cfg.highlighting.ax25_command_color = rgba_to_hex(&ax25_color_btn.rgba());
+                cfg.highlighting.rules = rules.borrow().clone();
 
                 cfg.mailbox.enabled = mailbox_enabled_row.is_active();
 
@@ -198,7 +218,113 @@ pub fn show(ui: &Rc<Ui>) {
     win.present();
 }
 
-pub(crate) fn color_button(hex: &str) -> gtk::ColorDialogButton {
+fn rebuild_rules_list(list_box: &gtk::ListBox, rules: &Rc<RefCell<Vec<HighlightRule>>>) {
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+    let len = rules.borrow().len();
+    for idx in 0..len {
+        list_box.append(&build_rule_row(list_box, rules, idx));
+    }
+}
+
+fn build_rule_row(list_box: &gtk::ListBox, rules: &Rc<RefCell<Vec<HighlightRule>>>, idx: usize) -> gtk::Widget {
+    let rule = rules.borrow()[idx].clone();
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_margin_top(4);
+    row.set_margin_bottom(4);
+    row.set_margin_start(6);
+    row.set_margin_end(6);
+
+    let enabled_check = gtk::CheckButton::new();
+    enabled_check.set_active(rule.enabled);
+    {
+        let rules = rules.clone();
+        enabled_check.connect_toggled(move |btn| {
+            if let Some(r) = rules.borrow_mut().get_mut(idx) {
+                r.enabled = btn.is_active();
+            }
+        });
+    }
+    row.append(&enabled_check);
+
+    let label_entry = gtk::Entry::builder().text(&rule.label).width_chars(10).build();
+    {
+        let rules = rules.clone();
+        label_entry.connect_changed(move |e| {
+            if let Some(r) = rules.borrow_mut().get_mut(idx) {
+                r.label = e.text().to_string();
+            }
+        });
+    }
+    row.append(&label_entry);
+
+    let pattern_entry =
+        gtk::Entry::builder().text(&rule.pattern).hexpand(true).placeholder_text("CQ, WIDE1-1, ...").build();
+    {
+        let rules = rules.clone();
+        pattern_entry.connect_changed(move |e| {
+            if let Some(r) = rules.borrow_mut().get_mut(idx) {
+                r.pattern = e.text().to_string();
+            }
+        });
+    }
+    row.append(&pattern_entry);
+
+    // Bell toggle: also raise a desktop notification on a match, lighting up
+    // (accent color, via the same `.notify-rule-active` class pattern as the
+    // tab pin toggle) when active.
+    let notify_toggle =
+        gtk::ToggleButton::builder().icon_name("notifications-symbolic").tooltip_text("Notify on match").build();
+    notify_toggle.add_css_class("flat");
+    notify_toggle.add_css_class("notify-rule-toggle");
+    notify_toggle.set_active(rule.notify);
+    if rule.notify {
+        notify_toggle.add_css_class("notify-rule-active");
+    }
+    {
+        let rules = rules.clone();
+        notify_toggle.connect_toggled(move |btn| {
+            if btn.is_active() {
+                btn.add_css_class("notify-rule-active");
+            } else {
+                btn.remove_css_class("notify-rule-active");
+            }
+            if let Some(r) = rules.borrow_mut().get_mut(idx) {
+                r.notify = btn.is_active();
+            }
+        });
+    }
+    row.append(&notify_toggle);
+
+    let color_btn = color_button(&rule.color);
+    {
+        let rules = rules.clone();
+        color_btn.connect_rgba_notify(move |btn| {
+            if let Some(r) = rules.borrow_mut().get_mut(idx) {
+                r.color = rgba_to_hex(&btn.rgba());
+            }
+        });
+    }
+    row.append(&color_btn);
+
+    let remove_button = gtk::Button::with_label("\u{2715}");
+    remove_button.add_css_class("flat");
+    {
+        let rules = rules.clone();
+        let list_box = list_box.clone();
+        remove_button.connect_clicked(move |_| {
+            rules.borrow_mut().remove(idx);
+            rebuild_rules_list(&list_box, &rules);
+        });
+    }
+    row.append(&remove_button);
+
+    row.upcast()
+}
+
+fn color_button(hex: &str) -> gtk::ColorDialogButton {
     let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     button.set_valign(gtk::Align::Center);
     if let Ok(rgba) = gtk::gdk::RGBA::parse(hex) {
@@ -207,7 +333,7 @@ pub(crate) fn color_button(hex: &str) -> gtk::ColorDialogButton {
     button
 }
 
-pub(crate) fn rgba_to_hex(rgba: &gtk::gdk::RGBA) -> String {
+fn rgba_to_hex(rgba: &gtk::gdk::RGBA) -> String {
     format!(
         "#{:02X}{:02X}{:02X}",
         (rgba.red() * 255.0).round() as u8,

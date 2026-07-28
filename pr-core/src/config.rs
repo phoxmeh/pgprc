@@ -174,31 +174,16 @@ pub struct MailboxPrefs {
     pub messages: Vec<MailboxMessage>,
 }
 
-/// A user-defined destination match for desktop notifications: any frame
-/// whose destination callsign matches `pattern` triggers one, independent of
-/// (and in addition to) the built-in "directed to my callsign" check.
-/// Mirrors `HighlightRule`'s shape, but matches an address field instead of
-/// message content — no color, since this doesn't touch the scrollback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotifyRule {
-    pub label: String,
-    /// Case-insensitive. Literal callsigns separated by `,`/`|` unless
-    /// `regex` is set, in which case it's used as a regex directly.
-    pub pattern: String,
-    #[serde(default)]
-    pub regex: bool,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
 /// Desktop notification preferences. Off by default, like the mailbox —
-/// firing OS notifications is a side effect the user should opt into.
+/// firing OS notifications is a side effect the user should opt into. Which
+/// destinations actually raise a notification (beyond the built-in
+/// "directed to my callsign"/incoming-connection checks) is driven by each
+/// `HighlightRule.notify` flag, not a separate rule list — one set of
+/// destination rules covers both highlighting and notifications.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotifyPrefs {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub rules: Vec<NotifyRule>,
 }
 
 /// One real connected-mode QSO, logged for ADIF export. Distinct from the
@@ -238,20 +223,26 @@ pub struct AgwpeLogin {
     pub password: String,
 }
 
-/// A user-defined highlight: any line containing text matching `pattern`
-/// gets that span colored. Seeded by default with common traffic keywords
-/// (CQ, BEACON, IDENT); users add more of these for their own nets/bulletins
-/// — there's no separate mechanism for "custom" rules, just more entries.
+/// A user-defined destination-address rule: any line containing a token
+/// matching `pattern` gets that span colored, and — when `notify` is set —
+/// a frame whose destination exactly matches also raises a desktop
+/// notification (subject to `NotifyPrefs.enabled`). One rule list drives
+/// both features, since "addresses I want to highlight" and "addresses I
+/// want to be notified about" are the same underlying concept. Seeded by
+/// default with common traffic keywords (CQ, BEACON, IDENT); users add more
+/// of these for their own nets/bulletins/watched callsigns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighlightRule {
     pub label: String,
-    /// Case-insensitive. Literal keywords separated by `,` or `|` unless
-    /// `regex` is set, in which case it's used as a regex directly.
+    /// Case-insensitive. Literal destination addresses/keywords separated
+    /// by `,` or `|`, e.g. `"CQ, WIDE1-1"`.
     pub pattern: String,
-    #[serde(default)]
-    pub regex: bool,
     /// A CSS-style color, e.g. `"#FFD700"`.
     pub color: String,
+    /// Also raise a desktop notification when a frame's destination
+    /// exactly matches this rule.
+    #[serde(default)]
+    pub notify: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -299,12 +290,12 @@ fn default_ax25_command_color() -> String {
 
 fn default_rules() -> Vec<HighlightRule> {
     vec![
-        HighlightRule { label: "CQ".to_string(), pattern: "CQ".to_string(), regex: false, color: "#FFD700".to_string(), enabled: true },
+        HighlightRule { label: "CQ".to_string(), pattern: "CQ".to_string(), color: "#FFD700".to_string(), notify: false, enabled: true },
         HighlightRule {
             label: "BEACON/IDENT".to_string(),
             pattern: "BEACON,IDENT".to_string(),
-            regex: false,
             color: "#FF8C00".to_string(),
+            notify: false,
             enabled: true,
         },
     ]

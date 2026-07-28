@@ -782,10 +782,19 @@ pub fn apply_font(font_desc: &str) {
 
 /// One-time static CSS for widgets whose styling doesn't depend on user
 /// preferences (unlike `apply_font`, which is reapplied whenever the font
-/// setting changes) — currently just the pin toggle's checked-state tint.
+/// setting changes): the tab pin toggle's active-state tint, and the
+/// per-rule notify bell's "lit" state. The bell uses a background tint
+/// rather than `color` — the `notifications-symbolic` icon doesn't recolor
+/// via a plain `color` override the way single-path icons like
+/// `pin-symbolic` do (confirmed empirically: a `background-color: red`
+/// diagnostic rendered immediately, a `color` override on the icon itself
+/// did not).
 fn apply_base_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(".pin-toggle.pin-pinned { color: @accent_color; }");
+    provider.load_from_string(
+        ".pin-toggle.pin-pinned { color: @accent_color; } \
+         .notify-rule-toggle.notify-rule-active { background-color: @accent_color; }",
+    );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }

@@ -55,21 +55,17 @@ impl Highlighter {
             .iter()
             .filter(|r| r.enabled)
             .filter_map(|r| {
-                let pattern = if r.regex {
-                    r.pattern.clone()
-                } else {
-                    let alts: Vec<String> = r
-                        .pattern
-                        .split([',', '|'])
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(regex::escape)
-                        .collect();
-                    if alts.is_empty() {
-                        return None;
-                    }
-                    format!(r"\b({})\b", alts.join("|"))
-                };
+                let alts: Vec<String> = r
+                    .pattern
+                    .split([',', '|'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(regex::escape)
+                    .collect();
+                if alts.is_empty() {
+                    return None;
+                }
+                let pattern = format!(r"\b({})\b", alts.join("|"));
                 RegexBuilder::new(&pattern)
                     .case_insensitive(true)
                     .build()
