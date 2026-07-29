@@ -108,6 +108,11 @@ pub struct Ui {
     /// port (e.g. a bad outgoing frame), which must not clear its favorites
     /// button or `active` entry.
     confirmed_ports: RefCell<HashSet<String>>,
+    /// (port_id, connection_id) pairs that received `ConnState::Connected`,
+    /// meaning the remote accepted the SABM (UA). Used to distinguish a
+    /// clean disconnect from a timeout (`ConnectionClosed` without a prior
+    /// `Connected` state = timeout/no-answer).
+    established_conns: RefCell<HashSet<(String, ConnectionId)>>,
 
     // --- Shared bottom bar: Node / Via / Port (in that order), then the
     // dial/minimize button, the phone-handset connect/disconnect button
@@ -872,6 +877,7 @@ impl Ui {
                 self.refresh_status_bar();
             }
             PortEvent::ConnectionClosed { id } => {
+                let was_established = self.established_conns.borrow_mut().remove(&(port_id.to_string(), id));
                 if let Some(tab_id) = self.bound.borrow_mut().remove(&(port_id.to_string(), id)) {
                     if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                         let is_connect_port =
@@ -882,7 +888,8 @@ impl Ui {
                         tab.conn_id.set(None);
                         tab.mark_disconnected();
                         tab.flush_pending();
-                        tab.append_status_line("Disconnected");
+                        let status_msg = if was_established { "Disconnected" } else { "Connection timed out" };
+                        tab.append_status_line(status_msg);
                         *tab.mailbox_state.borrow_mut() = None;
                     }
                     if self.selected_tab.get() == Some(tab_id) {
@@ -893,6 +900,9 @@ impl Ui {
             }
             PortEvent::ConnState { id, state } => {
                 self.log.append_line(&format!("[{port_id}] connection {id}: {}", describe_state(state)));
+                if state == ConnState::Connected {
+                    self.established_conns.borrow_mut().insert((port_id.to_string(), id));
+                }
             }
             PortEvent::Data { id, bytes } => {
                 if let Some(&tab_id) = self.bound.borrow().get(&(port_id.to_string(), id)) {
@@ -1351,6 +1361,7 @@ pub fn build_ui(app: &adw::Application) {
         favorite_buttons: RefCell::new(HashMap::new()),
         beacon_button: beacon_button.clone(),
         confirmed_ports: RefCell::new(HashSet::new()),
+        established_conns: RefCell::new(HashSet::new()),
         bottom_node_entry,
         bottom_via_entry,
         bottom_port_dropdown,
