@@ -205,6 +205,7 @@ fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_
             ui.state.save_config();
             rebuild_list(&ui, &list_box);
             ui.rebuild_favorites_bar();
+            ui.rebuild_bottom_ports();
         });
     }
     row.append(&remove_button);
@@ -529,6 +530,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
             ui.state.save_config();
             rebuild_list(&ui, &list_box);
             ui.rebuild_favorites_bar();
+            ui.rebuild_bottom_ports();
             win.close();
         });
     }

@@ -71,28 +71,23 @@ impl AppState {
         self.save_config();
     }
 
-    pub fn is_pinned(&self, port_id: &str, remote: &str, unproto: bool) -> bool {
-        self.config
-            .borrow()
-            .pinned_sessions
-            .iter()
-            .any(|p| p.port_id == port_id && p.remote == remote && p.unproto == unproto)
+    pub fn is_pinned(&self, port_id: &str, remote: &str) -> bool {
+        self.config.borrow().pinned_sessions.iter().any(|p| p.port_id == port_id && p.remote == remote)
     }
 
-    /// Pin or unpin a (port, node, mode) tab so its shell (port + node
-    /// prefilled, disconnected) is recreated automatically at the next app
-    /// startup. Unconditionally replaces any existing entry for the same
-    /// (port_id, remote, unproto) with the current `via`, so editing a
-    /// pinned tab's via path while pinned keeps it in sync.
-    pub fn set_pinned(&self, port_id: &str, remote: &str, unproto: bool, via: &str, pinned: bool) {
+    /// Pin or unpin a (port, node) tab so its shell (port + node prefilled,
+    /// disconnected) is recreated automatically at the next app startup.
+    /// Unconditionally replaces any existing entry for the same
+    /// (port_id, remote) with the current `via`, so editing a pinned tab's
+    /// via path while pinned keeps it in sync.
+    pub fn set_pinned(&self, port_id: &str, remote: &str, via: &str, pinned: bool) {
         let mut cfg = self.config.borrow_mut();
-        cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote && p.unproto == unproto));
+        cfg.pinned_sessions.retain(|p| !(p.port_id == port_id && p.remote == remote));
         if pinned {
             cfg.pinned_sessions.push(PinnedSession {
                 port_id: port_id.to_string(),
                 remote: remote.to_string(),
                 via: via.to_string(),
-                unproto,
             });
         }
         drop(cfg);
@@ -127,14 +122,13 @@ impl AppState {
         self.save_config();
     }
 
-    /// `unproto` keeps connected-mode session history separate from unproto
-    /// traffic history to the same (port, remote) — they're unrelated
-    /// conversations that happen to share a destination callsign. Backed by
-    /// a plain-text file under `history/<port>/`, not `AppConfig` — see
-    /// `history_path`.
-    pub fn history_for(&self, port_id: &str, remote: &str, unproto: bool) -> Vec<String> {
+    /// Every tab is a two-way connection now (unproto has no per-node
+    /// history of its own — see the packet_radio project memory's redesign
+    /// notes). Backed by a plain-text file under `history/<port>/`, not
+    /// `AppConfig` — see `history_path`.
+    pub fn history_for(&self, port_id: &str, remote: &str) -> Vec<String> {
         let cfg = self.config.borrow();
-        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+        let Some(path) = history_path(&cfg, port_id, remote) else {
             return Vec::new();
         };
         let max_lines = cfg.ui.history_lines as usize;
@@ -150,11 +144,11 @@ impl AppState {
         }
     }
 
-    /// Permanently delete the persisted history for one (port, node, mode) —
+    /// Permanently delete the persisted history for one (port, node) —
     /// used by the tab's "Clear History" action.
-    pub fn clear_history(&self, port_id: &str, remote: &str, unproto: bool) {
+    pub fn clear_history(&self, port_id: &str, remote: &str) {
         let cfg = self.config.borrow();
-        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+        let Some(path) = history_path(&cfg, port_id, remote) else {
             return;
         };
         drop(cfg);
@@ -165,13 +159,13 @@ impl AppState {
         }
     }
 
-    /// Append one completed line to a (port, node, mode)'s persisted
-    /// history file. Unlike the old in-config storage, this is an unbounded
+    /// Append one completed line to a (port, node)'s persisted history
+    /// file. Unlike the old in-config storage, this is an unbounded
     /// archive — `history_for` applies the line-count cap at read time
     /// instead.
-    pub fn append_history_line(&self, port_id: &str, remote: &str, unproto: bool, line: &str) {
+    pub fn append_history_line(&self, port_id: &str, remote: &str, line: &str) {
         let cfg = self.config.borrow();
-        let Some(path) = history_path(&cfg, port_id, remote, unproto) else {
+        let Some(path) = history_path(&cfg, port_id, remote) else {
             return;
         };
         drop(cfg);
@@ -288,12 +282,12 @@ pub fn find_entry(config: &AppConfig, id: &str) -> Option<PortEntry> {
     config.ports.iter().find(|p| p.id == id).cloned()
 }
 
-/// Resolve the on-disk path for one (port, node, mode)'s history file —
-/// `None` only if the config directory itself can't be determined.
-fn history_path(config: &AppConfig, port_id: &str, remote: &str, unproto: bool) -> Option<std::path::PathBuf> {
+/// Resolve the on-disk path for one (port, node)'s history file — `None`
+/// only if the config directory itself can't be determined.
+fn history_path(config: &AppConfig, port_id: &str, remote: &str) -> Option<std::path::PathBuf> {
     let dir = AppConfig::config_dir()?;
     let port_name = find_entry(config, port_id).map(|p| p.name).unwrap_or_else(|| port_id.to_string());
-    Some(pr_core::history_file_path(&dir, &port_name, remote, unproto))
+    Some(pr_core::history_file_path(&dir, &port_name, remote))
 }
 
 pub(crate) fn now_timestamp() -> String {

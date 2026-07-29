@@ -25,20 +25,11 @@ pub fn history_dir(config_dir: &Path, port_name: &str) -> PathBuf {
     config_dir.join("history").join(sanitize_component(port_name))
 }
 
-/// The auto-managed, ever-appended scrollback file for one (port, node,
-/// mode) — the program's own record, read back (tail-capped) as the
-/// "previous conversation" preview.
-pub fn history_file_path(config_dir: &Path, port_name: &str, remote: &str, unproto: bool) -> PathBuf {
+/// The auto-managed, ever-appended scrollback file for one (port, node) —
+/// the program's own record, read back (tail-capped) as the "previous
+/// conversation" preview. Every tab is a two-way connection now, so there's
+/// no separate unproto-vs-connected bucket to key on any more.
+pub fn history_file_path(config_dir: &Path, port_name: &str, remote: &str) -> PathBuf {
     let node = sanitize_component(remote);
-    let filename = if unproto { format!("{node}_unproto.txt") } else { format!("{node}.txt") };
-    history_dir(config_dir, port_name).join(filename)
-}
-
-/// A one-off archive/capture filename: `<node>_<YYYY-MM-DD>_<HHMMSS>.txt`,
-/// used by both the manual "Save..." export and the live-capture checkbox
-/// so a single conversation can accumulate several distinct dated captures
-/// over time without overwriting each other.
-pub fn capture_file_path(config_dir: &Path, port_name: &str, node: &str, date: &str, time: &str) -> PathBuf {
-    let node = sanitize_component(node);
-    history_dir(config_dir, port_name).join(format!("{node}_{date}_{time}.txt"))
+    history_dir(config_dir, port_name).join(format!("{node}.txt"))
 }

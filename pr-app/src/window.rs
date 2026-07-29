@@ -5,12 +5,13 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEvent};
+use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEntry, PortEvent};
 
 use crate::about_dialog;
 use crate::address_book_dialog;
 use crate::app_state::{find_entry, spawn_for_config, AppState};
 use crate::beacons_dialog;
+use crate::dial_dialog;
 use crate::direwolf::{DirewolfProcess, DirewolfState};
 use crate::direwolf_dialog;
 use crate::help_dialog;
@@ -22,31 +23,58 @@ use crate::ports_dialog;
 use crate::preferences_dialog;
 use crate::session_tab::{port_supports_connect, port_supports_unproto, SessionTab, TabId};
 
-/// Prefills a newly-created tab's shell: port + node, and optionally a via
-/// path and/or unproto mode. Used both for pinned-tab restoration at startup
-/// and for the fallback tab created when an unsolicited connection arrives.
+/// Prefills a newly-opened tab's shell: port + node + via/address. Used both
+/// for pinned-tab restoration at startup and for the fallback tab created
+/// when an unsolicited connection arrives on a connect-capable port.
 pub struct TabPrefill {
     pub port_id: String,
     pub remote: String,
     pub via: String,
-    pub unproto: bool,
+}
+
+/// One tab's chip in the always-visible-while-any-tab-exists strip: pin
+/// icon (left of the title, per explicit request), title label, close X.
+/// Only `root` is read back later (to remove the chip on close) — the pin
+/// toggle and title label are wired up once at creation and otherwise left
+/// alone, kept alive by `root` itself as their GTK parent.
+struct TabChip {
+    root: gtk::Box,
 }
 
 pub struct Ui {
     pub state: Rc<AppState>,
     pub monitor: MonitorView,
-    pub notebook: gtk::Notebook,
-    /// Swaps between the notebook and an empty-state placeholder with its
-    /// own "+ New Tab" button — GTK hides the notebook's entire tab strip
-    /// (and with it, the "+" action widget on the tab line) when it has zero
-    /// pages, so that's otherwise the *only* way to create the first tab.
-    notebook_stack: gtk::Stack,
     pub tabs: RefCell<HashMap<TabId, SessionTab>>,
+    /// Content-switching stack for tab scrollbacks, keyed by `tab_id`
+    /// stringified. Attached/detached from `paned`'s end child based on
+    /// `tab_area_expanded` -- detaching gives Monitor the full pane (a
+    /// `gtk::Paned` with no end child allocates 100% to its start child).
+    tab_stack: gtk::Stack,
+    /// The Monitor/tab-content split. Monitor is always `start_child`;
+    /// `end_child` is `Some(&tab_stack)` only while expanded.
+    paned: gtk::Paned,
+    /// Always visible whenever `tabs` is non-empty (regardless of
+    /// expanded/minimized), sitting just above the bottom bar -- a chip per
+    /// open tab plus a trailing "+" to dial another. Deliberately a custom
+    /// strip (not `gtk::Notebook`'s built-in one) since it needs to stay
+    /// visible even while the content pane itself is collapsed/minimized.
+    tab_strip: gtk::Box,
+    tab_chips: RefCell<HashMap<TabId, TabChip>>,
+    /// The strip's own trailing "+" button — `add_tab_chip` inserts new
+    /// chips right before it so it always stays at the far right.
+    tab_strip_add_button: gtk::Button,
+    /// Whether the tab content pane is currently shown (state 3) or
+    /// collapsed with only the strip visible (state 2), or there simply are
+    /// no tabs at all (state 1, strip hidden too).
+    tab_area_expanded: Cell<bool>,
+    /// The tab currently shown in `tab_stack` / reflected in the bottom
+    /// bar, only meaningful while `tab_area_expanded`.
+    selected_tab: Cell<Option<TabId>>,
     /// Live connection (port, id) -> the tab it's bound to.
     bound: RefCell<HashMap<(String, ConnectionId), TabId>>,
-    /// A Connect click in progress, keyed by (port_id, remote) — remote is
-    /// empty for port kinds with no node concept (Telnet/SSH), since those
-    /// only ever have one connection to bind.
+    /// A dial in progress, keyed by (port_id, remote) — remote is empty for
+    /// port kinds with no node concept (Telnet/SSH), since those only ever
+    /// have one connection to bind.
     pending: RefCell<HashMap<(String, String), TabId>>,
     next_tab_id: Cell<TabId>,
     /// Scheduled beacon timers, keyed by `Beacon.id` — reset in full by
@@ -72,6 +100,21 @@ pub struct Ui {
     /// port (e.g. a bad outgoing frame), which must not clear its favorites
     /// button or `active` entry.
     confirmed_ports: RefCell<HashSet<String>>,
+
+    // --- Shared bottom bar: Node / Via / Port (in that order), then the
+    // dial/minimize button, the phone-handset connect/disconnect button
+    // (visible only while a tab is selected/expanded), the message entry,
+    // and Send. When no tab is expanded, Node/Via/Port define an ad-hoc
+    // unproto destination + port; when one is, they read-only-display that
+    // tab's own fixed identity instead (see `refresh_bottom_bar`). ---
+    bottom_node_entry: gtk::Entry,
+    bottom_via_entry: gtk::Entry,
+    bottom_port_dropdown: gtk::DropDown,
+    bottom_ports_snapshot: RefCell<Vec<PortEntry>>,
+    dial_button: gtk::Button,
+    phone_button: gtk::Button,
+    message_entry: gtk::Entry,
+
     pub direwolf: Rc<DirewolfProcess>,
     pub window: adw::ApplicationWindow,
 }
@@ -169,6 +212,15 @@ impl Ui {
         }
     }
 
+    /// Rebuild the shared bottom bar's Port dropdown from current config —
+    /// call at startup and after any Ports dialog change.
+    pub fn rebuild_bottom_ports(&self) {
+        let ports = self.state.config.borrow().ports.clone();
+        let names: Vec<&str> = ports.iter().map(|p| p.name.as_str()).collect();
+        self.bottom_port_dropdown.set_model(Some(&gtk::StringList::new(&names)));
+        *self.bottom_ports_snapshot.borrow_mut() = ports;
+    }
+
     /// (Re)schedule every enabled beacon from the current config, discarding
     /// any previously-scheduled timers first. Call this once at startup and
     /// again whenever the beacon list is edited/saved.
@@ -201,122 +253,28 @@ impl Ui {
         }
     }
 
-    /// Create a new, disconnected session tab — optionally prefilled — and
-    /// return its id.
-    pub fn add_tab(self: &Rc<Self>, prefill: Option<TabPrefill>) -> TabId {
+    /// Create a new connected-session tab (from the dial dialog), fixed at
+    /// this identity for its whole lifetime. `connect` issues the actual
+    /// dial immediately; otherwise the tab opens disconnected showing
+    /// history, for manual review/reconnect later ("Open Disconnected").
+    pub fn add_connection_tab(self: &Rc<Self>, port: PortEntry, node: String, via_raw: String, connect: bool) -> TabId {
         let tab_id = self.next_tab_id.get();
         self.next_tab_id.set(tab_id + 1);
 
-        let ports = self.state.config.borrow().ports.clone();
-        let address_book = self.state.config.borrow().address_book.clone();
-        let tab = SessionTab::new(ports, address_book, self.state.clone());
-
-        if let Some(prefill) = &prefill {
-            if let Some(idx) = tab.available_ports.iter().position(|p| p.id == prefill.port_id) {
-                tab.port_dropdown.set_selected(idx as u32);
-            }
-            tab.node_entry.set_text(&prefill.remote);
-            tab.via_entry.set_text(&prefill.via);
-            tab.unproto_toggle.set_active(prefill.unproto);
-            if self.state.is_pinned(&prefill.port_id, &prefill.remote, prefill.unproto) {
-                tab.pin_toggle.set_active(true);
-                *tab.pinned_identity.borrow_mut() = Some((prefill.port_id.clone(), prefill.remote.clone(), prefill.unproto));
-            }
+        let tab = SessionTab::new(port, node, via_raw, self.state.clone());
+        if self.state.is_pinned(&tab.port.id, &tab.node) {
+            tab.pin_toggle.set_active(true);
+            *tab.pinned_identity.borrow_mut() = Some((tab.port.id.clone(), tab.node.clone()));
         }
+        self.preview_history(&tab);
 
-        // Clone out the specific widgets we need after moving `tab` into the map.
         let root = tab.root.clone();
-        let tab_label = tab.tab_label.clone();
         let pin_toggle = tab.pin_toggle.clone();
-        let port_dropdown = tab.port_dropdown.clone();
-        let node_entry = tab.node_entry.clone();
-        let via_entry = tab.via_entry.clone();
-        let address_book_dropdown = tab.address_book_dropdown.clone();
-        let unproto_toggle = tab.unproto_toggle.clone();
-        let connect_button = tab.connect_button.clone();
-        let disconnect_button = tab.disconnect_button.clone();
         let save_button = tab.save_button.clone();
-        let capture_toggle = tab.capture_toggle.clone();
         let clear_history_button = tab.clear_history_button.clone();
-        let input_entry = tab.input_entry.clone();
-        let send_input_button = tab.send_input_button.clone();
 
         self.tabs.borrow_mut().insert(tab_id, tab);
-        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
-            self.update_node_visibility(tab);
-            self.update_mode_controls(tab);
-            self.update_tab_title(tab);
-            self.preview_history(tab);
-        }
 
-        {
-            let ui = self.clone();
-            port_dropdown.connect_selected_notify(move |_| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    ui.update_node_visibility(tab);
-                    ui.update_mode_controls(tab);
-                    ui.update_tab_title(tab);
-                    ui.preview_history(tab);
-                    ui.sync_pin(tab);
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            node_entry.connect_changed(move |_| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    ui.update_tab_title(tab);
-                    ui.sync_pin(tab);
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            let focus = gtk::EventControllerFocus::new();
-            focus.connect_leave(move |_| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    ui.preview_history(tab);
-                }
-            });
-            node_entry.add_controller(focus);
-        }
-        {
-            let ui = self.clone();
-            via_entry.connect_changed(move |_| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    ui.sync_pin(tab);
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            address_book_dropdown.connect_selected_notify(move |_dropdown| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    if let Some(entry) = tab.selected_address_book_entry() {
-                        tab.node_entry.set_text(&entry.callsign);
-                        // A station usually needs the same digipeater path
-                        // every time, so fill it in too — but only if the
-                        // entry actually has one, so picking a direct-path
-                        // station doesn't clobber a via the user already typed.
-                        if !entry.via.trim().is_empty() {
-                            tab.via_entry.set_text(&entry.via);
-                        }
-                        ui.refresh_tab_for_node_entry(&tab.node_entry);
-                    }
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            unproto_toggle.connect_toggled(move |_| {
-                if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    ui.update_mode_controls(tab);
-                    ui.update_tab_title(tab);
-                    ui.preview_history(tab);
-                    ui.sync_pin(tab);
-                }
-            });
-        }
         {
             let ui = self.clone();
             pin_toggle.connect_toggled(move |btn| {
@@ -331,50 +289,22 @@ impl Ui {
                 }
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     if btn.is_active() {
-                        ui.sync_pin(tab);
-                    } else if let Some((old_port, old_remote, old_unproto)) = tab.pinned_identity.borrow_mut().take() {
-                        ui.state.set_pinned(&old_port, &old_remote, old_unproto, "", false);
+                        let via = tab.via_raw.clone();
+                        ui.state.set_pinned(&tab.port.id, &tab.node, &via, true);
+                        *tab.pinned_identity.borrow_mut() = Some((tab.port.id.clone(), tab.node.clone()));
+                    } else if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
+                        ui.state.set_pinned(&old_port, &old_remote, "", false);
                     }
                 }
-            });
-        }
-        {
-            let ui = self.clone();
-            connect_button.connect_clicked(move |_| {
-                ui.connect_tab(tab_id);
-            });
-        }
-        {
-            let ui = self.clone();
-            disconnect_button.connect_clicked(move |_| {
-                ui.disconnect_tab(tab_id);
             });
         }
         {
             let ui = self.clone();
             save_button.connect_clicked(move |_| {
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    let name = tab.tab_label.text().to_string().replace([':', ' ', '/'], "_");
-                    let history_dir = pr_core::AppConfig::config_dir()
-                        .and_then(|dir| tab.selected_port().map(|p| pr_core::history_dir(&dir, &p.name)));
+                    let name = format!("{}_{}", tab.port.name, tab.node).replace([':', ' ', '/'], "_");
+                    let history_dir = pr_core::AppConfig::config_dir().map(|dir| pr_core::history_dir(&dir, &tab.port.name));
                     crate::export::save_text(&ui.window, &format!("{name}.txt"), tab.full_text(), history_dir.as_deref());
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            capture_toggle.connect_toggled(move |btn| {
-                if btn.is_active() {
-                    let started = ui.tabs.borrow().get(&tab_id).and_then(|tab| tab.start_capture());
-                    match started {
-                        Some(path) => ui.monitor.append_line(&format!("Capturing to {}", path.display())),
-                        None => {
-                            ui.monitor.append_line("Can't start capture \u{2014} pick a port and node first.");
-                            btn.set_active(false);
-                        }
-                    }
-                } else if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                    tab.stop_capture();
                 }
             });
         }
@@ -384,19 +314,55 @@ impl Ui {
                 ui.confirm_clear_history(tab_id);
             });
         }
-        {
-            let ui = self.clone();
-            let entry_for_button = input_entry.clone();
-            input_entry.connect_activate(move |entry| {
-                ui.activate_input(tab_id, entry);
-            });
-            let ui = self.clone();
-            send_input_button.connect_clicked(move |_| {
-                ui.activate_input(tab_id, &entry_for_button);
-            });
+
+        self.tab_stack.add_named(&root, Some(&tab_id.to_string()));
+        self.add_tab_chip(tab_id);
+        self.select_tab(tab_id);
+
+        if connect {
+            self.connect_tab(tab_id);
         }
 
-        let close_button = gtk::Button::with_label("\u{2715}");
+        tab_id
+    }
+
+    /// `"{port_index}:{node}"` — fixed for the tab's whole lifetime, since
+    /// both its port and node are immutable once dialed.
+    fn tab_title_text(&self, tab: &SessionTab) -> String {
+        let port_index = self.bottom_ports_snapshot.borrow().iter().position(|p| p.id == tab.port.id).unwrap_or(0);
+        format!("{port_index}:{}", tab.node)
+    }
+
+    /// Build this tab's strip chip (pin left of title, close on the right)
+    /// and insert it just before the strip's own trailing "+" button.
+    fn add_tab_chip(self: &Rc<Self>, tab_id: TabId) {
+        let Some((title_text, pin_toggle)) =
+            self.tabs.borrow().get(&tab_id).map(|t| (self.tab_title_text(t), t.pin_toggle.clone()))
+        else {
+            return;
+        };
+
+        let chip_root = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        chip_root.add_css_class("frame");
+        chip_root.set_margin_start(2);
+        chip_root.set_margin_end(2);
+
+        let click_area = gtk::Button::new();
+        click_area.add_css_class("flat");
+        let title_label = gtk::Label::new(Some(&title_text));
+        let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        title_box.append(&pin_toggle);
+        title_box.append(&title_label);
+        click_area.set_child(Some(&title_box));
+        {
+            let ui = self.clone();
+            click_area.connect_clicked(move |_| {
+                ui.select_tab(tab_id);
+            });
+        }
+        chip_root.append(&click_area);
+
+        let close_button = gtk::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
         {
             let ui = self.clone();
@@ -404,36 +370,136 @@ impl Ui {
                 ui.close_tab(tab_id);
             });
         }
+        chip_root.append(&close_button);
 
-        let tab_label_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        tab_label_box.append(&tab_label);
-        tab_label_box.append(&pin_toggle);
-        tab_label_box.append(&close_button);
-
-        self.notebook.append_page(&root, Some(&tab_label_box));
-        self.notebook.set_tab_reorderable(&root, true);
-        let page_idx = self.notebook.page_num(&root);
-        self.notebook.set_current_page(page_idx);
-        self.update_notebook_stack();
-        self.refresh_status_bar();
-
-        tab_id
+        // Insert right before the strip's own trailing "+" button, so new
+        // chips read left-to-right in creation order with "+" staying at
+        // the far right.
+        let sibling = self.tab_strip_add_button.prev_sibling();
+        self.tab_strip.insert_child_after(&chip_root, sibling.as_ref());
+        self.tab_chips.borrow_mut().insert(tab_id, TabChip { root: chip_root });
+        self.refresh_tab_strip_visibility();
     }
 
-    /// Show the notebook once it has at least one page, otherwise the
-    /// empty-state placeholder (see `notebook_stack`'s doc comment).
-    fn update_notebook_stack(&self) {
-        let name = if self.notebook.n_pages() == 0 { "empty" } else { "notebook" };
-        self.notebook_stack.set_visible_child_name(name);
+    /// Show the tab strip whenever at least one tab exists, matching the
+    /// explicit "the tab bar will not be there when there is no active
+    /// connection" requirement.
+    fn refresh_tab_strip_visibility(&self) {
+        self.tab_strip.set_visible(!self.tabs.borrow().is_empty());
+    }
+
+    /// Expand the tab-content pane (Monitor shrinks to ~1/4) showing
+    /// `tab_id`, and refresh the bottom bar/status bar/phone button for it.
+    pub fn select_tab(self: &Rc<Self>, tab_id: TabId) {
+        if !self.tabs.borrow().contains_key(&tab_id) {
+            return;
+        }
+        self.selected_tab.set(Some(tab_id));
+        self.tab_stack.set_visible_child_name(&tab_id.to_string());
+        if !self.tab_area_expanded.get() {
+            self.tab_area_expanded.set(true);
+            self.paned.set_end_child(Some(&self.tab_stack));
+            // ~1/4 of a typical window height -- approximate on purpose,
+            // the user can still drag the divider.
+            self.paned.set_position(180);
+        }
+        self.refresh_bottom_bar();
+        self.refresh_status_bar();
+    }
+
+    /// Collapse the tab-content pane back to Monitor-fills-everything,
+    /// without closing or disconnecting anything — the tab strip (if any
+    /// tabs remain) stays visible so they can be reselected. Triggered by
+    /// the dial/minimize button when a tab is currently expanded.
+    pub fn minimize_tab_area(&self) {
+        self.tab_area_expanded.set(false);
+        self.selected_tab.set(None);
+        self.paned.set_end_child(gtk::Widget::NONE);
+        self.refresh_bottom_bar();
+        self.refresh_status_bar();
+    }
+
+    /// The dial/minimize button in the bottom bar: opens the dial dialog
+    /// when nothing is currently expanded (covers both "no tabs at all" and
+    /// "tabs exist but minimized" -- clicking it always starts a *new*
+    /// dial in that state, per explicit request), or minimizes the
+    /// currently-expanded tab view.
+    fn on_dial_button_clicked(self: &Rc<Self>) {
+        if self.tab_area_expanded.get() {
+            self.minimize_tab_area();
+        } else {
+            dial_dialog::show(self);
+        }
+    }
+
+    /// Reflects whether a tab is currently expanded/selected: swaps the
+    /// dial/minimize icon, shows/hides the phone-handset button, and
+    /// switches Node/Via/Port between "ad-hoc unproto compose" (editable)
+    /// and "this tab's fixed identity" (read-only display).
+    fn refresh_bottom_bar(&self) {
+        let tabs = self.tabs.borrow();
+        match self.selected_tab.get().and_then(|id| tabs.get(&id)) {
+            Some(tab) => {
+                self.dial_button.set_icon_name("pan-down-symbolic");
+                self.dial_button.set_tooltip_text(Some("Minimize"));
+                self.phone_button.set_visible(true);
+                self.refresh_phone_button(tab);
+                self.bottom_node_entry.set_text(&tab.node);
+                self.bottom_via_entry.set_text(&tab.via_raw);
+                if let Some(idx) = self.bottom_ports_snapshot.borrow().iter().position(|p| p.id == tab.port.id) {
+                    self.bottom_port_dropdown.set_selected(idx as u32);
+                }
+                self.bottom_node_entry.set_sensitive(false);
+                self.bottom_via_entry.set_sensitive(false);
+                self.bottom_port_dropdown.set_sensitive(false);
+                self.message_entry.set_placeholder_text(Some("Type and press Enter\u{2026}"));
+            }
+            None => {
+                self.dial_button.set_icon_name("list-add-symbolic");
+                self.dial_button.set_tooltip_text(Some("Dial\u{2026}"));
+                self.phone_button.set_visible(false);
+                // Clear any node/via left behind by whichever tab was
+                // selected before -- these fields are ad-hoc unproto entry
+                // now, not a read-only mirror of a tab, so a stale callsign
+                // here would otherwise look like a real destination.
+                self.bottom_node_entry.set_text("");
+                self.bottom_via_entry.set_text("");
+                self.bottom_node_entry.set_sensitive(true);
+                self.bottom_via_entry.set_sensitive(true);
+                self.bottom_port_dropdown.set_sensitive(true);
+                self.message_entry.set_placeholder_text(Some("Unproto message\u{2026}"));
+            }
+        }
+    }
+
+    /// Recolor/relabel the phone-handset button for `tab`'s current connect
+    /// state — same explicit CSS-class-swap pattern as the Direwolf button.
+    fn refresh_phone_button(&self, tab: &SessionTab) {
+        self.phone_button.remove_css_class("direwolf-running");
+        if tab.conn_id.get().is_some() {
+            self.phone_button.add_css_class("direwolf-running");
+            self.phone_button.set_tooltip_text(Some("Disconnect"));
+        } else {
+            self.phone_button.set_tooltip_text(Some("Connect"));
+        }
+    }
+
+    /// The phone-handset button: connect or disconnect whichever tab is
+    /// currently selected.
+    fn on_phone_button_clicked(self: &Rc<Self>) {
+        let Some(tab_id) = self.selected_tab.get() else { return };
+        let is_connected = self.tabs.borrow().get(&tab_id).is_some_and(|t| t.conn_id.get().is_some());
+        if is_connected {
+            self.disconnect_tab(tab_id);
+        } else {
+            self.connect_tab(tab_id);
+        }
     }
 
     /// Prompt to confirm, then permanently clear the persisted history *and*
-    /// the visible scrollback for whatever (port, node, mode) the tab is
-    /// currently showing.
+    /// the visible scrollback for the given tab.
     fn confirm_clear_history(self: &Rc<Self>, tab_id: TabId) {
-        let Some((port_id, remote, unproto)) = self.tabs.borrow().get(&tab_id).and_then(|tab| tab.history_key())
-        else {
-            self.monitor.append_line("Nothing to clear \u{2014} select a port and node first.");
+        let Some((port_id, remote)) = self.tabs.borrow().get(&tab_id).map(|tab| tab.history_key()) else {
             return;
         };
 
@@ -450,7 +516,7 @@ impl Ui {
         let ui = self.clone();
         dialog.choose(&self.window, gtk::gio::Cancellable::NONE, move |response| {
             if response == "clear" {
-                ui.state.clear_history(&port_id, &remote, unproto);
+                ui.state.clear_history(&port_id, &remote);
                 if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
                     tab.clear_text();
                 }
@@ -458,89 +524,87 @@ impl Ui {
         });
     }
 
-    /// Send whatever's currently in a tab's input entry — shared by both
-    /// pressing Enter and clicking the Send button next to it. The input
-    /// field stays editable at all times (see `SessionTab::set_connected`),
-    /// but `send_input_button`'s sensitivity only gates the mouse path —
-    /// pressing Enter in a focused `gtk::Entry` fires regardless of any
-    /// other widget's sensitivity, so this re-checks the same "is there
-    /// actually something to send this over" condition before sending or
-    /// clearing the text, rather than silently discarding a composed message.
-    fn activate_input(self: &Rc<Self>, tab_id: TabId, entry: &gtk::Entry) {
-        let text = entry.text().to_string();
+    /// Send whatever's in the shared message entry — shared by both
+    /// pressing Enter and clicking Send. Sends into the currently selected
+    /// tab's live connection if one is expanded, otherwise as an ad-hoc
+    /// unproto frame using the bottom bar's own Node/Via/Port fields.
+    fn activate_message_entry(self: &Rc<Self>) {
+        let text = self.message_entry.text().to_string();
         if text.is_empty() {
             return;
         }
-        let tabs = self.tabs.borrow();
-        let Some(tab) = tabs.get(&tab_id) else { return };
-        let ready = if tab.unproto_toggle.is_active() {
-            tab.selected_port().is_some_and(|p| self.state.is_active(&p.id))
-        } else {
-            tab.conn_id.get().is_some()
-        };
-        if !ready {
-            drop(tabs);
-            self.monitor.append_line("Not connected \u{2014} message kept in the input field.");
-            return;
-        }
-        if tab.unproto_toggle.is_active() {
-            self.send_tab_unproto(tab, &text);
-        } else {
+        if let Some(tab_id) = self.selected_tab.get() {
+            let tabs = self.tabs.borrow();
+            let Some(tab) = tabs.get(&tab_id) else { return };
+            if tab.conn_id.get().is_none() {
+                drop(tabs);
+                self.monitor.append_line("Not connected \u{2014} message kept in the input field.");
+                return;
+            }
             self.send_tab_connected(tab, &text);
+            drop(tabs);
+        } else {
+            self.send_bottom_unproto(&text);
         }
-        drop(tabs);
-        entry.set_text("");
+        self.message_entry.set_text("");
     }
 
-    /// Send the tab's connected-mode input over its live connection.
+    /// Send the selected tab's input over its live connection.
     fn send_tab_connected(&self, tab: &SessionTab, text: &str) {
         let mut bytes = text.to_string().into_bytes();
         bytes.push(b'\n');
-        if let (Some(conn_id), Some(port)) = (tab.conn_id.get(), tab.selected_port()) {
-            if let Some(handle) = self.state.active.borrow().get(&port.id) {
+        if let Some(conn_id) = tab.conn_id.get() {
+            if let Some(handle) = self.state.active.borrow().get(&tab.port.id) {
                 let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
             }
             // Connected-mode AX.25/AGWPE backends don't echo our own
             // transmissions back, so log what we sent ourselves. Telnet/SSH
             // already get a remote echo from the far end, so don't double
             // it up there.
-            if port_supports_connect(&port.config) {
-                let port_name = port.name.clone();
-                let remote = tab.node_entry.text().to_string();
+            if port_supports_connect(&tab.port.config) {
                 tab.append_sent_line(text);
-                self.monitor.append_line(&format!("[{port_name}] TX > {remote}: {text}"));
+                self.monitor.append_line(&format!("[{}] TX > {}: {text}", tab.port.name, tab.node));
                 self.refresh_status_bar();
             }
         }
     }
 
-    /// Send the tab's input as a one-shot unconnected (UI) frame — the tab's
-    /// own destination/via fields, not tied to any live connection.
-    fn send_tab_unproto(&self, tab: &SessionTab, text: &str) {
-        let Some(port) = tab.selected_port() else { return };
-        let port_id = port.id.clone();
-        let port_name = port.name.clone();
-        let dest = tab.node_entry.text().trim().to_uppercase();
+    /// Send the bottom bar's message as a one-shot unconnected (UI) frame,
+    /// using its own Node/Via/Port fields — not tied to any tab.
+    fn send_bottom_unproto(&self, text: &str) {
+        let ports = self.bottom_ports_snapshot.borrow();
+        let Some(port) = ports.get(self.bottom_port_dropdown.selected() as usize).cloned() else { return };
+        drop(ports);
+        if !port_supports_unproto(&port.config) {
+            self.monitor.append_line(&format!("[{}] this port doesn't support unproto sending.", port.name));
+            return;
+        }
+        let dest = self.bottom_node_entry.text().trim().to_uppercase();
         if dest.is_empty() {
             self.monitor.append_line("Enter a destination before sending unproto.");
             return;
         }
-        if !self.state.is_active(&port_id) {
-            self.monitor.append_line(&format!("[{port_name}] port not connected \u{2014} can't send unproto."));
+        if !self.state.is_active(&port.id) {
+            self.monitor.append_line(&format!("[{}] port not connected \u{2014} can't send unproto.", port.name));
             return;
         }
-        let via = tab.via();
-        if let Some(handle) = self.state.active.borrow().get(&port_id) {
+        let via: Vec<String> = self
+            .bottom_via_entry
+            .text()
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_uppercase)
+            .collect();
+        if let Some(handle) = self.state.active.borrow().get(&port.id) {
             let _ = handle.cmd_tx.send(PortCommand::SendUnproto {
                 dest: dest.clone(),
                 via: via.clone(),
                 bytes: text.to_string().into_bytes(),
             });
         }
-        tab.append_sent_line(text);
         let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
-        self.monitor.append_line(&format!("[{port_name}] TX unproto > {dest}{via_suffix}: {text}"));
-        self.refresh_status_bar();
+        self.monitor.append_line(&format!("[{}] TX unproto > {dest}{via_suffix}: {text}", port.name));
     }
 
     /// Send arbitrary text over a tab's live connection on the mailbox's
@@ -563,7 +627,7 @@ impl Ui {
         if tab.mailbox_state.borrow().is_none() {
             return;
         }
-        let remote_call = tab.node_entry.text().trim().to_uppercase();
+        let remote_call = tab.node.trim().to_uppercase();
         for line in tab.take_mailbox_lines(chunk) {
             let mut state_slot = tab.mailbox_state.borrow_mut();
             let Some(state) = state_slot.as_mut() else { break };
@@ -586,30 +650,23 @@ impl Ui {
         }
     }
 
-    /// Connect the tab's selected port (if not already active) and, for
-    /// connect-capable ports, open a session to the entered node. No-op if
-    /// the tab is in Unproto mode.
+    /// Connect the tab's port (if not already active) and, for connect-
+    /// capable ports, open a session to its node; for Telnet/SSH, connect
+    /// the port itself (that connection *is* the whole session) -- the
+    /// greeting line (if any) is sent once `ConnectionOpened` confirms it.
     pub fn connect_tab(self: &Rc<Self>, tab_id: TabId) {
-        let Some((port_id, remote, via, needs_node)) = self.tabs.borrow().get(&tab_id).and_then(|tab| {
-            if tab.unproto_toggle.is_active() {
-                return None;
-            }
-            let port = tab.selected_port()?;
-            Some((port.id.clone(), tab.node_entry.text().trim().to_uppercase(), tab.via(), port_supports_connect(&port.config)))
+        let Some((port_id, node, via, needs_node)) = self.tabs.borrow().get(&tab_id).map(|tab| {
+            (tab.port.id.clone(), tab.node.clone(), tab.via(), port_supports_connect(&tab.port.config))
         }) else {
             return;
         };
 
-        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
-            self.preview_history(tab);
-        }
-
-        if needs_node && remote.is_empty() {
-            self.monitor.append_line("Enter a node/callsign before connecting.");
+        if needs_node && node.is_empty() {
+            self.monitor.append_line("No node set for this tab \u{2014} can't connect.");
             return;
         }
 
-        let pending_key = if needs_node { (port_id.clone(), remote.clone()) } else { (port_id.clone(), String::new()) };
+        let pending_key = if needs_node { (port_id.clone(), node.clone()) } else { (port_id.clone(), String::new()) };
         self.pending.borrow_mut().insert(pending_key, tab_id);
 
         if !self.state.is_active(&port_id) {
@@ -617,13 +674,13 @@ impl Ui {
         }
         if needs_node {
             if let Some(handle) = self.state.active.borrow().get(&port_id) {
-                let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote, via });
+                let _ = handle.cmd_tx.send(PortCommand::OpenConnection { remote: node, via });
             }
         }
     }
 
     pub fn disconnect_tab(&self, tab_id: TabId) {
-        let Some((port_id, conn_id)) = self.tabs.borrow().get(&tab_id).and_then(|tab| Some((tab.selected_port()?.id.clone(), tab.conn_id.get()?)))
+        let Some((port_id, conn_id)) = self.tabs.borrow().get(&tab_id).and_then(|tab| Some((tab.port.id.clone(), tab.conn_id.get()?)))
         else {
             return;
         };
@@ -632,193 +689,50 @@ impl Ui {
         }
     }
 
-    /// Remove a tab entirely: disconnect it if live, unpin it, and drop its
-    /// notebook page.
+    /// Remove a tab entirely: disconnect it first if live (sends a proper
+    /// disconnect over the wire rather than just dropping the UI side),
+    /// unpin it, and drop its chip/content page.
     pub fn close_tab(self: &Rc<Self>, tab_id: TabId) {
         self.disconnect_tab(tab_id);
 
         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
-            if let Some((old_port, old_remote, old_unproto)) = tab.pinned_identity.borrow_mut().take() {
-                self.state.set_pinned(&old_port, &old_remote, old_unproto, "", false);
+            if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
+                self.state.set_pinned(&old_port, &old_remote, "", false);
             }
         }
         self.bound.borrow_mut().retain(|_, v| *v != tab_id);
         self.pending.borrow_mut().retain(|_, v| *v != tab_id);
 
-        // Extracted into its own `let` rather than matched directly on
-        // `self.tabs.borrow_mut().remove(...)`: in an `if let`, temporaries in
-        // the scrutinee live for the whole block, so the `RefMut` guard would
-        // otherwise still be held while `remove_page` runs below.
-        // `remove_page` can synchronously emit `switch-page` (GTK
-        // recalculates the notebook's current page during removal), which
-        // re-enters `refresh_status_bar` -> `current_tab_id` ->
-        // `self.tabs.borrow()` -- an immutable borrow while still mutably
-        // borrowed, which panics and crashes the app. This was the real cause
-        // of the "close a tab, app crashes" bug.
+        if self.selected_tab.get() == Some(tab_id) {
+            self.minimize_tab_area();
+        }
+
+        // Extracted into its own `let` first (not matched directly on
+        // `self.tabs.borrow_mut().remove(...)`) so the `RefMut` guard is
+        // dropped before `tab_stack.remove` runs below -- a stale lesson
+        // from this exact class of bug earlier in this project: an `if let`
+        // scrutinee's temporaries live for the whole block, so a GTK call
+        // that can re-enter and re-borrow `tabs` (as `remove_page` on the
+        // old `Notebook` once did) would otherwise panic.
         let removed_tab = self.tabs.borrow_mut().remove(&tab_id);
         if let Some(tab) = removed_tab {
-            if let Some(page) = self.notebook.page_num(&tab.root) {
-                self.notebook.remove_page(Some(page));
-            }
+            self.tab_stack.remove(&tab.root);
         }
-        self.update_notebook_stack();
+        if let Some(chip) = self.tab_chips.borrow_mut().remove(&tab_id) {
+            self.tab_strip.remove(&chip.root);
+        }
+        self.refresh_tab_strip_visibility();
         self.refresh_status_bar();
     }
 
-    /// Called after something outside the tab's own signal handlers sets its
-    /// node text programmatically (the address-book dropdown) — the normal
-    /// `connect_changed`/focus-out wiring wouldn't otherwise fire for that.
-    pub fn refresh_tab_for_node_entry(&self, node_entry: &gtk::Entry) {
-        if let Some(tab) = self.tabs.borrow().values().find(|t| &t.node_entry == node_entry) {
-            self.update_tab_title(tab);
-            self.preview_history(tab);
-            self.sync_pin(tab);
-        }
-    }
 
-    /// Shows/hides the node/via/unproto row for ports with no node concept
-    /// at all (Telnet/SSH), and forces the Unproto toggle on/off + locked
-    /// for ports that only support one of connect/unproto.
-    fn update_node_visibility(&self, tab: &SessionTab) {
-        let Some(port) = tab.selected_port() else {
-            tab.node_row.set_visible(false);
-            return;
-        };
-        let can_connect = port_supports_connect(&port.config);
-        let can_unproto = port_supports_unproto(&port.config);
-        tab.node_row.set_visible(can_connect || can_unproto);
-        if !can_unproto {
-            tab.unproto_toggle.set_active(false);
-            tab.unproto_toggle.set_sensitive(false);
-        } else if !can_connect {
-            tab.unproto_toggle.set_active(true);
-            tab.unproto_toggle.set_sensitive(false);
-        } else {
-            tab.unproto_toggle.set_sensitive(true);
-        }
-    }
-
-    /// Refreshes Connect/Disconnect/input sensitivity for the tab's current
-    /// Unproto state. In Unproto mode, Connect/Disconnect are always
-    /// disabled (there's no per-tab connection to manage) and the input
-    /// entry tracks whether the underlying port is currently active; outside
-    /// Unproto mode this just restores the normal connected-mode sensitivity.
-    fn update_mode_controls(&self, tab: &SessionTab) {
-        if tab.unproto_toggle.is_active() {
-            tab.connect_button.set_sensitive(false);
-            tab.disconnect_button.set_sensitive(false);
-            tab.port_dropdown.set_sensitive(true);
-            tab.node_entry.set_sensitive(true);
-            tab.via_entry.set_sensitive(true);
-            let active = tab.selected_port().map(|p| self.state.is_active(&p.id)).unwrap_or(false);
-            tab.input_entry.set_sensitive(true);
-            tab.send_input_button.set_sensitive(active);
-        } else {
-            tab.set_connected(tab.conn_id.get().is_some());
-        }
-    }
-
-    /// The tab backing the notebook's currently visible page, if any.
-    fn current_tab_id(&self) -> Option<TabId> {
-        let current = self.notebook.current_page()?;
-        self.tabs.borrow().iter().find(|(_, t)| self.notebook.page_num(&t.root) == Some(current)).map(|(id, _)| *id)
-    }
-
-    /// Refresh the status bar's connect-state (left) and packet/byte stats
-    /// (right) for whichever tab is currently selected. Call this whenever
-    /// the selected tab changes, connects/disconnects, or sends/receives —
-    /// cheap enough to call liberally rather than track precisely. Also
-    /// ticked once a second (see `build_ui`) so the elapsed-time display
-    /// keeps counting up while a tab stays selected.
-    ///
-    /// The connect indicator reflects a genuine two-way connected-mode
-    /// session to a node, not the underlying port -- and is hidden entirely
-    /// for an Unproto tab, which has no such session at all.
-    pub fn refresh_status_bar(&self) {
-        let tabs = self.tabs.borrow();
-        match self.current_tab_id().and_then(|id| tabs.get(&id)) {
-            Some(tab) if tab.unproto_toggle.is_active() => {
-                self.status_conn_icon.set_visible(false);
-                self.status_conn_label.set_text("");
-                self.status_stats_label.set_text(&tab.stats_text());
-            }
-            Some(tab) => {
-                self.status_conn_icon.set_visible(true);
-                let live = tab.conn_id.get().is_some();
-                self.status_conn_icon.set_icon_name(Some(if live {
-                    "network-transmit-receive-symbolic"
-                } else {
-                    "network-offline-symbolic"
-                }));
-                let text = match (live, tab.elapsed_text()) {
-                    (true, Some(elapsed)) => format!("Connected to {} \u{2014} {elapsed}", tab.node_entry.text()),
-                    (true, None) => "Connected".to_string(),
-                    (false, _) => "Disconnected".to_string(),
-                };
-                self.status_conn_label.set_text(&text);
-                self.status_stats_label.set_text(&tab.stats_text());
-            }
-            None => {
-                self.status_conn_icon.set_visible(true);
-                self.status_conn_icon.set_icon_name(Some("network-offline-symbolic"));
-                self.status_conn_label.set_text("No tab selected");
-                self.status_stats_label.set_text("");
-            }
-        }
-    }
-
-    fn update_tab_title(&self, tab: &SessionTab) {
-        let port_name = tab.selected_port().map(|p| p.name.as_str()).unwrap_or("(no port)");
-        let remote = tab.node_entry.text();
-        let mut title = if remote.trim().is_empty() { port_name.to_string() } else { format!("{port_name}: {remote}") };
-        if tab.unproto_toggle.is_active() {
-            title.push_str(" (unproto)");
-        }
-        tab.tab_label.set_text(&title);
-    }
-
-    /// Load a previous node's history into the scrollback, but only while
-    /// disconnected — never clobber a live session's display.
+    /// Load this tab's persisted history into its scrollback right after
+    /// creation (before/without connecting) — "Open Disconnected" is
+    /// specifically for this kind of offline review.
     fn preview_history(&self, tab: &SessionTab) {
-        if tab.conn_id.get().is_some() {
-            return;
-        }
-        let Some(port) = tab.selected_port() else {
-            tab.clear_text();
-            return;
-        };
-        let remote = tab.node_entry.text().trim().to_uppercase();
-        if remote.is_empty() {
-            tab.clear_text();
-            return;
-        }
-        let history = self.state.history_for(&port.id, &remote, tab.unproto_toggle.is_active());
+        let (port_id, remote) = tab.history_key();
+        let history = self.state.history_for(&port_id, &remote);
         tab.load_history(&history);
-    }
-
-    /// Keep a pinned tab's persisted (port, node, mode) identity — and its
-    /// via path — in sync as the user edits its fields, unpinning the stale
-    /// identity in the process.
-    fn sync_pin(&self, tab: &SessionTab) {
-        if !tab.pin_toggle.is_active() {
-            return;
-        }
-        let Some(port) = tab.selected_port() else { return };
-        let remote = tab.node_entry.text().trim().to_uppercase();
-        if remote.is_empty() {
-            return;
-        }
-        let unproto = tab.unproto_toggle.is_active();
-        let via = tab.via_entry.text().trim().to_uppercase();
-        let new_id = (port.id.clone(), remote, unproto);
-        let mut current = tab.pinned_identity.borrow_mut();
-        if let Some(old) = current.as_ref() {
-            if old != &new_id {
-                self.state.set_pinned(&old.0, &old.1, old.2, "", false);
-            }
-        }
-        self.state.set_pinned(&new_id.0, &new_id.1, new_id.2, &via, true);
-        *current = Some(new_id);
     }
 
     fn handle_event(self: &Rc<Self>, port_id: &str, event: PortEvent) {
@@ -826,7 +740,6 @@ impl Ui {
             PortEvent::PortConnected => {
                 self.monitor.append_line(&format!("[{port_id}] port connected"));
                 self.confirmed_ports.borrow_mut().insert(port_id.to_string());
-                self.refresh_unproto_tabs_for_port(port_id);
                 self.refresh_favorite_button(port_id);
                 self.refresh_status_bar();
             }
@@ -850,13 +763,16 @@ impl Ui {
                     if let Some(tab_id) = self.bound.borrow_mut().remove(&key) {
                         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                             tab.conn_id.set(None);
-                            tab.set_connected(false);
                             tab.mark_disconnected();
+                        }
+                        if self.selected_tab.get() == Some(tab_id) {
+                            if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+                                self.refresh_phone_button(tab);
+                            }
                         }
                     }
                 }
                 self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
-                self.refresh_unproto_tabs_for_port(port_id);
                 self.refresh_favorite_button(port_id);
                 self.refresh_status_bar();
             }
@@ -869,7 +785,6 @@ impl Ui {
                 // `active` entry or favorites-bar button.
                 if !self.confirmed_ports.borrow().contains(port_id) {
                     self.state.active.borrow_mut().remove(port_id);
-                    self.refresh_unproto_tabs_for_port(port_id);
                     self.mark_favorite_failed(port_id);
                     self.refresh_status_bar();
                 }
@@ -879,7 +794,6 @@ impl Ui {
                 if let (Some(from), Some(to), Some(message)) = (from, to, message) {
                     self.maybe_notify_directed(port_id, &from, &to, &message, &line);
                     self.maybe_detect_beacon(port_id, &from, &to, &message);
-                    self.feed_unproto_tabs(port_id, &line);
                 }
             }
             PortEvent::ConnectionOpened { id, label } => {
@@ -891,23 +805,16 @@ impl Ui {
                 let existing_tab_id = self.pending.borrow_mut().remove(&pending_key);
                 let is_new_incoming = existing_tab_id.is_none();
                 let tab_id = existing_tab_id.unwrap_or_else(|| {
-                    self.add_tab(Some(TabPrefill {
-                        port_id: port_id.to_string(),
-                        remote: label.clone(),
-                        via: String::new(),
-                        unproto: false,
-                    }))
+                    find_entry(&self.state.config.borrow(), port_id)
+                        .map(|port| self.add_connection_tab(port, label.clone(), String::new(), false))
+                        .unwrap_or(0)
                 });
 
                 self.bound.borrow_mut().insert((port_id.to_string(), id), tab_id);
+                let greeting = self.tabs.borrow().get(&tab_id).map(|t| t.via_raw.clone()).filter(|_| !needs_node);
                 if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                     tab.conn_id.set(Some(id));
-                    tab.set_connected(true);
                     tab.mark_connected();
-                    if needs_node && tab.node_entry.text().is_empty() {
-                        tab.node_entry.set_text(&label);
-                    }
-                    self.update_tab_title(tab);
 
                     if needs_node && is_new_incoming {
                         // An unsolicited connect while the mailbox is enabled
@@ -930,8 +837,20 @@ impl Ui {
                         }
                     }
                 }
+                // Telnet/SSH "Address" field: send it verbatim as the first
+                // line, exactly as if typed at the far end's own prompt --
+                // no protocol assumed, maximally flexible per explicit
+                // request. `greeting` is `None` for connect-capable ports
+                // (Agwpe/Ax25RawSocket), where the via slot is a real
+                // digipeater path instead, already consumed by `OpenConnection`.
+                if let Some(greeting) = greeting.filter(|g| !g.is_empty()) {
+                    self.send_tab_text_raw(port_id, id, &greeting);
+                }
                 if needs_node {
                     self.state.log_qso_started(port_id, &label);
+                }
+                if self.selected_tab.get() == Some(tab_id) {
+                    self.refresh_bottom_bar();
                 }
                 self.refresh_status_bar();
             }
@@ -941,13 +860,15 @@ impl Ui {
                         let is_connect_port =
                             find_entry(&self.state.config.borrow(), port_id).map(|e| port_supports_connect(&e.config)).unwrap_or(false);
                         if is_connect_port {
-                            self.state.log_qso_ended(port_id, &tab.node_entry.text());
+                            self.state.log_qso_ended(port_id, &tab.node);
                         }
                         tab.conn_id.set(None);
-                        tab.set_connected(false);
                         tab.mark_disconnected();
                         tab.flush_pending();
                         *tab.mailbox_state.borrow_mut() = None;
+                    }
+                    if self.selected_tab.get() == Some(tab_id) {
+                        self.refresh_bottom_bar();
                     }
                 }
                 self.refresh_status_bar();
@@ -972,27 +893,15 @@ impl Ui {
         }
     }
 
-    /// Unproto tabs have no live `ConnectionId` to key off of, so their
-    /// input sensitivity has to be refreshed explicitly whenever the
-    /// underlying port connects or disconnects.
-    fn refresh_unproto_tabs_for_port(&self, port_id: &str) {
-        for tab in self.tabs.borrow().values() {
-            if tab.unproto_toggle.is_active() && tab.selected_port().is_some_and(|p| p.id == port_id) {
-                self.update_mode_controls(tab);
-            }
-        }
-    }
-
-    /// Stream every observed UI (unproto) frame into any Unproto-mode tab
-    /// open on the same port -- an Unproto tab has no live `ConnectionId` of
-    /// its own to receive `Data` events through, so without this a reply
-    /// sent back via unproto would only ever show up in the global Monitor
-    /// pane, not in the tab the user is actually watching.
-    fn feed_unproto_tabs(&self, port_id: &str, line: &str) {
-        for tab in self.tabs.borrow().values() {
-            if tab.unproto_toggle.is_active() && tab.selected_port().is_some_and(|p| p.id == port_id) {
-                tab.append_monitor_line(line);
-            }
+    /// Send a raw line directly over a known `(port_id, ConnectionId)` —
+    /// used for the Telnet/SSH greeting line, which fires before any tab
+    /// lookup/echo bookkeeping is relevant (the connection was *just*
+    /// confirmed open).
+    fn send_tab_text_raw(&self, port_id: &str, conn_id: ConnectionId, text: &str) {
+        if let Some(handle) = self.state.active.borrow().get(port_id) {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(b'\n');
+            let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
         }
     }
 
@@ -1057,6 +966,40 @@ impl Ui {
     /// actually opened, the simplest "mark as seen" trigger available.
     pub fn clear_beacon_lit(&self) {
         self.beacon_button.remove_css_class("beacon-lit");
+    }
+
+    /// Refresh the status bar's connect-state (left) and packet/byte stats
+    /// (right) for whichever tab is currently selected. Call this whenever
+    /// the selection changes, connects/disconnects, or sends/receives —
+    /// cheap enough to call liberally rather than track precisely. Also
+    /// ticked once a second (see `build_ui`) so the elapsed-time display
+    /// keeps counting up while a tab stays selected.
+    pub fn refresh_status_bar(&self) {
+        let tabs = self.tabs.borrow();
+        match self.selected_tab.get().and_then(|id| tabs.get(&id)) {
+            Some(tab) => {
+                self.status_conn_icon.set_visible(true);
+                let live = tab.conn_id.get().is_some();
+                self.status_conn_icon.set_icon_name(Some(if live {
+                    "network-transmit-receive-symbolic"
+                } else {
+                    "network-offline-symbolic"
+                }));
+                let text = match (live, tab.elapsed_text()) {
+                    (true, Some(elapsed)) => format!("Connected to {} \u{2014} {elapsed}", tab.node),
+                    (true, None) => "Connected".to_string(),
+                    (false, _) => "Disconnected".to_string(),
+                };
+                self.status_conn_label.set_text(&text);
+                self.status_stats_label.set_text(&tab.stats_text());
+            }
+            None => {
+                self.status_conn_icon.set_visible(true);
+                self.status_conn_icon.set_icon_name(Some("network-offline-symbolic"));
+                self.status_conn_label.set_text("No tab selected");
+                self.status_stats_label.set_text("");
+            }
+        }
     }
 }
 
@@ -1168,16 +1111,12 @@ pub fn build_ui(app: &adw::Application) {
         tracing::warn!("failed to load config, starting fresh: {e}");
         AppConfig::default()
     });
-    let show_monitor = config.ui.show_monitor;
     let show_timestamps = config.ui.show_timestamps;
     let font = config.ui.font.clone().unwrap_or_else(|| "Monospace 11".to_string());
     let autoconnect_ids: Vec<String> =
         config.ports.iter().filter(|p| p.autoconnect).map(|p| p.id.clone()).collect();
-    let pinned_tabs: Vec<TabPrefill> = config
-        .pinned_sessions
-        .iter()
-        .map(|p| TabPrefill { port_id: p.port_id.clone(), remote: p.remote.clone(), via: p.via.clone(), unproto: p.unproto })
-        .collect();
+    let pinned_tabs: Vec<TabPrefill> =
+        config.pinned_sessions.iter().map(|p| TabPrefill { port_id: p.port_id.clone(), remote: p.remote.clone(), via: p.via.clone() }).collect();
     apply_font(&font);
     apply_base_css();
     let state = AppState::new(config);
@@ -1191,45 +1130,70 @@ pub fn build_ui(app: &adw::Application) {
 
     let monitor = MonitorView::new(state.clone());
     monitor.set_show_timestamps(show_timestamps);
-    let notebook = gtk::Notebook::builder().vexpand(true).hexpand(true).scrollable(true).build();
+    monitor.container.set_vexpand(true);
 
-    // GTK hides the notebook's entire tab strip (and the "+" action widget
-    // on it) when it has zero pages, so an empty state with its own
-    // "+ New Tab" button stands in until the first tab exists.
-    let empty_state = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .valign(gtk::Align::Center)
-        .halign(gtk::Align::Center)
-        .vexpand(true)
-        .hexpand(true)
-        .build();
-    let empty_label = gtk::Label::new(Some("No tabs open"));
-    empty_label.add_css_class("dim-label");
-    empty_state.append(&empty_label);
-    let empty_new_tab_button = gtk::Button::with_label("+ New Tab");
-    empty_new_tab_button.add_css_class("pill");
-    empty_new_tab_button.add_css_class("suggested-action");
-    empty_state.append(&empty_new_tab_button);
-
-    let notebook_stack = gtk::Stack::new();
-    notebook_stack.add_named(&empty_state, Some("empty"));
-    notebook_stack.add_named(&notebook, Some("notebook"));
-    notebook_stack.set_visible_child_name("empty");
+    // Content-switching stack for tab scrollbacks -- attached/detached from
+    // `paned`'s end child based on whether the tab area is expanded (see
+    // `Ui::select_tab`/`minimize_tab_area`). A `gtk::Paned` with no end
+    // child gives its start child (Monitor) the full allocation, which is
+    // exactly "Monitor at 100% with zero tabs or while minimized."
+    let tab_stack = gtk::Stack::new();
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
         .start_child(&monitor.container)
-        .end_child(&notebook_stack)
         .resize_start_child(true)
         .resize_end_child(true)
         .shrink_start_child(false)
         .shrink_end_child(false)
-        .position(220)
         .vexpand(true)
         .build();
-    paned.set_visible(true);
-    monitor.container.set_visible(show_monitor);
+
+    // Always visible whenever any tab exists (regardless of expanded state)
+    // -- deliberately a plain Box, not `gtk::Notebook`'s built-in tab strip,
+    // since it needs to stay visible even while the content pane itself is
+    // collapsed. Sits just above the bottom bar, per explicit request.
+    let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tab_strip.set_margin_start(8);
+    tab_strip.set_margin_end(8);
+    tab_strip.set_margin_top(2);
+    tab_strip.set_margin_bottom(2);
+    tab_strip.set_visible(false);
+    let tab_strip_add_button = gtk::Button::from_icon_name("list-add-symbolic");
+    tab_strip_add_button.add_css_class("flat");
+    tab_strip_add_button.set_tooltip_text(Some("Dial\u{2026}"));
+    tab_strip.append(&tab_strip_add_button);
+
+    // --- Shared bottom bar: Node / Via / Port (in that order), then the
+    // dial/minimize button, the phone-handset connect/disconnect button,
+    // the message entry, and Send. ---
+    let bottom_node_entry = gtk::Entry::builder().placeholder_text("Node").width_chars(10).build();
+    crate::ports_dialog::force_uppercase(&bottom_node_entry);
+    let bottom_via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(12).build();
+    crate::ports_dialog::force_uppercase(&bottom_via_entry);
+    let bottom_port_dropdown = gtk::DropDown::builder().build();
+    let dial_button = gtk::Button::from_icon_name("list-add-symbolic");
+    dial_button.add_css_class("flat");
+    dial_button.set_tooltip_text(Some("Dial\u{2026}"));
+    let phone_button = gtk::Button::from_icon_name("call-start-symbolic");
+    phone_button.add_css_class("flat");
+    phone_button.set_visible(false);
+    let message_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Unproto message\u{2026}").build();
+    let send_button = gtk::Button::with_label("Send");
+    send_button.add_css_class("suggested-action");
+
+    let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bottom_bar.set_margin_start(8);
+    bottom_bar.set_margin_end(8);
+    bottom_bar.set_margin_top(4);
+    bottom_bar.set_margin_bottom(6);
+    bottom_bar.append(&bottom_node_entry);
+    bottom_bar.append(&bottom_via_entry);
+    bottom_bar.append(&bottom_port_dropdown);
+    bottom_bar.append(&dial_button);
+    bottom_bar.append(&phone_button);
+    bottom_bar.append(&message_entry);
+    bottom_bar.append(&send_button);
 
     // Bottom status bar: connect/disconnect state for the selected tab on
     // the left (icon + subtle-colored text), its packet/byte counters on
@@ -1266,6 +1230,8 @@ pub fn build_ui(app: &adw::Application) {
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&favorites_bar);
     content_box.append(&paned);
+    content_box.append(&tab_strip);
+    content_box.append(&bottom_bar);
     content_box.append(&status_bar);
 
     let toolbar_view = adw::ToolbarView::new();
@@ -1274,12 +1240,12 @@ pub fn build_ui(app: &adw::Application) {
     // keeps its title dead-center in the *whole* bar (reserving equal space
     // on each side, regardless of how wide the packed content actually is),
     // which reads as off-center here since the left group (menu/mailbox/
-    // beacon/filter) is much wider than the right group (Save Monitor Log/
-    // Monitor toggle). A plain `Box` with a hexpand+center title between two
-    // natural-width side boxes centers it in the *actual* leftover space
-    // instead. Wrapped in `WindowHandle` to keep click-drag-to-move and
-    // double-click-to-maximize, and `WindowControls` restores the
-    // minimize/maximize/close buttons `HeaderBar` provided automatically.
+    // beacon/filter) is much wider than the right group. A plain `Box` with
+    // a hexpand+center title between two natural-width side boxes centers
+    // it in the *actual* leftover space instead. Wrapped in `WindowHandle`
+    // to keep click-drag-to-move and double-click-to-maximize, and
+    // `WindowControls` restores the minimize/maximize/close buttons
+    // `HeaderBar` provided automatically.
     let header_start = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let header_end = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let header_title = gtk::Label::new(Some("PGPRC"));
@@ -1306,9 +1272,14 @@ pub fn build_ui(app: &adw::Application) {
     let ui = Rc::new(Ui {
         state,
         monitor,
-        notebook,
-        notebook_stack,
         tabs: RefCell::new(HashMap::new()),
+        tab_stack,
+        paned,
+        tab_strip,
+        tab_chips: RefCell::new(HashMap::new()),
+        tab_strip_add_button: tab_strip_add_button.clone(),
+        tab_area_expanded: Cell::new(false),
+        selected_tab: Cell::new(None),
         bound: RefCell::new(HashMap::new()),
         pending: RefCell::new(HashMap::new()),
         next_tab_id: Cell::new(0),
@@ -1320,10 +1291,49 @@ pub fn build_ui(app: &adw::Application) {
         favorite_buttons: RefCell::new(HashMap::new()),
         beacon_button: beacon_button.clone(),
         confirmed_ports: RefCell::new(HashSet::new()),
+        bottom_node_entry,
+        bottom_via_entry,
+        bottom_port_dropdown,
+        bottom_ports_snapshot: RefCell::new(Vec::new()),
+        dial_button: dial_button.clone(),
+        phone_button: phone_button.clone(),
+        message_entry: message_entry.clone(),
         direwolf: DirewolfProcess::new(),
         window: window.clone(),
     });
     ui.rebuild_favorites_bar();
+    ui.rebuild_bottom_ports();
+
+    {
+        let ui = ui.clone();
+        tab_strip_add_button.connect_clicked(move |_| {
+            dial_dialog::show(&ui);
+        });
+    }
+    {
+        let ui = ui.clone();
+        dial_button.connect_clicked(move |_| {
+            ui.on_dial_button_clicked();
+        });
+    }
+    {
+        let ui = ui.clone();
+        phone_button.connect_clicked(move |_| {
+            ui.on_phone_button_clicked();
+        });
+    }
+    {
+        let ui = ui.clone();
+        message_entry.connect_activate(move |_| {
+            ui.activate_message_entry();
+        });
+    }
+    {
+        let ui = ui.clone();
+        send_button.connect_clicked(move |_| {
+            ui.activate_message_entry();
+        });
+    }
 
     {
         let ui = ui.clone();
@@ -1333,14 +1343,8 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
 
-    {
-        let ui = ui.clone();
-        let notebook = ui.notebook.clone();
-        notebook.connect_switch_page(move |_, _, _| {
-            ui.refresh_status_bar();
-        });
-    }
     ui.refresh_status_bar();
+    ui.refresh_bottom_bar();
     {
         // Ticks the status bar's elapsed-connected-time display once a
         // second; cheap enough (two label/icon updates) to run unconditionally
@@ -1356,19 +1360,17 @@ pub fn build_ui(app: &adw::Application) {
     // `gtk::ShortcutController` (rather than a hand-rolled `EventControllerKey`
     // matching on raw modifier bits) is the GTK4-recommended way to bind
     // these: it parses standard accelerator strings and correctly resolves
-    // against whatever descendant widget currently has focus (e.g. a session
-    // tab's input entry) via `ShortcutScope::Global`, whereas a manual bubble-
-    // phase key handler can lose the race against a focused widget's own
-    // default key handling. Ctrl+Tab/Shift+Ctrl+Tab aren't included since
-    // `gtk::Notebook` already binds those itself. Escape-closing dialogs is
-    // handled separately, per dialog window, in `ports_dialog::dialog_window`.
+    // against whatever descendant widget currently has focus, whereas a
+    // manual bubble-phase key handler can lose the race against a focused
+    // widget's own default key handling. Escape-closing dialogs is handled
+    // separately, per dialog window, in `ports_dialog::dialog_window`.
     let shortcuts = gtk::ShortcutController::new();
     shortcuts.set_scope(gtk::ShortcutScope::Global);
     add_shortcut(&shortcuts, "<Control>n", &ui, |ui| {
-        ui.add_tab(None);
+        dial_dialog::show(ui);
     });
     add_shortcut(&shortcuts, "<Control>w", &ui, |ui| {
-        if let Some(tab_id) = ui.current_tab_id() {
+        if let Some(tab_id) = ui.selected_tab.get() {
             ui.close_tab(tab_id);
         }
     });
@@ -1382,26 +1384,6 @@ pub fn build_ui(app: &adw::Application) {
         ui.window.close();
     });
     ui.window.add_controller(shortcuts);
-
-    // A plain "+" button on the notebook's own tab bar creates a new,
-    // disconnected session tab: pick a port, a node (if the port supports
-    // one), then Connect explicitly.
-    let new_tab_button = gtk::Button::from_icon_name("list-add-symbolic");
-    new_tab_button.add_css_class("flat");
-    new_tab_button.set_tooltip_text(Some("New Tab"));
-    {
-        let ui = ui.clone();
-        new_tab_button.connect_clicked(move |_| {
-            ui.add_tab(None);
-        });
-    }
-    ui.notebook.set_action_widget(&new_tab_button, gtk::PackType::End);
-    {
-        let ui = ui.clone();
-        empty_new_tab_button.connect_clicked(move |_| {
-            ui.add_tab(None);
-        });
-    }
 
     // A single hamburger menu holds the less-frequently-used management
     // dialogs, instead of a header button apiece. Placed first so it's the
@@ -1464,8 +1446,8 @@ pub fn build_ui(app: &adw::Application) {
     header_start.append(&menu_button);
 
     // Quick-access icon button for the Mailbox dialog, same tier of
-    // frequent-use action as "Send Beacon...", so it lives in the header
-    // instead of behind the hamburger menu.
+    // frequent-use action as Direwolf/Incoming Beacons/Notified Packets, so
+    // it lives in the header instead of behind the hamburger menu.
     let mailbox_button = gtk::Button::from_icon_name("mail-unread-symbolic");
     mailbox_button.add_css_class("flat");
     mailbox_button.set_tooltip_text(Some("Mailbox"));
@@ -1543,29 +1525,6 @@ pub fn build_ui(app: &adw::Application) {
     }
     header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
-
-    // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered)
-    // view — packed at the end, next to the Monitor toggle it relates to.
-    let save_monitor_button = gtk::Button::with_label("Save Monitor Log\u{2026}");
-    {
-        let ui = ui.clone();
-        save_monitor_button.connect_clicked(move |_| {
-            let history_dir = pr_core::AppConfig::config_dir().map(|dir| dir.join("history"));
-            crate::export::save_text(&ui.window, "monitor.txt", ui.monitor.full_text(), history_dir.as_deref());
-        });
-    }
-    header_end.append(&save_monitor_button);
-
-    let monitor_toggle = gtk::ToggleButton::builder().label("Monitor").active(show_monitor).build();
-    {
-        let ui = ui.clone();
-        monitor_toggle.connect_toggled(move |btn| {
-            ui.monitor.container.set_visible(btn.is_active());
-            ui.state.config.borrow_mut().ui.show_monitor = btn.is_active();
-            ui.state.save_config();
-        });
-    }
-    header_end.append(&monitor_toggle);
     header_end.append(&gtk::WindowControls::new(gtk::PackType::End));
 
     toolbar_view.add_top_bar(&header_handle);
@@ -1577,8 +1536,11 @@ pub fn build_ui(app: &adw::Application) {
     // Pinned tabs are recreated as disconnected shells; they never
     // auto-connect, even if their port also has autoconnect enabled.
     for prefill in pinned_tabs {
-        ui.add_tab(Some(prefill));
+        if let Some(port) = find_entry(&ui.state.config.borrow(), &prefill.port_id) {
+            ui.add_connection_tab(port, prefill.remote, prefill.via, false);
+        }
     }
+    ui.minimize_tab_area();
 
     for id in autoconnect_ids {
         ui.connect_port(&id);

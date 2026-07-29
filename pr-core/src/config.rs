@@ -135,19 +135,17 @@ pub struct AddressBookEntry {
 
 /// A tab the user pinned: its (port, node) shell is recreated automatically
 /// at the next app startup, prefilled but disconnected — the user still has
-/// to press Connect. `remote` is empty for port kinds with no node concept
-/// (Telnet/SSH).
+/// to press the connect (phone-handset) button. `remote` is empty for port
+/// kinds with no node concept (Telnet/SSH), which use `via` as a greeting
+/// line instead of a digipeater path — see `SessionTab::via_raw`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinnedSession {
     pub port_id: String,
     pub remote: String,
-    /// Digipeater path, e.g. "WIDE1-1,WIDE2-1". Empty for a direct path.
+    /// Digipeater path (Agwpe/Ax25RawSocket) or greeting line (Telnet/SSH).
+    /// Empty for a direct path/no greeting.
     #[serde(default)]
     pub via: String,
-    /// True if this tab sends unconnected (UI) traffic to `remote` instead
-    /// of opening a connected-mode session.
-    #[serde(default)]
-    pub unproto: bool,
 }
 
 /// The old (pre-split) shape of persisted scrollback for one (port, node)
@@ -418,8 +416,6 @@ impl Default for HighlightPrefs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPrefs {
-    #[serde(default = "default_true")]
-    pub show_monitor: bool,
     /// A font description string like `"Monospace 11"`: everything but a
     /// trailing numeric token is the family name, the trailing number (if
     /// present) is the point size.
@@ -452,6 +448,13 @@ pub struct UiPrefs {
     /// single global stream, not per-node.
     #[serde(default = "default_monitor_buffer_lines")]
     pub monitor_buffer_lines: u32,
+    /// Max lines kept in a connected tab's *live* scrollback display before
+    /// the oldest are trimmed from the GTK buffer — a memory-sanity cap
+    /// only. The on-disk history file this feeds is never trimmed, so the
+    /// full session is always recoverable there even once the live display
+    /// has dropped its earliest lines.
+    #[serde(default = "default_tab_buffer_max_lines")]
+    pub tab_buffer_max_lines: u32,
 }
 
 fn default_history_lines() -> u32 {
@@ -462,6 +465,10 @@ fn default_monitor_buffer_lines() -> u32 {
     5000
 }
 
+fn default_tab_buffer_max_lines() -> u32 {
+    25000
+}
+
 fn default_true() -> bool {
     true
 }
@@ -469,7 +476,6 @@ fn default_true() -> bool {
 impl Default for UiPrefs {
     fn default() -> Self {
         UiPrefs {
-            show_monitor: true,
             font: None,
             show_timestamps: true,
             default_call: None,
@@ -479,6 +485,7 @@ impl Default for UiPrefs {
             qrz_password: None,
             history_lines: default_history_lines(),
             monitor_buffer_lines: default_monitor_buffer_lines(),
+            tab_buffer_max_lines: default_tab_buffer_max_lines(),
         }
     }
 }
@@ -692,9 +699,12 @@ impl AppConfig {
         save_part(&Self::beacons_path(dir), &BeaconsFile { beacons })?;
         save_part(&Self::mailbox_path(dir), &MailboxFile { messages: mailbox_messages })?;
 
-        for h in &node_history {
+        // Unproto history has no on-disk convention any more (every tab is a
+        // two-way connection now) -- old unproto-bucketed entries from this
+        // legacy format simply aren't migrated forward.
+        for h in node_history.iter().filter(|h| !h.unproto) {
             let port_name = ports.iter().find(|p| p.id == h.port_id).map(|p| p.name.as_str()).unwrap_or(&h.port_id);
-            let path = crate::history_paths::history_file_path(dir, port_name, &h.remote, h.unproto);
+            let path = crate::history_paths::history_file_path(dir, port_name, &h.remote);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }

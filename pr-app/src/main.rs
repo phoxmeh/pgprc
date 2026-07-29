@@ -3,6 +3,7 @@ mod address_book_dialog;
 mod adif;
 mod app_state;
 mod beacons_dialog;
+mod dial_dialog;
 mod direwolf;
 mod direwolf_dialog;
 mod export;

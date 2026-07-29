@@ -3,78 +3,52 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use pr_core::{AddressBookEntry, ConnectionId, PortConfig, PortEntry};
+use pr_core::{ConnectionId, PortConfig, PortEntry};
 
 use crate::app_state::AppState;
 use crate::highlight::{highlight_line, Highlighter, TagCache};
 use crate::mailbox::MailboxState;
-use crate::ports_dialog::force_uppercase;
 
 pub type TabId = u64;
 
 /// True for port kinds that support opening a connected-mode session to a
 /// specific remote callsign (AGWPE, AX.25 raw socket). Telnet/SSH have no
-/// node concept — connecting the port *is* the whole session.
+/// node concept — connecting the port *is* the whole session, and KISS
+/// ports have no connected mode at all.
 pub fn port_supports_connect(config: &PortConfig) -> bool {
     matches!(config, PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. })
 }
 
-/// True for port kinds that can send one-shot unconnected (UI) traffic.
-/// AX.25 raw sockets only expose connected mode (`SOCK_SEQPACKET`); a
-/// separate `SOCK_DGRAM` socket would be needed for unproto and isn't
-/// implemented.
+/// True for port kinds the dial dialog can offer at all — every connect-
+/// capable port plus Telnet/SSH (whose "connection" is the whole port).
+/// KISS ports are unproto-only and never appear here.
+pub fn port_dialable(config: &PortConfig) -> bool {
+    port_supports_connect(config) || matches!(config, PortConfig::Telnet { .. } | PortConfig::Ssh { .. })
+}
+
+/// True for port kinds that can send one-shot unconnected (UI) traffic —
+/// used by the shared bottom bar's default/no-tab-selected compose mode.
 pub fn port_supports_unproto(config: &PortConfig) -> bool {
     matches!(config, PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. })
 }
 
-/// True for port kinds where entering a destination callsign makes sense at
-/// all — either connected-mode or unproto. Gates whether the tab shows its
-/// node/via/unproto row.
-pub fn port_needs_node(config: &PortConfig) -> bool {
-    port_supports_connect(config) || port_supports_unproto(config)
-}
-
-/// A user-managed session tab: pick a port (and, for node-capable ports, a
-/// remote callsign), Connect/Disconnect explicitly. The tab persists across
-/// disconnects — only its Close button removes it — so it can be reused for
-/// a different node or reconnected later.
+/// A connected-session tab: created by the dial dialog with a fixed
+/// (port, node, via/address) identity for its whole lifetime — redialing a
+/// different destination means opening a new tab, not editing this one.
+/// Persists across disconnects (only its Close button removes it) so its
+/// history can be reviewed and it can be reconnected.
 pub struct SessionTab {
     pub root: gtk::Box,
-    pub tab_label: gtk::Label,
     pub pin_toggle: gtk::ToggleButton,
-    pub port_dropdown: gtk::DropDown,
-    /// Snapshot of configured ports at tab-creation time, in the same order
-    /// as `port_dropdown`'s model, so a selection index can be resolved back
-    /// to a `PortEntry`.
-    pub available_ports: Vec<PortEntry>,
-    pub node_row: gtk::Box,
-    pub node_entry: gtk::Entry,
-    /// Optional digipeater path, e.g. "WIDE1-1,WIDE2-1".
-    pub via_entry: gtk::Entry,
-    /// A one-shot picker: indices correspond positionally to
-    /// `available_address_book`. Selecting an entry copies its callsign
-    /// (and, if set, its via path) into `node_entry`/`via_entry` (wired in
-    /// `window.rs`, mirroring `port_dropdown`/`available_ports`). Snapshot
-    /// taken at tab-creation time like the port list — reopen a new tab to
-    /// see address book entries added since.
-    pub address_book_dropdown: gtk::DropDown,
-    available_address_book: Vec<AddressBookEntry>,
-    /// When active, this tab sends unconnected (UI) traffic to `node_entry`
-    /// instead of opening a connected-mode session — Connect/Disconnect are
-    /// disabled and `input_entry` sends via `PortCommand::SendUnproto`.
-    pub unproto_toggle: gtk::CheckButton,
-    pub connect_button: gtk::Button,
-    pub disconnect_button: gtk::Button,
+    /// Fixed at creation time by the dial dialog.
+    pub port: PortEntry,
+    pub node: String,
+    /// Raw text as entered in the dial dialog: a digipeater path for
+    /// Agwpe/Ax25RawSocket (parsed by `via()`), or a greeting line sent
+    /// verbatim right after connecting for Telnet/SSH.
+    pub via_raw: String,
     pub save_button: gtk::Button,
-    /// Continuously appends this tab's traffic (exactly what's shown in the
-    /// scrollback) to a dated plain-text file under `history/<port>/`, from
-    /// the moment it's checked until it's unchecked — a running capture log
-    /// distinct from the auto-managed per-node history file.
-    pub capture_toggle: gtk::CheckButton,
-    capture_file: RefCell<Option<std::fs::File>>,
     pub clear_history_button: gtk::Button,
-    pub input_entry: gtk::Entry,
-    pub send_input_button: gtk::Button,
     pub conn_id: Cell<Option<ConnectionId>>,
     /// When the current connected-mode session started, for the window
     /// status bar's elapsed-time display -- `None` while disconnected.
@@ -82,10 +56,10 @@ pub struct SessionTab {
     /// Text received since the last completed line, for splitting arbitrary
     /// byte chunks into history lines.
     pending_line: RefCell<String>,
-    /// The (port_id, remote, unproto) currently persisted as pinned for this
-    /// tab, if any — lets us unpin the *old* identity when the user edits a
-    /// pinned tab's port/node/mode instead of leaking an orphaned pin entry.
-    pub pinned_identity: RefCell<Option<(String, String, bool)>>,
+    /// The (port_id, remote) currently persisted as pinned for this tab, if
+    /// any — lets us unpin the *old* identity when the user edits a pinned
+    /// tab's identity instead of leaking an orphaned pin entry.
+    pub pinned_identity: RefCell<Option<(String, String)>>,
     /// Bytes/packets actually sent/received over the wire — the only
     /// traffic stats honestly available here, since the AX.25 ARQ state
     /// machine (and any retry/timer counts) lives in the AGWPE host or the
@@ -111,101 +85,22 @@ pub struct SessionTab {
 }
 
 impl SessionTab {
-    pub fn new(available_ports: Vec<PortEntry>, address_book: Vec<AddressBookEntry>, state: Rc<AppState>) -> Self {
+    pub fn new(port: PortEntry, node: String, via_raw: String, state: Rc<AppState>) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         root.set_margin_top(4);
         root.set_margin_bottom(4);
         root.set_margin_start(4);
         root.set_margin_end(4);
 
-        // --- controls row ---
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-
-        let port_names: Vec<&str> = available_ports.iter().map(|p| p.name.as_str()).collect();
-        let port_model = gtk::StringList::new(&port_names);
-        let port_dropdown = gtk::DropDown::builder().model(&port_model).build();
-        controls.append(&port_dropdown);
-
-        let node_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        let node_entry = gtk::Entry::builder().placeholder_text("Node (callsign)").width_chars(12).build();
-        force_uppercase(&node_entry);
-        let via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(14).build();
-        force_uppercase(&via_entry);
-
-        let mut available_address_book: Vec<AddressBookEntry> = address_book;
-        available_address_book.sort_by(|a, b| a.callsign.cmp(&b.callsign));
-        let address_book_names: Vec<String> = available_address_book
-            .iter()
-            .map(|e| {
-                let extra = e.name.as_deref().or(e.alias.as_deref());
-                match extra {
-                    Some(extra) if !extra.is_empty() => format!("{} \u{2014} {extra}", e.callsign),
-                    _ => e.callsign.clone(),
-                }
-            })
-            .collect();
-        let address_book_refs: Vec<&str> = address_book_names.iter().map(String::as_str).collect();
-        let address_book_model = gtk::StringList::new(&address_book_refs);
-        let address_book_dropdown = gtk::DropDown::builder().model(&address_book_model).build();
-        address_book_dropdown.set_tooltip_text(Some("From Address Book\u{2026}"));
-        // Blank factory for the closed button (leaves just the dropdown's own
-        // arrow visible) but a real text factory for the popup list, so the
-        // picker reads as a small arrow next to the node entry instead of a
-        // wide "From Address Book..." button.
-        let button_factory = gtk::SignalListItemFactory::new();
-        button_factory.connect_setup(|_, _list_item| {});
-        address_book_dropdown.set_factory(Some(&button_factory));
-        let list_factory = gtk::SignalListItemFactory::new();
-        list_factory.connect_setup(|_, list_item| {
-            let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
-            let label = gtk::Label::new(None);
-            label.set_halign(gtk::Align::Start);
-            list_item.set_child(Some(&label));
-        });
-        list_factory.connect_bind(|_, list_item| {
-            let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
-            let label = list_item.child().and_then(|c| c.downcast::<gtk::Label>().ok());
-            let text = list_item.item().and_then(|o| o.downcast::<gtk::StringObject>().ok());
-            if let (Some(label), Some(text)) = (label, text) {
-                label.set_text(&text.string());
-            }
-        });
-        address_book_dropdown.set_list_factory(Some(&list_factory));
-
-        let unproto_toggle = gtk::CheckButton::with_label("Unproto");
-        node_row.append(&node_entry);
-        node_row.append(&address_book_dropdown);
-        node_row.append(&via_entry);
-        node_row.append(&unproto_toggle);
-
-        let connect_button = gtk::Button::with_label("Connect");
-        connect_button.add_css_class("suggested-action");
-        let disconnect_button = gtk::Button::with_label("Disconnect");
-        disconnect_button.set_sensitive(false);
-        controls.append(&connect_button);
-        controls.append(&disconnect_button);
-
-        // Pushes Save/Clear History/stats to the row's right edge, away from
-        // the port/Connect/Disconnect controls on the left.
-        let controls_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        controls_spacer.set_hexpand(true);
-        controls.append(&controls_spacer);
-
-        let capture_toggle = gtk::CheckButton::with_label("Capture");
-        capture_toggle
-            .set_tooltip_text(Some("Continuously append this session's traffic to a dated log file while checked"));
-        controls.append(&capture_toggle);
-
+        // Per-tab actions that don't belong on the shared bottom bar (which
+        // is about composing/dialing, not per-tab file actions).
+        let tab_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let save_button = gtk::Button::with_label("Save\u{2026}");
-        controls.append(&save_button);
-
+        tab_toolbar.append(&save_button);
         let clear_history_button = gtk::Button::with_label("Clear History\u{2026}");
-        controls.append(&clear_history_button);
+        tab_toolbar.append(&clear_history_button);
+        root.append(&tab_toolbar);
 
-        root.append(&controls);
-        root.append(&node_row);
-
-        // --- scrollback + input ---
         let text_view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -221,48 +116,23 @@ impl SessionTab {
         let scrolled = gtk::ScrolledWindow::builder().child(&text_view).vexpand(true).hexpand(true).build();
         root.append(&scrolled);
 
-        let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        // Always editable, even while disconnected -- a message can be
-        // composed ahead of time; only the Send button (and Enter, gated in
-        // `Ui::activate_input`) actually require a live connection.
-        let input_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Type and press Enter\u{2026}").build();
-        input_row.append(&input_entry);
-        let send_input_button = gtk::Button::with_label("Send");
-        send_input_button.add_css_class("suggested-action");
-        send_input_button.set_sensitive(false);
-        input_row.append(&send_input_button);
-        root.append(&input_row);
-
-        // --- notebook tab label: title + Pin + Close ---
-        let tab_label = gtk::Label::new(Some("New Tab"));
-        // Recolored via CSS (`.pin-toggle:checked`, set up once in
+        // Recolored via CSS (`.pin-toggle.pin-pinned`, set up once in
         // `window::apply_base_css`) instead of swapping icons, so the pin
         // itself stays a plain pushpin glyph and only its color signals
-        // whether this tab is currently pinned.
+        // whether this tab is currently pinned. Placed left of the title in
+        // the tab strip's chip -- see `Ui::add_tab_chip`.
         let pin_toggle = gtk::ToggleButton::builder().icon_name("pin-symbolic").tooltip_text("Pin").build();
         pin_toggle.add_css_class("flat");
         pin_toggle.add_css_class("pin-toggle");
 
         SessionTab {
             root,
-            tab_label,
             pin_toggle,
-            port_dropdown,
-            available_ports,
-            node_row,
-            node_entry,
-            via_entry,
-            address_book_dropdown,
-            available_address_book,
-            unproto_toggle,
-            connect_button,
-            disconnect_button,
+            port,
+            node,
+            via_raw,
             save_button,
-            capture_toggle,
-            capture_file: RefCell::new(None),
             clear_history_button,
-            input_entry,
-            send_input_button,
             conn_id: Cell::new(None),
             connected_since: Cell::new(None),
             pending_line: RefCell::new(String::new()),
@@ -280,28 +150,12 @@ impl SessionTab {
         }
     }
 
-    /// The port currently selected in the dropdown, if any.
-    pub fn selected_port(&self) -> Option<&PortEntry> {
-        self.available_ports.get(self.port_dropdown.selected() as usize)
-    }
-
-    /// The currently selected address-book dropdown entry, if any.
-    pub fn selected_address_book_entry(&self) -> Option<&AddressBookEntry> {
-        self.available_address_book.get(self.address_book_dropdown.selected() as usize)
-    }
-
-    pub fn set_connected(&self, connected: bool) {
-        self.connect_button.set_sensitive(!connected);
-        self.disconnect_button.set_sensitive(connected);
-        // The input field stays editable regardless of connection state, so
-        // a message can be composed ahead of time -- only actually sending it
-        // requires a live connection (enforced by `send_input_button`'s
-        // sensitivity here and the `activate_input` guard in window.rs, which
-        // also covers the Enter-key path).
-        self.send_input_button.set_sensitive(connected);
-        self.port_dropdown.set_sensitive(!connected);
-        self.node_entry.set_sensitive(!connected);
-        self.via_entry.set_sensitive(!connected);
+    /// The via digipeater path as an ordered, uppercased, non-empty list —
+    /// split on commas/whitespace. Only meaningful for Agwpe/Ax25RawSocket;
+    /// for Telnet/SSH `via_raw` is a greeting line instead, sent verbatim
+    /// (see `Ui::connect_tab`).
+    pub fn via(&self) -> Vec<String> {
+        self.via_raw.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_uppercase()).collect()
     }
 
     /// Append a chunk of received bytes to the mailbox's own line buffer
@@ -319,94 +173,43 @@ impl SessionTab {
         lines
     }
 
-    /// The via digipeater path as an ordered, uppercased, non-empty list —
-    /// split on commas/whitespace.
-    pub fn via(&self) -> Vec<String> {
-        self.via_entry
-            .text()
-            .split([',', ' '])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_uppercase())
-            .collect()
-    }
-
     /// Insert raw text (NUL-sanitized) at the end of the buffer, scroll it
     /// into view, and return the char offset it was inserted at plus the
     /// sanitized text actually inserted — callers use the offset to
-    /// highlight exactly the span they just added.
+    /// highlight exactly the span they just added. Trims the buffer's start
+    /// if it's grown past `UiPrefs.tab_buffer_max_lines` (a live-session
+    /// display cap only — the on-disk history file this feeds is never
+    /// trimmed).
     fn insert(&self, text: &str) -> (i32, String) {
         // GTK's string marshaling panics on embedded NUL bytes; a peer could
         // send arbitrary/binary data over a connection.
         let sanitized = if text.contains('\0') { text.replace('\0', "") } else { text.to_string() };
+        self.trim_buffer_if_needed(sanitized.matches('\n').count());
         let mut end = self.buffer.end_iter();
         let start_offset = end.offset();
         self.buffer.insert(&mut end, &sanitized);
         let end_mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
         self.text_view.scroll_mark_onscreen(&end_mark);
 
-        if let Some(file) = self.capture_file.borrow_mut().as_mut() {
-            use std::io::Write;
-            if let Err(e) = file.write_all(sanitized.as_bytes()) {
-                tracing::warn!("failed to write capture log: {e}");
-            }
-        }
-
         (start_offset, sanitized)
     }
 
-    /// The (port name, node label) pair used to name a capture file — for
-    /// node-capable ports this is the entered destination callsign;
-    /// otherwise (Telnet/SSH) there's no node concept, so the port's own
-    /// name stands in for it.
-    fn capture_identity(&self) -> Option<(String, String)> {
-        let port = self.selected_port()?;
-        let node = if port_needs_node(&port.config) {
-            let node = self.node_entry.text().trim().to_string();
-            if node.is_empty() {
-                return None;
-            }
-            node
-        } else {
-            port.name.clone()
-        };
-        Some((port.name.clone(), node))
-    }
-
-    /// Start live-capturing this tab's traffic (everything shown in the
-    /// scrollback from this point on) to a new dated file under the same
-    /// per-port history directory as the auto-managed history — named
-    /// `<node>_<date>_<start time>.txt` so repeated captures never collide.
-    /// Returns the path on success; `None` if the port/node isn't set up
-    /// yet or the file couldn't be created (logged).
-    pub fn start_capture(&self) -> Option<std::path::PathBuf> {
-        let (port_name, node) = self.capture_identity()?;
-        let dir = pr_core::AppConfig::config_dir()?;
-        let now = gtk::glib::DateTime::now_local().ok()?;
-        let date = now.format("%Y-%m-%d").ok()?.to_string();
-        let time = now.format("%H%M%S").ok()?.to_string();
-        let path = pr_core::capture_file_path(&dir, &port_name, &node, &date, &time);
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("failed to create capture dir {}: {e}", parent.display());
-                return None;
-            }
+    /// Drop the oldest lines from the live scrollback once it would exceed
+    /// `tab_buffer_max_lines` after adding `incoming_lines` more — keeps a
+    /// long-running connected session bounded in memory without ever
+    /// touching the complete on-disk history file.
+    fn trim_buffer_if_needed(&self, incoming_lines: usize) {
+        let max_lines = self.state.config.borrow().ui.tab_buffer_max_lines as usize;
+        let current_lines = self.buffer.line_count().max(0) as usize;
+        let projected = current_lines + incoming_lines;
+        if projected <= max_lines {
+            return;
         }
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => {
-                *self.capture_file.borrow_mut() = Some(f);
-                Some(path)
-            }
-            Err(e) => {
-                tracing::warn!("failed to open capture file {}: {e}", path.display());
-                None
-            }
-        }
-    }
-
-    /// Stop live-capturing (closes the file handle).
-    pub fn stop_capture(&self) {
-        *self.capture_file.borrow_mut() = None;
+        let excess = projected - max_lines;
+        let start = self.buffer.start_iter();
+        let mut cut = self.buffer.start_iter();
+        cut.forward_lines(excess as i32);
+        self.buffer.delete(&mut start.clone(), &mut cut);
     }
 
     /// Highlight every *complete* line within the just-inserted span
@@ -428,23 +231,9 @@ impl SessionTab {
         }
     }
 
-    /// Append a raw line observed on this tab's port (not necessarily to/from
-    /// the node currently entered) straight to the scrollback -- no history
-    /// persistence or traffic-stat counting, since this is a passive feed of
-    /// *other* stations' unproto traffic, not our own send/receive stream to
-    /// a specific node. Used to stream every UI frame seen on the port into
-    /// an open Unproto tab, since a reply might come back from anyone.
-    pub fn append_monitor_line(&self, line: &str) {
-        let formatted = format!("{line}\n");
-        let (start_offset, sanitized) = self.insert(&formatted);
-        self.highlight_new_lines(start_offset, &sanitized);
-    }
-
-    /// `unproto` is part of the key so unproto traffic and a connected-mode
-    /// session to the same (port, remote) get separate history buckets.
-    pub fn history_key(&self) -> Option<(String, String, bool)> {
-        let port = self.selected_port().filter(|p| port_needs_node(&p.config))?;
-        Some((port.id.clone(), self.node_entry.text().to_string(), self.unproto_toggle.is_active()))
+    /// `(port_id, node)` key this tab's history is stored/loaded under.
+    pub fn history_key(&self) -> (String, String) {
+        (self.port.id.clone(), self.node.clone())
     }
 
     /// Append a chunk of received bytes (already UTF8-decoded), highlighting
@@ -458,23 +247,22 @@ impl SessionTab {
         let (start_offset, sanitized) = self.insert(text);
         self.highlight_new_lines(start_offset, &sanitized);
 
-        if let Some((port_id, remote, unproto)) = self.history_key() {
-            let mut pending = self.pending_line.borrow_mut();
-            pending.push_str(&sanitized);
-            while let Some(pos) = pending.find('\n') {
-                let line: String = pending.drain(..=pos).collect();
-                self.state.append_history_line(&port_id, &remote, unproto, line.trim_end_matches(['\r', '\n']));
-            }
+        let (port_id, remote) = self.history_key();
+        let mut pending = self.pending_line.borrow_mut();
+        pending.push_str(&sanitized);
+        while let Some(pos) = pending.find('\n') {
+            let line: String = pending.drain(..=pos).collect();
+            self.state.append_history_line(&port_id, &remote, line.trim_end_matches(['\r', '\n']));
         }
     }
 
     /// Flush any trailing partial line to history (it'll never see a
     /// trailing `\n` otherwise) — call on disconnect.
     pub fn flush_pending(&self) {
-        let Some((port_id, remote, unproto)) = self.history_key() else { return };
+        let (port_id, remote) = self.history_key();
         let mut pending = self.pending_line.borrow_mut();
         if !pending.is_empty() {
-            self.state.append_history_line(&port_id, &remote, unproto, pending.trim_end_matches(['\r', '\n']));
+            self.state.append_history_line(&port_id, &remote, pending.trim_end_matches(['\r', '\n']));
             pending.clear();
         }
     }
@@ -491,13 +279,13 @@ impl SessionTab {
         let (start_offset, sanitized) = self.insert(&formatted);
         self.highlight_new_lines(start_offset, &sanitized);
 
-        if let Some((port_id, remote, unproto)) = self.history_key() {
-            self.state.append_history_line(&port_id, &remote, unproto, &format!("\u{00BB} {text}"));
-        }
+        let (port_id, remote) = self.history_key();
+        self.state.append_history_line(&port_id, &remote, &format!("\u{00BB} {text}"));
     }
 
     /// Replace the whole scrollback with the given historical lines (used
-    /// when previewing a previous node's history before connecting).
+    /// when previewing history right after opening the tab, before/without
+    /// connecting).
     pub fn load_history(&self, lines: &[String]) {
         self.buffer.set_text("");
         if lines.is_empty() {
