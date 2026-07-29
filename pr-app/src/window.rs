@@ -195,6 +195,15 @@ impl Ui {
                     }
                 });
             }
+            {
+                let gesture = gtk::GestureClick::new();
+                gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+                let btn = button.clone();
+                gesture.connect_pressed(move |_, _, _, _| {
+                    btn.remove_css_class("favorite-port-failed");
+                });
+                button.add_controller(gesture);
+            }
             self.favorites_bar.append(&button);
             self.favorite_buttons.borrow_mut().insert(port.id.clone(), button);
         }
@@ -1598,19 +1607,9 @@ pub fn build_ui(app: &adw::Application) {
     header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
     header_start.append(&ui.monitor.port_filter_button);
-    header_start.append(&ui.favorites_bar);
+    header_end.prepend(&ui.favorites_bar);
 
-    // Which stream you're looking at (Monitor's packet traffic vs. Log's
-    // connect/disconnect/error noise) -- not a show/hide toggle, since both
-    // panels are structurally always present now (see `display_stack`).
-    // Labeled (not icon-only) and recolored via `log-toggle-active` while
-    // pressed -- a plain `:checked` state alone read as too subtle for
-    // "you are currently looking at the diagnostic Log, not Monitor."
-    let log_toggle_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    log_toggle_content.append(&gtk::Image::from_icon_name("utilities-terminal-symbolic"));
-    log_toggle_content.append(&gtk::Label::new(Some("Log")));
-    let log_toggle_button = gtk::ToggleButton::new();
-    log_toggle_button.set_child(Some(&log_toggle_content));
+    let log_toggle_button = gtk::ToggleButton::builder().icon_name("utilities-terminal-symbolic").build();
     log_toggle_button.add_css_class("flat");
     log_toggle_button.set_tooltip_text(Some("Show Log"));
     {
