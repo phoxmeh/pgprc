@@ -1043,7 +1043,8 @@ fn apply_base_css() {
          .direwolf-failed { background-color: @warning_color; } \
          .favorite-port-button.favorite-port-connected { background-color: @success_color; } \
          .favorite-port-button.favorite-port-failed { background-color: @warning_color; } \
-         .beacon-lit { background-color: @accent_color; }",
+         .beacon-lit { background-color: @accent_color; } \
+         .log-toggle-active { background-color: @accent_color; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -1225,10 +1226,10 @@ pub fn build_ui(app: &adw::Application) {
     bottom_bar.set_margin_end(8);
     bottom_bar.set_margin_top(4);
     bottom_bar.set_margin_bottom(6);
+    bottom_bar.append(&dial_button);
     bottom_bar.append(&bottom_node_entry);
     bottom_bar.append(&bottom_via_entry);
     bottom_bar.append(&bottom_port_dropdown);
-    bottom_bar.append(&dial_button);
     bottom_bar.append(&phone_button);
     bottom_bar.append(&message_entry);
     bottom_bar.append(&send_button);
@@ -1256,17 +1257,13 @@ pub fn build_ui(app: &adw::Application) {
     status_stats_label.add_css_class("caption");
     status_bar.append(&status_stats_label);
 
-    // Left-aligned quick-connect row for favorite-flagged ports, directly
-    // under the title bar -- see `Ui::rebuild_favorites_bar`.
+    // Quick-connect row for favorite-flagged ports -- lives in the header's
+    // title row now (left side, left of the right-side buttons), not its
+    // own row -- see `Ui::rebuild_favorites_bar`.
     let favorites_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     favorites_bar.set_halign(gtk::Align::Start);
-    favorites_bar.set_margin_start(8);
-    favorites_bar.set_margin_end(8);
-    favorites_bar.set_margin_top(4);
-    favorites_bar.set_margin_bottom(4);
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content_box.append(&favorites_bar);
     content_box.append(&paned);
     content_box.append(&tab_strip);
     content_box.append(&bottom_bar);
@@ -1274,32 +1271,44 @@ pub fn build_ui(app: &adw::Application) {
 
     let toolbar_view = adw::ToolbarView::new();
 
-    // A plain custom title bar instead of `adw::HeaderBar`: HeaderBar always
-    // keeps its title dead-center in the *whole* bar (reserving equal space
-    // on each side, regardless of how wide the packed content actually is),
-    // which reads as off-center here since the left group (menu/mailbox/
-    // beacon/filter) is much wider than the right group. A plain `Box` with
-    // a hexpand+center title between two natural-width side boxes centers
-    // it in the *actual* leftover space instead. Wrapped in `WindowHandle`
-    // to keep click-drag-to-move and double-click-to-maximize, and
-    // `WindowControls` restores the minimize/maximize/close buttons
-    // `HeaderBar` provided automatically.
+    // A plain custom title bar instead of `adw::HeaderBar`, built on
+    // `gtk::Overlay`: the base layer is header_start/header_end spanning the
+    // full width edge-to-edge, and the title floats on top as an overlay
+    // child centered (via halign/valign) in the *overlay's own* full
+    // allocation -- independent of how lopsided header_start/header_end are.
+    // `gtk::CenterBox` was tried first but did not equalize start/end space
+    // as its docs suggest in this GTK version; Overlay is a guaranteed-exact
+    // center regardless. Wrapped in `WindowHandle` to keep click-drag-to-move
+    // and double-click-to-maximize, and `WindowControls` restores the
+    // minimize/maximize/close buttons `HeaderBar` provided automatically.
     let header_start = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_start.set_halign(gtk::Align::Start);
+    header_start.set_valign(gtk::Align::Center);
     let header_end = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_end.set_halign(gtk::Align::End);
+    header_end.set_valign(gtk::Align::Center);
     let header_title = gtk::Label::new(Some("PGPRC"));
     header_title.add_css_class("title");
-    header_title.set_hexpand(true);
-    header_title.set_halign(gtk::Align::Center);
     header_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_title.set_halign(gtk::Align::Center);
+    header_title.set_valign(gtk::Align::Center);
+
+    let header_sides = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_sides.set_hexpand(true);
+    header_sides.append(&header_start);
+    let header_sides_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header_sides_spacer.set_hexpand(true);
+    header_sides.append(&header_sides_spacer);
+    header_sides.append(&header_end);
+
+    let header_row = gtk::Overlay::new();
     header_row.set_margin_start(6);
     header_row.set_margin_end(6);
     header_row.set_margin_top(6);
     header_row.set_margin_bottom(6);
     header_row.add_css_class("titlebar");
-    header_row.append(&header_start);
-    header_row.append(&header_title);
-    header_row.append(&header_end);
+    header_row.set_child(Some(&header_sides));
+    header_row.add_overlay(&header_title);
     let header_handle = gtk::WindowHandle::builder().child(&header_row).build();
 
     // Created here (rather than alongside its click handler below) so it can
@@ -1535,7 +1544,7 @@ pub fn build_ui(app: &adw::Application) {
             refresh_direwolf_button(&direwolf_button, &direwolf);
         });
     }
-    header_start.append(&direwolf_button);
+    header_end.append(&direwolf_button);
 
     // Opens the Incoming Beacons dialog -- icon-only (a loudspeaker with
     // sound waves), same tier as the Direwolf button next to it. `flat`
@@ -1567,19 +1576,36 @@ pub fn build_ui(app: &adw::Application) {
     header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
     header_start.append(&ui.monitor.port_filter_button);
+    header_start.append(&ui.favorites_bar);
 
     // Which stream you're looking at (Monitor's packet traffic vs. Log's
     // connect/disconnect/error noise) -- not a show/hide toggle, since both
     // panels are structurally always present now (see `display_stack`).
-    let log_toggle_button = gtk::ToggleButton::builder().icon_name("utilities-terminal-symbolic").tooltip_text("Show Log").build();
+    // Labeled (not icon-only) and recolored via `log-toggle-active` while
+    // pressed -- a plain `:checked` state alone read as too subtle for
+    // "you are currently looking at the diagnostic Log, not Monitor."
+    let log_toggle_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    log_toggle_content.append(&gtk::Image::from_icon_name("utilities-terminal-symbolic"));
+    log_toggle_content.append(&gtk::Label::new(Some("Log")));
+    let log_toggle_button = gtk::ToggleButton::new();
+    log_toggle_button.set_child(Some(&log_toggle_content));
     log_toggle_button.add_css_class("flat");
+    log_toggle_button.set_tooltip_text(Some("Show Log"));
     {
         let display_stack = ui.display_stack.clone();
         log_toggle_button.connect_toggled(move |button| {
-            display_stack.set_visible_child_name(if button.is_active() { "log" } else { "monitor" });
+            let showing_log = button.is_active();
+            display_stack.set_visible_child_name(if showing_log { "log" } else { "monitor" });
+            if showing_log {
+                button.add_css_class("log-toggle-active");
+                button.set_tooltip_text(Some("Viewing Log \u{2014} click to show Monitor"));
+            } else {
+                button.remove_css_class("log-toggle-active");
+                button.set_tooltip_text(Some("Show Log"));
+            }
         });
     }
-    header_start.append(&log_toggle_button);
+    header_end.append(&log_toggle_button);
     header_end.append(&gtk::WindowControls::new(gtk::PackType::End));
 
     toolbar_view.add_top_bar(&header_handle);
