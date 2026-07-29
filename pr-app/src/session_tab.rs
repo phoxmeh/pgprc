@@ -267,6 +267,15 @@ impl SessionTab {
         }
     }
 
+    /// Append a connection-lifecycle status message to the scrollback —
+    /// visually distinct from data/sent lines and not persisted to history
+    /// (connecting/connected/disconnected are ephemeral session events, not
+    /// part of the QSO transcript).
+    pub fn append_status_line(&self, text: &str) {
+        let formatted = format!("\u{2014} {text} \u{2014}\n");
+        self.insert(&formatted);
+    }
+
     /// Echo a locally-sent line (the operator's own typed text) into the
     /// scrollback and history. Connected-mode AX.25/AGWPE backends don't
     /// echo our own transmissions back to us, so without this the buffer

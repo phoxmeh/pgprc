@@ -676,6 +676,15 @@ impl Ui {
         let pending_key = if needs_node { (port_id.clone(), node.clone()) } else { (port_id.clone(), String::new()) };
         self.pending.borrow_mut().insert(pending_key, tab_id);
 
+        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
+            let msg = if needs_node && !node.is_empty() {
+                format!("Connecting to {node}\u{2026}")
+            } else {
+                "Connecting\u{2026}".to_string()
+            };
+            tab.append_status_line(&msg);
+        }
+
         if !self.state.is_active(&port_id) {
             self.connect_port(&port_id);
         }
@@ -822,6 +831,7 @@ impl Ui {
                 if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                     tab.conn_id.set(Some(id));
                     tab.mark_connected();
+                    tab.append_status_line("Connected");
 
                     if needs_node && is_new_incoming {
                         // An unsolicited connect while the mailbox is enabled
@@ -872,6 +882,7 @@ impl Ui {
                         tab.conn_id.set(None);
                         tab.mark_disconnected();
                         tab.flush_pending();
+                        tab.append_status_line("Disconnected");
                         *tab.mailbox_state.borrow_mut() = None;
                     }
                     if self.selected_tab.get() == Some(tab_id) {
