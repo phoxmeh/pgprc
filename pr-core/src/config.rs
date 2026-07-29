@@ -725,6 +725,23 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Pre-redesign unproto tabs wrote their own `_unproto.txt` history
+    /// files (one per ad-hoc destination); every tab is a two-way
+    /// connection now, so anything matching that suffix is permanently
+    /// orphaned. Swept on every load rather than gated behind a one-time
+    /// flag -- the scan is cheap and a no-op once they're gone.
+    fn sweep_orphaned_unproto_history(dir: &std::path::Path) {
+        let Ok(port_dirs) = std::fs::read_dir(dir.join("history")) else { return };
+        for port_dir in port_dirs.flatten() {
+            let Ok(files) = std::fs::read_dir(port_dir.path()) else { continue };
+            for file in files.flatten() {
+                if file.file_name().to_string_lossy().ends_with("_unproto.txt") {
+                    let _ = std::fs::remove_file(file.path());
+                }
+            }
+        }
+    }
+
     pub fn load() -> anyhow::Result<AppConfig> {
         let Some(dir) = Self::config_dir() else {
             return Ok(AppConfig::default());
@@ -734,6 +751,7 @@ impl AppConfig {
         if main_path.exists() && !Self::ports_path(&dir).exists() {
             Self::migrate_legacy_config(&dir, &main_path)?;
         }
+        Self::sweep_orphaned_unproto_history(&dir);
 
         let mut cfg: AppConfig = if main_path.exists() {
             let text = std::fs::read_to_string(&main_path)?;

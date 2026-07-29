@@ -136,11 +136,6 @@ impl MonitorView {
         *self.session_log.borrow_mut() = Some(file);
     }
 
-    /// Get the visible buffer's full text, e.g. for exporting to a file.
-    pub fn full_text(&self) -> String {
-        self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true).to_string()
-    }
-
     /// Restrict the visible buffer to lines whose content matches `filter`,
     /// tried first as a case-insensitive regex and, if that fails to
     /// compile (e.g. an unbalanced paren typed mid-edit), as a plain
