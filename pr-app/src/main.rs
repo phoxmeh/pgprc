@@ -10,6 +10,7 @@ mod export;
 mod help_dialog;
 mod highlight;
 mod incoming_beacons_dialog;
+mod log_view;
 mod mailbox;
 mod mailbox_dialog;
 mod monitor_view;

@@ -16,6 +16,7 @@ use crate::direwolf::{DirewolfProcess, DirewolfState};
 use crate::direwolf_dialog;
 use crate::help_dialog;
 use crate::incoming_beacons_dialog;
+use crate::log_view::LogView;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
 use crate::notified_packets_dialog;
@@ -43,15 +44,22 @@ struct TabChip {
 
 pub struct Ui {
     pub state: Rc<AppState>,
-    pub monitor: MonitorView,
+    pub monitor: Rc<MonitorView>,
+    /// Diagnostic/status noise (connect/disconnect/error/connecting, AX.25
+    /// connection-state transitions) -- kept separate from `monitor`, which
+    /// is packet traffic only. Toggled into view via `display_stack`.
+    pub log: LogView,
+    /// Swaps `paned`'s start child between `monitor.container` and
+    /// `log.container` -- which stream you're looking at, not show/hide.
+    display_stack: gtk::Stack,
     pub tabs: RefCell<HashMap<TabId, SessionTab>>,
     /// Content-switching stack for tab scrollbacks, keyed by `tab_id`
     /// stringified. Attached/detached from `paned`'s end child based on
     /// `tab_area_expanded` -- detaching gives Monitor the full pane (a
     /// `gtk::Paned` with no end child allocates 100% to its start child).
     tab_stack: gtk::Stack,
-    /// The Monitor/tab-content split. Monitor is always `start_child`;
-    /// `end_child` is `Some(&tab_stack)` only while expanded.
+    /// The Monitor-or-Log/tab-content split. `display_stack` is always
+    /// `start_child`; `end_child` is `Some(&tab_stack)` only while expanded.
     paned: gtk::Paned,
     /// Always visible whenever `tabs` is non-empty (regardless of
     /// expanded/minimized), sitting just above the bottom bar -- a chip per
@@ -128,8 +136,7 @@ impl Ui {
             Some(e) => e,
             None => return,
         };
-        self.monitor
-            .append_line(&format!("[{}] connecting ({})\u{2026}", entry.name, entry.config.kind_label()));
+        self.log.append_line(&format!("[{}] connecting ({})\u{2026}", entry.name, entry.config.kind_label()));
 
         let handle = spawn_for_config(&entry.config);
         let events = handle.events.clone();
@@ -538,7 +545,7 @@ impl Ui {
             let Some(tab) = tabs.get(&tab_id) else { return };
             if tab.conn_id.get().is_none() {
                 drop(tabs);
-                self.monitor.append_line("Not connected \u{2014} message kept in the input field.");
+                self.log.append_line("Not connected \u{2014} message kept in the input field.");
                 return;
             }
             self.send_tab_connected(tab, &text);
@@ -563,7 +570,7 @@ impl Ui {
             // it up there.
             if port_supports_connect(&tab.port.config) {
                 tab.append_sent_line(text);
-                self.monitor.append_line(&format!("[{}] TX > {}: {text}", tab.port.name, tab.node));
+                self.monitor.append_line(&tab.port.id, &format!("[{}] TX > {}: {text}", tab.port.name, tab.node));
                 self.refresh_status_bar();
             }
         }
@@ -576,16 +583,16 @@ impl Ui {
         let Some(port) = ports.get(self.bottom_port_dropdown.selected() as usize).cloned() else { return };
         drop(ports);
         if !port_supports_unproto(&port.config) {
-            self.monitor.append_line(&format!("[{}] this port doesn't support unproto sending.", port.name));
+            self.log.append_line(&format!("[{}] this port doesn't support unproto sending.", port.name));
             return;
         }
         let dest = self.bottom_node_entry.text().trim().to_uppercase();
         if dest.is_empty() {
-            self.monitor.append_line("Enter a destination before sending unproto.");
+            self.log.append_line("Enter a destination before sending unproto.");
             return;
         }
         if !self.state.is_active(&port.id) {
-            self.monitor.append_line(&format!("[{}] port not connected \u{2014} can't send unproto.", port.name));
+            self.log.append_line(&format!("[{}] port not connected \u{2014} can't send unproto.", port.name));
             return;
         }
         let via: Vec<String> = self
@@ -604,7 +611,7 @@ impl Ui {
             });
         }
         let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
-        self.monitor.append_line(&format!("[{}] TX unproto > {dest}{via_suffix}: {text}", port.name));
+        self.monitor.append_line(&port.id, &format!("[{}] TX unproto > {dest}{via_suffix}: {text}", port.name));
     }
 
     /// Send arbitrary text over a tab's live connection on the mailbox's
@@ -662,7 +669,7 @@ impl Ui {
         };
 
         if needs_node && node.is_empty() {
-            self.monitor.append_line("No node set for this tab \u{2014} can't connect.");
+            self.log.append_line("No node set for this tab \u{2014} can't connect.");
             return;
         }
 
@@ -738,7 +745,7 @@ impl Ui {
     fn handle_event(self: &Rc<Self>, port_id: &str, event: PortEvent) {
         match event {
             PortEvent::PortConnected => {
-                self.monitor.append_line(&format!("[{port_id}] port connected"));
+                self.log.append_line(&format!("[{port_id}] port connected"));
                 self.confirmed_ports.borrow_mut().insert(port_id.to_string());
                 self.refresh_favorite_button(port_id);
                 self.refresh_status_bar();
@@ -754,7 +761,7 @@ impl Ui {
                 self.confirmed_ports.borrow_mut().remove(port_id);
 
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
-                self.monitor.append_line(&format!("[{port_id}] port disconnected{suffix}"));
+                self.log.append_line(&format!("[{port_id}] port disconnected{suffix}"));
 
                 // Unbind (not remove — tabs persist) every tab this port had.
                 let affected: Vec<(String, ConnectionId)> =
@@ -777,7 +784,7 @@ impl Ui {
                 self.refresh_status_bar();
             }
             PortEvent::PortError { message } => {
-                self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
+                self.log.append_line(&format!("[{port_id}] ERROR: {message}"));
                 // Only a port that never reached `PortConnected` at all is a
                 // genuine connect failure -- some backends (e.g. a bad
                 // outgoing KISS frame) report a `PortError` for a non-fatal
@@ -790,7 +797,7 @@ impl Ui {
                 }
             }
             PortEvent::Monitor { line, from, to, message } => {
-                self.monitor.append_line(&format!("[{port_id}] {line}"));
+                self.monitor.append_line(port_id, &format!("[{port_id}] {line}"));
                 if let (Some(from), Some(to), Some(message)) = (from, to, message) {
                     self.maybe_notify_directed(port_id, &from, &to, &message, &line);
                     self.maybe_detect_beacon(port_id, &from, &to, &message);
@@ -874,8 +881,7 @@ impl Ui {
                 self.refresh_status_bar();
             }
             PortEvent::ConnState { id, state } => {
-                self.monitor
-                    .append_line(&format!("[{port_id}] connection {id}: {}", describe_state(state)));
+                self.log.append_line(&format!("[{port_id}] connection {id}: {}", describe_state(state)));
             }
             PortEvent::Data { id, bytes } => {
                 if let Some(&tab_id) = self.bound.borrow().get(&(port_id.to_string(), id)) {
@@ -1128,20 +1134,52 @@ pub fn build_ui(app: &adw::Application) {
         .default_height(700)
         .build();
 
-    let monitor = MonitorView::new(state.clone());
+    let monitor = Rc::new(MonitorView::new(state.clone()));
     monitor.set_show_timestamps(show_timestamps);
     monitor.container.set_vexpand(true);
+
+    // Every run gets its own always-on session transcript -- exactly what
+    // Monitor shows, mirrored to disk regardless of the live filter. This
+    // replaces the old manual "Save Monitor Log..." button entirely.
+    if let Some(dir) = AppConfig::config_dir() {
+        let logs_dir = dir.join("logs");
+        if std::fs::create_dir_all(&logs_dir).is_ok() {
+            let stamp = glib::DateTime::now_local()
+                .and_then(|t| t.format("%Y-%m-%d_%H-%M-%S"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "session".to_string());
+            let path = logs_dir.join(format!("session_{stamp}.txt"));
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => monitor.set_session_log(file),
+                Err(e) => tracing::warn!("failed to open session log {path:?}: {e}"),
+            }
+        }
+    }
+
+    let log = LogView::new(state.clone());
+    log.container.set_vexpand(true);
+
+    // Swaps between Monitor (packet traffic) and Log (connect/disconnect/
+    // error noise) -- a header toggle button drives this (see
+    // `log_toggle_button` below). Distinct from the Monitor/tab-content
+    // `paned` split just below: this is "which stream", that's "how much
+    // room the stream gets."
+    let display_stack = gtk::Stack::new();
+    display_stack.add_named(&monitor.container, Some("monitor"));
+    display_stack.add_named(&log.container, Some("log"));
+    display_stack.set_visible_child_name("monitor");
+    display_stack.set_vexpand(true);
 
     // Content-switching stack for tab scrollbacks -- attached/detached from
     // `paned`'s end child based on whether the tab area is expanded (see
     // `Ui::select_tab`/`minimize_tab_area`). A `gtk::Paned` with no end
-    // child gives its start child (Monitor) the full allocation, which is
-    // exactly "Monitor at 100% with zero tabs or while minimized."
+    // child gives its start child (Monitor/Log) the full allocation, which
+    // is exactly "Monitor at 100% with zero tabs or while minimized."
     let tab_stack = gtk::Stack::new();
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
-        .start_child(&monitor.container)
+        .start_child(&display_stack)
         .resize_start_child(true)
         .resize_end_child(true)
         .shrink_start_child(false)
@@ -1272,6 +1310,8 @@ pub fn build_ui(app: &adw::Application) {
     let ui = Rc::new(Ui {
         state,
         monitor,
+        log,
+        display_stack,
         tabs: RefCell::new(HashMap::new()),
         tab_stack,
         paned,
@@ -1303,6 +1343,7 @@ pub fn build_ui(app: &adw::Application) {
     });
     ui.rebuild_favorites_bar();
     ui.rebuild_bottom_ports();
+    ui.monitor.rebuild_port_filter();
 
     {
         let ui = ui.clone();
@@ -1525,6 +1566,20 @@ pub fn build_ui(app: &adw::Application) {
     }
     header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
+    header_start.append(&ui.monitor.port_filter_button);
+
+    // Which stream you're looking at (Monitor's packet traffic vs. Log's
+    // connect/disconnect/error noise) -- not a show/hide toggle, since both
+    // panels are structurally always present now (see `display_stack`).
+    let log_toggle_button = gtk::ToggleButton::builder().icon_name("utilities-terminal-symbolic").tooltip_text("Show Log").build();
+    log_toggle_button.add_css_class("flat");
+    {
+        let display_stack = ui.display_stack.clone();
+        log_toggle_button.connect_toggled(move |button| {
+            display_stack.set_visible_child_name(if button.is_active() { "log" } else { "monitor" });
+        });
+    }
+    header_start.append(&log_toggle_button);
     header_end.append(&gtk::WindowControls::new(gtk::PackType::End));
 
     toolbar_view.add_top_bar(&header_handle);
