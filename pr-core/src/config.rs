@@ -11,6 +11,12 @@ pub struct PortEntry {
     pub config: PortConfig,
     #[serde(default)]
     pub autoconnect: bool,
+    /// Shows a quick-connect button for this port in the main window's
+    /// favorites row (left side, under the title bar). Toggling it just
+    /// connects/disconnects the port itself, same as the Ports dialog's own
+    /// Connect/Disconnect button.
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -57,6 +57,16 @@ pub struct Ui {
     status_conn_icon: gtk::Image,
     status_conn_label: gtk::Label,
     status_stats_label: gtk::Label,
+    /// Left-aligned row of quick-connect buttons under the title bar, one
+    /// per favorite-flagged port. Rebuilt whenever the port list changes.
+    favorites_bar: gtk::Box,
+    favorite_buttons: RefCell<HashMap<String, gtk::Button>>,
+    /// Ports that have received `PortConnected` and not yet a matching
+    /// `PortDisconnected` -- lets `PortError` tell a genuine connect failure
+    /// (never confirmed) apart from a non-fatal error on an already-live
+    /// port (e.g. a bad outgoing frame), which must not clear its favorites
+    /// button or `active` entry.
+    confirmed_ports: RefCell<HashSet<String>>,
     pub direwolf: Rc<DirewolfProcess>,
     pub window: adw::ApplicationWindow,
 }
@@ -96,6 +106,61 @@ impl Ui {
     pub fn send_unproto(&self, id: &str, dest: String, via: Vec<String>, bytes: Vec<u8>) {
         if let Some(handle) = self.state.active.borrow().get(id) {
             let _ = handle.cmd_tx.send(PortCommand::SendUnproto { dest, via, bytes });
+        }
+    }
+
+    /// Rebuild the favorites quick-connect row from the current config's
+    /// favorite-flagged ports. Call after anything that adds/removes/renames
+    /// a port or changes its favorite flag (the Ports dialog).
+    pub fn rebuild_favorites_bar(self: &Rc<Self>) {
+        while let Some(child) = self.favorites_bar.first_child() {
+            self.favorites_bar.remove(&child);
+        }
+        self.favorite_buttons.borrow_mut().clear();
+
+        for port in self.state.config.borrow().ports.iter().filter(|p| p.favorite) {
+            let button = gtk::Button::with_label(&port.name);
+            button.add_css_class("favorite-port-button");
+            if self.state.is_active(&port.id) {
+                button.add_css_class("favorite-port-connected");
+            }
+            {
+                let ui = self.clone();
+                let id = port.id.clone();
+                button.connect_clicked(move |_| {
+                    if ui.state.is_active(&id) {
+                        ui.disconnect_port(&id);
+                    } else {
+                        ui.connect_port(&id);
+                    }
+                });
+            }
+            self.favorites_bar.append(&button);
+            self.favorite_buttons.borrow_mut().insert(port.id.clone(), button);
+        }
+    }
+
+    /// Update just one favorite button's connected-state color -- cheaper
+    /// than a full rebuild, called on every port connect/disconnect event.
+    /// Always clears the failed-to-connect indicator too, since reaching
+    /// either a connected or disconnected state supersedes it.
+    fn refresh_favorite_button(&self, port_id: &str) {
+        if let Some(button) = self.favorite_buttons.borrow().get(port_id) {
+            button.remove_css_class("favorite-port-failed");
+            if self.state.is_active(port_id) {
+                button.add_css_class("favorite-port-connected");
+            } else {
+                button.remove_css_class("favorite-port-connected");
+            }
+        }
+    }
+
+    /// Mark a favorite button yellow after a genuine connect failure (the
+    /// port never reached `PortConnected` at all).
+    fn mark_favorite_failed(&self, port_id: &str) {
+        if let Some(button) = self.favorite_buttons.borrow().get(port_id) {
+            button.remove_css_class("favorite-port-connected");
+            button.add_css_class("favorite-port-failed");
         }
     }
 
@@ -383,16 +448,36 @@ impl Ui {
     }
 
     /// Send whatever's currently in a tab's input entry — shared by both
-    /// pressing Enter and clicking the Send button next to it.
+    /// pressing Enter and clicking the Send button next to it. The input
+    /// field stays editable at all times (see `SessionTab::set_connected`),
+    /// but `send_input_button`'s sensitivity only gates the mouse path —
+    /// pressing Enter in a focused `gtk::Entry` fires regardless of any
+    /// other widget's sensitivity, so this re-checks the same "is there
+    /// actually something to send this over" condition before sending or
+    /// clearing the text, rather than silently discarding a composed message.
     fn activate_input(self: &Rc<Self>, tab_id: TabId, entry: &gtk::Entry) {
         let text = entry.text().to_string();
-        if let Some(tab) = self.tabs.borrow().get(&tab_id) {
-            if tab.unproto_toggle.is_active() {
-                self.send_tab_unproto(tab, &text);
-            } else {
-                self.send_tab_connected(tab, &text);
-            }
+        if text.is_empty() {
+            return;
         }
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs.get(&tab_id) else { return };
+        let ready = if tab.unproto_toggle.is_active() {
+            tab.selected_port().is_some_and(|p| self.state.is_active(&p.id))
+        } else {
+            tab.conn_id.get().is_some()
+        };
+        if !ready {
+            drop(tabs);
+            self.monitor.append_line("Not connected \u{2014} message kept in the input field.");
+            return;
+        }
+        if tab.unproto_toggle.is_active() {
+            self.send_tab_unproto(tab, &text);
+        } else {
+            self.send_tab_connected(tab, &text);
+        }
+        drop(tabs);
         entry.set_text("");
     }
 
@@ -549,7 +634,18 @@ impl Ui {
         self.bound.borrow_mut().retain(|_, v| *v != tab_id);
         self.pending.borrow_mut().retain(|_, v| *v != tab_id);
 
-        if let Some(tab) = self.tabs.borrow_mut().remove(&tab_id) {
+        // Extracted into its own `let` rather than matched directly on
+        // `self.tabs.borrow_mut().remove(...)`: in an `if let`, temporaries in
+        // the scrutinee live for the whole block, so the `RefMut` guard would
+        // otherwise still be held while `remove_page` runs below.
+        // `remove_page` can synchronously emit `switch-page` (GTK
+        // recalculates the notebook's current page during removal), which
+        // re-enters `refresh_status_bar` -> `current_tab_id` ->
+        // `self.tabs.borrow()` -- an immutable borrow while still mutably
+        // borrowed, which panics and crashes the app. This was the real cause
+        // of the "close a tab, app crashes" bug.
+        let removed_tab = self.tabs.borrow_mut().remove(&tab_id);
+        if let Some(tab) = removed_tab {
             if let Some(page) = self.notebook.page_num(&tab.root) {
                 self.notebook.remove_page(Some(page));
             }
@@ -604,7 +700,7 @@ impl Ui {
             tab.node_entry.set_sensitive(true);
             tab.via_entry.set_sensitive(true);
             let active = tab.selected_port().map(|p| self.state.is_active(&p.id)).unwrap_or(false);
-            tab.input_entry.set_sensitive(active);
+            tab.input_entry.set_sensitive(true);
             tab.send_input_button.set_sensitive(active);
         } else {
             tab.set_connected(tab.conn_id.get().is_some());
@@ -620,21 +716,39 @@ impl Ui {
     /// Refresh the status bar's connect-state (left) and packet/byte stats
     /// (right) for whichever tab is currently selected. Call this whenever
     /// the selected tab changes, connects/disconnects, or sends/receives —
-    /// cheap enough to call liberally rather than track precisely.
+    /// cheap enough to call liberally rather than track precisely. Also
+    /// ticked once a second (see `build_ui`) so the elapsed-time display
+    /// keeps counting up while a tab stays selected.
+    ///
+    /// The connect indicator reflects a genuine two-way connected-mode
+    /// session to a node, not the underlying port -- and is hidden entirely
+    /// for an Unproto tab, which has no such session at all.
     pub fn refresh_status_bar(&self) {
         let tabs = self.tabs.borrow();
         match self.current_tab_id().and_then(|id| tabs.get(&id)) {
+            Some(tab) if tab.unproto_toggle.is_active() => {
+                self.status_conn_icon.set_visible(false);
+                self.status_conn_label.set_text("");
+                self.status_stats_label.set_text(&tab.stats_text());
+            }
             Some(tab) => {
-                let live = tab.is_live();
+                self.status_conn_icon.set_visible(true);
+                let live = tab.conn_id.get().is_some();
                 self.status_conn_icon.set_icon_name(Some(if live {
                     "network-transmit-receive-symbolic"
                 } else {
                     "network-offline-symbolic"
                 }));
-                self.status_conn_label.set_text(if live { "Connected" } else { "Disconnected" });
+                let text = match (live, tab.elapsed_text()) {
+                    (true, Some(elapsed)) => format!("Connected to {} \u{2014} {elapsed}", tab.node_entry.text()),
+                    (true, None) => "Connected".to_string(),
+                    (false, _) => "Disconnected".to_string(),
+                };
+                self.status_conn_label.set_text(&text);
                 self.status_stats_label.set_text(&tab.stats_text());
             }
             None => {
+                self.status_conn_icon.set_visible(true);
                 self.status_conn_icon.set_icon_name(Some("network-offline-symbolic"));
                 self.status_conn_label.set_text("No tab selected");
                 self.status_stats_label.set_text("");
@@ -700,10 +814,21 @@ impl Ui {
         match event {
             PortEvent::PortConnected => {
                 self.monitor.append_line(&format!("[{port_id}] port connected"));
+                self.confirmed_ports.borrow_mut().insert(port_id.to_string());
                 self.refresh_unproto_tabs_for_port(port_id);
+                self.refresh_favorite_button(port_id);
                 self.refresh_status_bar();
             }
             PortEvent::PortDisconnected { reason } => {
+                // Remove from `active` immediately rather than waiting for
+                // `connect_port`'s event loop to end (which only happens once
+                // the event channel itself closes, *after* this event is
+                // handled) -- otherwise `is_active` still reports true for
+                // every refresh below, which left e.g. the favorites-bar
+                // button stuck green after a manual disconnect.
+                self.state.active.borrow_mut().remove(port_id);
+                self.confirmed_ports.borrow_mut().remove(port_id);
+
                 let suffix = reason.map(|r| format!(": {r}")).unwrap_or_default();
                 self.monitor.append_line(&format!("[{port_id}] port disconnected{suffix}"));
 
@@ -715,20 +840,34 @@ impl Ui {
                         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                             tab.conn_id.set(None);
                             tab.set_connected(false);
+                            tab.mark_disconnected();
                         }
                     }
                 }
                 self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
                 self.refresh_unproto_tabs_for_port(port_id);
+                self.refresh_favorite_button(port_id);
                 self.refresh_status_bar();
             }
             PortEvent::PortError { message } => {
                 self.monitor.append_line(&format!("[{port_id}] ERROR: {message}"));
+                // Only a port that never reached `PortConnected` at all is a
+                // genuine connect failure -- some backends (e.g. a bad
+                // outgoing KISS frame) report a `PortError` for a non-fatal
+                // problem on an already-live port, which must not clear its
+                // `active` entry or favorites-bar button.
+                if !self.confirmed_ports.borrow().contains(port_id) {
+                    self.state.active.borrow_mut().remove(port_id);
+                    self.refresh_unproto_tabs_for_port(port_id);
+                    self.mark_favorite_failed(port_id);
+                    self.refresh_status_bar();
+                }
             }
             PortEvent::Monitor { line, to } => {
                 self.monitor.append_line(&format!("[{port_id}] {line}"));
                 if let Some(to) = to.as_deref() {
                     self.maybe_notify_directed(port_id, to, &line);
+                    self.feed_unproto_tabs(port_id, &line);
                 }
             }
             PortEvent::ConnectionOpened { id, label } => {
@@ -752,6 +891,7 @@ impl Ui {
                 if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                     tab.conn_id.set(Some(id));
                     tab.set_connected(true);
+                    tab.mark_connected();
                     if needs_node && tab.node_entry.text().is_empty() {
                         tab.node_entry.set_text(&label);
                     }
@@ -793,6 +933,7 @@ impl Ui {
                         }
                         tab.conn_id.set(None);
                         tab.set_connected(false);
+                        tab.mark_disconnected();
                         tab.flush_pending();
                         *tab.mailbox_state.borrow_mut() = None;
                     }
@@ -826,6 +967,19 @@ impl Ui {
         for tab in self.tabs.borrow().values() {
             if tab.unproto_toggle.is_active() && tab.selected_port().is_some_and(|p| p.id == port_id) {
                 self.update_mode_controls(tab);
+            }
+        }
+    }
+
+    /// Stream every observed UI (unproto) frame into any Unproto-mode tab
+    /// open on the same port -- an Unproto tab has no live `ConnectionId` of
+    /// its own to receive `Data` events through, so without this a reply
+    /// sent back via unproto would only ever show up in the global Monitor
+    /// pane, not in the tab the user is actually watching.
+    fn feed_unproto_tabs(&self, port_id: &str, line: &str) {
+        for tab in self.tabs.borrow().values() {
+            if tab.unproto_toggle.is_active() && tab.selected_port().is_some_and(|p| p.id == port_id) {
+                tab.append_monitor_line(line);
             }
         }
     }
@@ -873,7 +1027,9 @@ fn apply_base_css() {
         ".pin-toggle.pin-pinned { color: @accent_color; } \
          .notify-rule-toggle.notify-rule-active { background-color: @accent_color; } \
          .direwolf-running { background-color: @success_color; } \
-         .direwolf-failed { background-color: @warning_color; }",
+         .direwolf-failed { background-color: @warning_color; } \
+         .favorite-port-button.favorite-port-connected { background-color: @success_color; } \
+         .favorite-port-button.favorite-port-failed { background-color: @warning_color; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -1033,7 +1189,17 @@ pub fn build_ui(app: &adw::Application) {
     status_stats_label.add_css_class("caption");
     status_bar.append(&status_stats_label);
 
+    // Left-aligned quick-connect row for favorite-flagged ports, directly
+    // under the title bar -- see `Ui::rebuild_favorites_bar`.
+    let favorites_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    favorites_bar.set_halign(gtk::Align::Start);
+    favorites_bar.set_margin_start(8);
+    favorites_bar.set_margin_end(8);
+    favorites_bar.set_margin_top(4);
+    favorites_bar.set_margin_bottom(4);
+
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&favorites_bar);
     content_box.append(&paned);
     content_box.append(&status_bar);
 
@@ -1080,9 +1246,13 @@ pub fn build_ui(app: &adw::Application) {
         status_conn_icon,
         status_conn_label,
         status_stats_label,
+        favorites_bar,
+        favorite_buttons: RefCell::new(HashMap::new()),
+        confirmed_ports: RefCell::new(HashSet::new()),
         direwolf: DirewolfProcess::new(),
         window: window.clone(),
     });
+    ui.rebuild_favorites_bar();
 
     {
         let ui = ui.clone();
@@ -1100,6 +1270,16 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
     ui.refresh_status_bar();
+    {
+        // Ticks the status bar's elapsed-connected-time display once a
+        // second; cheap enough (two label/icon updates) to run unconditionally
+        // rather than starting/stopping a timer per tab.
+        let ui = ui.clone();
+        glib::source::timeout_add_seconds_local(1, move || {
+            ui.refresh_status_bar();
+            glib::ControlFlow::Continue
+        });
+    }
 
     // A starter set of keyboard shortcuts mirroring existing mouse actions.
     // `gtk::ShortcutController` (rather than a hand-rolled `EventControllerKey`

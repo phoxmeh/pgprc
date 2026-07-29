@@ -204,6 +204,7 @@ fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_
             ui.state.config.borrow_mut().ports.retain(|p| p.id != id);
             ui.state.save_config();
             rebuild_list(&ui, &list_box);
+            ui.rebuild_favorites_bar();
         });
     }
     row.append(&remove_button);
@@ -375,6 +376,10 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     autoconnect_check.set_active(existing.as_ref().is_some_and(|e| e.autoconnect));
     root.append(&autoconnect_check);
 
+    let favorite_check = gtk::CheckButton::with_label("Favorite (quick-connect button in main window)");
+    favorite_check.set_active(existing.as_ref().is_some_and(|e| e.favorite));
+    root.append(&favorite_check);
+
     let error_label = gtk::Label::new(None);
     error_label.add_css_class("error");
     root.append(&error_label);
@@ -507,20 +512,23 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
             };
 
             let autoconnect = autoconnect_check.is_active();
+            let favorite = favorite_check.is_active();
             let mut cfg = ui.state.config.borrow_mut();
             if let Some(id) = &existing_id {
                 if let Some(slot) = cfg.ports.iter_mut().find(|p| &p.id == id) {
                     slot.name = name;
                     slot.config = config;
                     slot.autoconnect = autoconnect;
+                    slot.favorite = favorite;
                 }
             } else {
                 let id = next_id(&cfg);
-                cfg.ports.push(PortEntry { id, name, config, autoconnect });
+                cfg.ports.push(PortEntry { id, name, config, autoconnect, favorite });
             }
             drop(cfg);
             ui.state.save_config();
             rebuild_list(&ui, &list_box);
+            ui.rebuild_favorites_bar();
             win.close();
         });
     }

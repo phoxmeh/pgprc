@@ -75,6 +75,9 @@ pub struct SessionTab {
     pub input_entry: gtk::Entry,
     pub send_input_button: gtk::Button,
     pub conn_id: Cell<Option<ConnectionId>>,
+    /// When the current connected-mode session started, for the window
+    /// status bar's elapsed-time display -- `None` while disconnected.
+    connected_since: Cell<Option<std::time::Instant>>,
     /// Text received since the last completed line, for splitting arbitrary
     /// byte chunks into history lines.
     pending_line: RefCell<String>,
@@ -216,8 +219,10 @@ impl SessionTab {
         root.append(&scrolled);
 
         let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        // Always editable, even while disconnected -- a message can be
+        // composed ahead of time; only the Send button (and Enter, gated in
+        // `Ui::activate_input`) actually require a live connection.
         let input_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Type and press Enter\u{2026}").build();
-        input_entry.set_sensitive(false);
         input_row.append(&input_entry);
         let send_input_button = gtk::Button::with_label("Send");
         send_input_button.add_css_class("suggested-action");
@@ -256,6 +261,7 @@ impl SessionTab {
             input_entry,
             send_input_button,
             conn_id: Cell::new(None),
+            connected_since: Cell::new(None),
             pending_line: RefCell::new(String::new()),
             pinned_identity: RefCell::new(None),
             bytes_sent: Cell::new(0),
@@ -284,7 +290,11 @@ impl SessionTab {
     pub fn set_connected(&self, connected: bool) {
         self.connect_button.set_sensitive(!connected);
         self.disconnect_button.set_sensitive(connected);
-        self.input_entry.set_sensitive(connected);
+        // The input field stays editable regardless of connection state, so
+        // a message can be composed ahead of time -- only actually sending it
+        // requires a live connection (enforced by `send_input_button`'s
+        // sensitivity here and the `activate_input` guard in window.rs, which
+        // also covers the Enter-key path).
         self.send_input_button.set_sensitive(connected);
         self.port_dropdown.set_sensitive(!connected);
         self.node_entry.set_sensitive(!connected);
@@ -415,6 +425,18 @@ impl SessionTab {
         }
     }
 
+    /// Append a raw line observed on this tab's port (not necessarily to/from
+    /// the node currently entered) straight to the scrollback -- no history
+    /// persistence or traffic-stat counting, since this is a passive feed of
+    /// *other* stations' unproto traffic, not our own send/receive stream to
+    /// a specific node. Used to stream every UI frame seen on the port into
+    /// an open Unproto tab, since a reply might come back from anyone.
+    pub fn append_monitor_line(&self, line: &str) {
+        let formatted = format!("{line}\n");
+        let (start_offset, sanitized) = self.insert(&formatted);
+        self.highlight_new_lines(start_offset, &sanitized);
+    }
+
     /// `unproto` is part of the key so unproto traffic and a connected-mode
     /// session to the same (port, remote) get separate history buckets.
     pub fn history_key(&self) -> Option<(String, String, bool)> {
@@ -492,16 +514,24 @@ impl SessionTab {
         self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true).to_string()
     }
 
-    /// Whether this tab currently has live traffic flowing — a connected-
-    /// mode session for a normal tab, or (for an Unproto tab, which has no
-    /// `ConnectionId` of its own) whether the underlying port is active.
-    /// Drives the status bar's connect/disconnect indicator.
-    pub fn is_live(&self) -> bool {
-        if self.unproto_toggle.is_active() {
-            self.selected_port().is_some_and(|p| self.state.is_active(&p.id))
-        } else {
-            self.conn_id.get().is_some()
-        }
+    /// Mark a connected-mode session as having just started, for the status
+    /// bar's elapsed-time display.
+    pub fn mark_connected(&self) {
+        self.connected_since.set(Some(std::time::Instant::now()));
+    }
+
+    /// Clear the elapsed-time tracking (call on disconnect).
+    pub fn mark_disconnected(&self) {
+        self.connected_since.set(None);
+    }
+
+    /// Time since `mark_connected` as `H:MM:SS`, or `None` if not currently
+    /// tracking a connected-mode session.
+    pub fn elapsed_text(&self) -> Option<String> {
+        self.connected_since.get().map(|since| {
+            let secs = since.elapsed().as_secs();
+            format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        })
     }
 
     /// Formatted for the window's status bar: packet count and total bytes,
