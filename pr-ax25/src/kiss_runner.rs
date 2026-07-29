@@ -186,7 +186,9 @@ fn command_loop(writer: &mut impl Write, my_call: &str, cmd_rx: &mpsc::Receiver<
                         // at me" regardless of `dest`.
                         let _ = event_tx.send_blocking(PortEvent::Monitor {
                             line: format!("{my_call} > {dest}{via_suffix} [unproto TX]: {text}"),
+                            from: None,
                             to: None,
+                            message: None,
                         });
                     }
                     Err(e) => {
@@ -223,9 +225,16 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
                         // session we're passively monitoring, not a
                         // standalone directed message, and would otherwise
                         // fire once per frame of an ongoing conversation.
-                        let to = matches!(frame.content, FrameContent::UnnumberedInformation(_))
-                            .then(|| frame.destination.to_string());
-                        let _ = events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame), to });
+                        let (to, from, message) = match &frame.content {
+                            FrameContent::UnnumberedInformation(ui) => (
+                                Some(frame.destination.to_string()),
+                                Some(frame.source.to_string()),
+                                Some(String::from_utf8_lossy(&ui.info).replace('\0', "")),
+                            ),
+                            _ => (None, None, None),
+                        };
+                        let _ =
+                            events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame), from, to, message });
                     }
                 }
             }

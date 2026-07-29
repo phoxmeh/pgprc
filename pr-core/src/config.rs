@@ -126,6 +126,11 @@ pub struct AddressBookEntry {
     /// the same path every time.
     #[serde(default)]
     pub via: String,
+    /// Home BBS/mailbox address for this station, e.g. a Winlink RMS or
+    /// packet BBS callsign — distinct from `via` (a digipeater route to
+    /// reach the station directly), this is where its own mail lives.
+    #[serde(default)]
+    pub home_bbs: String,
 }
 
 /// A tab the user pinned: its (port, node) shell is recreated automatically
@@ -209,15 +214,20 @@ pub struct DirewolfPrefs {
 }
 
 /// Desktop notification preferences. Off by default, like the mailbox —
-/// firing OS notifications is a side effect the user should opt into. Which
-/// destinations actually raise a notification (beyond the built-in
-/// "directed to my callsign"/incoming-connection checks) is driven by each
-/// `HighlightRule.notify` flag, not a separate rule list — one set of
-/// destination rules covers both highlighting and notifications.
+/// firing OS notifications is a side effect the user should opt into. Three
+/// independent toggles since these are genuinely different kinds of traffic
+/// a user may want to track separately: an incoming connection or a frame
+/// directed at your own callsign, a frame matching a user `HighlightRule`
+/// with its `notify` flag set, and a frame matching a `BeaconMonitorRule`
+/// (tracked in the Incoming Beacons list, not user-destination traffic).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotifyPrefs {
     #[serde(default)]
-    pub enabled: bool,
+    pub directed_enabled: bool,
+    #[serde(default)]
+    pub custom_enabled: bool,
+    #[serde(default)]
+    pub beacon_enabled: bool,
 }
 
 /// A packet whose destination triggered a desktop notification, kept for
@@ -262,6 +272,48 @@ pub struct Beacon {
     pub interval_secs: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// Global on/off switch for every scheduled outgoing beacon at once,
+/// independent of each `Beacon.enabled` flag — lives in general
+/// `config.toml` (like `mailbox.enabled`/`notify.*`), while the beacon list
+/// itself stays in its own `beacons.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for BeaconPrefs {
+    fn default() -> Self {
+        BeaconPrefs { enabled: true }
+    }
+}
+
+/// A user-defined rule for detecting "this looks like a beacon" among
+/// incoming UI frames, tracked in the Incoming Beacons list. Uses a real
+/// regex against the frame's destination — unlike `HighlightRule`'s comma/
+/// pipe literal list — since beacon destination formats vary widely (not
+/// just literal tokens like "CQ"/"BEACON").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconMonitorRule {
+    pub id: String,
+    pub label: String,
+    pub pattern: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// One received frame that matched a `BeaconMonitorRule`, kept for later
+/// review in the Incoming Beacons dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingBeacon {
+    pub id: u64,
+    pub port_id: String,
+    pub from: String,
+    pub to: String,
+    pub message: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,8 +428,15 @@ pub struct UiPrefs {
     #[serde(default = "default_true")]
     pub show_timestamps: bool,
     /// Pre-fills the "My Callsign" field when adding a new AGWPE/KISS port.
+    /// Also shown as "Callsign" in Preferences' Profile section.
     #[serde(default)]
     pub default_call: Option<String>,
+    /// Operator's own name, shown in Preferences' Profile section.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Home BBS/mailbox address, shown in Preferences' Profile section.
+    #[serde(default)]
+    pub home_bbs: Option<String>,
     /// QRZ.com XML API credentials, for address book "Lookup QRZ". Stored in
     /// plain text like the AGWPE login fields already are — same tradeoff,
     /// not a new one.
@@ -414,6 +473,8 @@ impl Default for UiPrefs {
             font: None,
             show_timestamps: true,
             default_call: None,
+            name: None,
+            home_bbs: None,
             qrz_username: None,
             qrz_password: None,
             history_lines: default_history_lines(),
@@ -444,6 +505,12 @@ pub struct AppConfig {
     pub highlighting: HighlightPrefs,
     #[serde(skip)]
     pub beacons: Vec<Beacon>,
+    #[serde(default)]
+    pub beacon_prefs: BeaconPrefs,
+    #[serde(skip)]
+    pub beacon_rules: Vec<BeaconMonitorRule>,
+    #[serde(skip)]
+    pub incoming_beacons: Vec<IncomingBeacon>,
     #[serde(skip)]
     pub qso_log: Vec<QsoLogEntry>,
     #[serde(default)]
@@ -508,6 +575,18 @@ struct BeaconsFile {
 struct MailboxFile {
     #[serde(default)]
     messages: Vec<MailboxMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BeaconRulesFile {
+    #[serde(default)]
+    beacon_rules: Vec<BeaconMonitorRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct IncomingBeaconsFile {
+    #[serde(default)]
+    incoming_beacons: Vec<IncomingBeacon>,
 }
 
 fn load_part<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> anyhow::Result<T> {
@@ -577,6 +656,12 @@ impl AppConfig {
     }
     fn mailbox_path(dir: &std::path::Path) -> PathBuf {
         dir.join("mailbox.toml")
+    }
+    fn beacon_rules_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("beacon_rules.toml")
+    }
+    fn incoming_beacons_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("incoming_beacons.toml")
     }
 
     /// One-time migration from the old single-`config.toml` layout: detected
@@ -655,6 +740,8 @@ impl AppConfig {
         cfg.pinned_sessions = load_part::<PinnedSessionsFile>(&Self::pinned_sessions_path(&dir))?.pinned_sessions;
         cfg.beacons = load_part::<BeaconsFile>(&Self::beacons_path(&dir))?.beacons;
         cfg.mailbox.messages = load_part::<MailboxFile>(&Self::mailbox_path(&dir))?.messages;
+        cfg.beacon_rules = load_part::<BeaconRulesFile>(&Self::beacon_rules_path(&dir))?.beacon_rules;
+        cfg.incoming_beacons = load_part::<IncomingBeaconsFile>(&Self::incoming_beacons_path(&dir))?.incoming_beacons;
 
         Ok(cfg)
     }
@@ -681,6 +768,11 @@ impl AppConfig {
         )?;
         save_part(&Self::beacons_path(&dir), &BeaconsFile { beacons: self.beacons.clone() })?;
         save_part(&Self::mailbox_path(&dir), &MailboxFile { messages: self.mailbox.messages.clone() })?;
+        save_part(&Self::beacon_rules_path(&dir), &BeaconRulesFile { beacon_rules: self.beacon_rules.clone() })?;
+        save_part(
+            &Self::incoming_beacons_path(&dir),
+            &IncomingBeaconsFile { incoming_beacons: self.incoming_beacons.clone() },
+        )?;
 
         Ok(())
     }

@@ -14,6 +14,7 @@ use crate::beacons_dialog;
 use crate::direwolf::{DirewolfProcess, DirewolfState};
 use crate::direwolf_dialog;
 use crate::help_dialog;
+use crate::incoming_beacons_dialog;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
 use crate::notified_packets_dialog;
@@ -61,6 +62,10 @@ pub struct Ui {
     /// per favorite-flagged port. Rebuilt whenever the port list changes.
     favorites_bar: gtk::Box,
     favorite_buttons: RefCell<HashMap<String, gtk::Button>>,
+    /// Header icon that opens the Incoming Beacons dialog. Lights up
+    /// (`beacon-lit` CSS class) when a new beacon is detected, cleared the
+    /// next time the dialog is actually opened.
+    beacon_button: gtk::Button,
     /// Ports that have received `PortConnected` and not yet a matching
     /// `PortDisconnected` -- lets `PortError` tell a genuine connect failure
     /// (never confirmed) apart from a non-fatal error on an already-live
@@ -170,6 +175,12 @@ impl Ui {
     pub fn reschedule_beacons(self: &Rc<Self>) {
         for (_, source) in self.beacon_timers.borrow_mut().drain() {
             source.remove();
+        }
+        if !self.state.config.borrow().beacon_prefs.enabled {
+            // Master kill switch: stop everything regardless of each
+            // beacon's own `enabled` flag, and don't reschedule until it's
+            // flipped back on.
+            return;
         }
         for beacon in self.state.config.borrow().beacons.iter().filter(|b| b.enabled) {
             let ui = self.clone();
@@ -863,10 +874,11 @@ impl Ui {
                     self.refresh_status_bar();
                 }
             }
-            PortEvent::Monitor { line, to } => {
+            PortEvent::Monitor { line, from, to, message } => {
                 self.monitor.append_line(&format!("[{port_id}] {line}"));
-                if let Some(to) = to.as_deref() {
-                    self.maybe_notify_directed(port_id, to, &line);
+                if let (Some(from), Some(to), Some(message)) = (from, to, message) {
+                    self.maybe_notify_directed(port_id, &from, &to, &message, &line);
+                    self.maybe_detect_beacon(port_id, &from, &to, &message);
                     self.feed_unproto_tabs(port_id, &line);
                 }
             }
@@ -910,7 +922,7 @@ impl Ui {
                         // me" (that's what accepting it means), so this
                         // doesn't need `NotifyMatcher` at all — just the
                         // feature's on/off switch.
-                        if self.state.config.borrow().notify.enabled {
+                        if self.state.config.borrow().notify.directed_enabled {
                             let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
                             let body = format!("{label} connected to you");
                             crate::notify::send(&self.window, &format!("Packet Radio \u{2014} {port_name}"), &body);
@@ -985,14 +997,66 @@ impl Ui {
     }
 
     /// Fire a desktop notification if `to` is directed at the configured
-    /// default callsign or matches a user `NotifyRule` — no-op if
-    /// notifications are disabled or nothing matches.
-    fn maybe_notify_directed(&self, port_id: &str, to: &str, line: &str) {
+    /// callsign or matches a Custom Rule — no-op if the relevant toggle is
+    /// off or nothing matches. `line` (the full formatted Monitor text) is
+    /// only used for the historical Notified Packets record, which wants
+    /// the same highlighted display everything else gets; the live
+    /// notification body itself uses the clean structured fields, per
+    /// explicit request (from/to/message only, no frame-tag/PID metadata).
+    fn maybe_notify_directed(&self, port_id: &str, from: &str, to: &str, message: &str, line: &str) {
         let matcher = crate::notify::NotifyMatcher::build(&self.state.config.borrow());
-        let Some(reason) = matcher.match_destination(to) else { return };
+        let Some(match_kind) = matcher.match_destination(to) else { return };
         let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
-        crate::notify::send(&self.window, &format!("Packet Radio \u{2014} {port_name}"), &format!("{reason}\n{line}"));
+        let title = match &match_kind {
+            crate::notify::NotifyMatch::Directed => format!("Packet Radio \u{2014} {port_name}"),
+            crate::notify::NotifyMatch::Custom(label) => format!("Packet Radio \u{2014} {port_name} ({label})"),
+        };
+        crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
         self.state.record_notified_packet(port_id, line);
+    }
+
+    /// Record and (optionally) notify on a received frame matching a
+    /// `BeaconMonitorRule`, tracked separately from the general directed/
+    /// custom-rule notifications above — a beacon match always lights up
+    /// the header button regardless of whether `notify.beacon_enabled` also
+    /// fires a desktop notification for it.
+    fn maybe_detect_beacon(&self, port_id: &str, from: &str, to: &str, message: &str) {
+        let label = {
+            let cfg = self.state.config.borrow();
+            let mut found = None;
+            for rule in cfg.beacon_rules.iter().filter(|r| r.enabled) {
+                if let Ok(re) = regex::RegexBuilder::new(&rule.pattern).case_insensitive(true).build() {
+                    if re.is_match(to) {
+                        found = Some(rule.label.clone());
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        let Some(label) = label else { return };
+
+        self.state.record_incoming_beacon(port_id, from, to, message);
+        self.mark_beacon_lit();
+
+        if self.state.config.borrow().notify.beacon_enabled {
+            let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
+            let title = format!("Packet Radio \u{2014} {port_name} (Beacon: {label})");
+            crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
+        }
+    }
+
+    /// Light up the header's Incoming Beacons button — same explicit
+    /// CSS-class-toggle pattern as the favorites bar/pin toggle elsewhere in
+    /// this file, rather than a `:checked`-style pseudo-class.
+    pub fn mark_beacon_lit(&self) {
+        self.beacon_button.add_css_class("beacon-lit");
+    }
+
+    /// Clear the lit state — called when the Incoming Beacons dialog is
+    /// actually opened, the simplest "mark as seen" trigger available.
+    pub fn clear_beacon_lit(&self) {
+        self.beacon_button.remove_css_class("beacon-lit");
     }
 }
 
@@ -1029,7 +1093,8 @@ fn apply_base_css() {
          .direwolf-running { background-color: @success_color; } \
          .direwolf-failed { background-color: @warning_color; } \
          .favorite-port-button.favorite-port-connected { background-color: @success_color; } \
-         .favorite-port-button.favorite-port-failed { background-color: @warning_color; }",
+         .favorite-port-button.favorite-port-failed { background-color: @warning_color; } \
+         .beacon-lit { background-color: @accent_color; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -1233,6 +1298,11 @@ pub fn build_ui(app: &adw::Application) {
     header_row.append(&header_end);
     let header_handle = gtk::WindowHandle::builder().child(&header_row).build();
 
+    // Created here (rather than alongside its click handler below) so it can
+    // be stored on `Ui` itself -- `maybe_detect_beacon` needs to light it up
+    // from anywhere event handling happens, not just from this setup code.
+    let beacon_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
+
     let ui = Rc::new(Ui {
         state,
         monitor,
@@ -1248,6 +1318,7 @@ pub fn build_ui(app: &adw::Application) {
         status_stats_label,
         favorites_bar,
         favorite_buttons: RefCell::new(HashMap::new()),
+        beacon_button: beacon_button.clone(),
         confirmed_ports: RefCell::new(HashSet::new()),
         direwolf: DirewolfProcess::new(),
         window: window.clone(),
@@ -1345,14 +1416,14 @@ pub fn build_ui(app: &adw::Application) {
     menu_popover.set_child(Some(&menu_box));
     menu_button.set_popover(Some(&menu_popover));
 
-    // Mailbox has its own header button now (next to Send Beacon), so it's
-    // deliberately left out of this menu rather than duplicated in both.
+    // Mailbox/Incoming Beacons/Notified Packets each have their own header
+    // button now, so they're deliberately left out of this menu rather than
+    // duplicated in both.
     type MenuAction = fn(&Rc<Ui>);
-    let menu_items: [(&str, MenuAction); 5] = [
+    let menu_items: [(&str, MenuAction); 4] = [
         ("Ports\u{2026}", |ui| ports_dialog::show(ui)),
         ("Address Book\u{2026}", |ui| address_book_dialog::show(ui)),
         ("Beacons\u{2026}", |ui| beacons_dialog::show(ui)),
-        ("Notified Packets\u{2026}", |ui| notified_packets_dialog::show(ui)),
         ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
     ];
     for (label, open) in menu_items {
@@ -1443,19 +1514,34 @@ pub fn build_ui(app: &adw::Application) {
     }
     header_start.append(&direwolf_button);
 
-    // "Send Beacon" sends a one-shot unconnected (UI) frame over an
-    // already-connected AGWPE/KISS port — icon-only (a loudspeaker with
-    // sound waves, the closest stock glyph to "broadcasting"), same tier
-    // as the Direwolf button next to it.
-    let beacon_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
-    beacon_button.set_tooltip_text(Some("Send Beacon\u{2026}"));
+    // Opens the Incoming Beacons dialog -- icon-only (a loudspeaker with
+    // sound waves), same tier as the Direwolf button next to it. `flat`
+    // keeps its resting appearance uniform with the other header icon
+    // buttons; it only stands out via `beacon-lit` when a new beacon is
+    // actually detected (see `Ui::mark_beacon_lit`).
+    beacon_button.add_css_class("flat");
+    beacon_button.set_tooltip_text(Some("Incoming Beacons\u{2026}"));
     {
         let ui = ui.clone();
         beacon_button.connect_clicked(move |_| {
-            ports_dialog::show_send_unproto(&ui);
+            incoming_beacons_dialog::show(&ui);
         });
     }
     header_start.append(&beacon_button);
+
+    // Quick-access icon button for Notified Packets, same tier as Mailbox/
+    // Direwolf/Incoming Beacons -- moved out of the hamburger menu so every
+    // frequent-use dialog lives at the same level.
+    let notified_packets_button = gtk::Button::from_icon_name("notifications-symbolic");
+    notified_packets_button.add_css_class("flat");
+    notified_packets_button.set_tooltip_text(Some("Notified Packets\u{2026}"));
+    {
+        let ui = ui.clone();
+        notified_packets_button.connect_clicked(move |_| {
+            notified_packets_dialog::show(&ui);
+        });
+    }
+    header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
 
     // "Save Monitor Log\u{2026}" exports the Monitor's current (filtered)

@@ -155,7 +155,9 @@ impl PortRunner for AgwpeRunner {
                     // me" even if `dest` happens to be our own callsign.
                     let _ = event_tx.send_blocking(PortEvent::Monitor {
                         line: format!("{my_call} > {dest} [unproto TX]: {}", text_from_bytes(&bytes)),
+                        from: None,
                         to: None,
+                        message: None,
                     });
                     let frame = if via.is_empty() {
                         AgwFrame::new(radio_port, 'M', &my_call, &dest, bytes)
@@ -222,7 +224,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
         'G' | 'R' | 'H' | 'g' => {
             let text = text_from_bytes(&frame.data);
             events
-                .send_blocking(PortEvent::Monitor { line: format!("[{kind}] {text}"), to: None })
+                .send_blocking(PortEvent::Monitor { line: format!("[{kind}] {text}"), from: None, to: None, message: None })
                 .map_err(|_| ())?;
         }
         'C' => {
@@ -255,7 +257,9 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
                 // connection already gets its own "connected to you"
                 // notification; piggybacking another one here would just
                 // double up.
-                events.send_blocking(PortEvent::Monitor { line: text, to: None }).map_err(|_| ())?;
+                events
+                    .send_blocking(PortEvent::Monitor { line: text, from: None, to: None, message: None })
+                    .map_err(|_| ())?;
             }
         }
         'd' => {
@@ -289,11 +293,18 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             // its own tab — notifying on every reply would just be noise),
             // and 'T' is our own transmission being monitored, not something
             // received.
-            let to = (kind == 'U').then(|| frame.call_to.clone());
+            let is_ui = kind == 'U';
+            let (from, to, message) = if is_ui {
+                (Some(frame.call_from.clone()), Some(frame.call_to.clone()), Some(text.clone()))
+            } else {
+                (None, None, None)
+            };
             events
                 .send_blocking(PortEvent::Monitor {
                     line: format!("{} > {} [{kind}]{pid_suffix}: {text}", frame.call_from, frame.call_to),
+                    from,
                     to,
+                    message,
                 })
                 .map_err(|_| ())?;
         }

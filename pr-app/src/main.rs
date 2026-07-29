@@ -8,6 +8,7 @@ mod direwolf_dialog;
 mod export;
 mod help_dialog;
 mod highlight;
+mod incoming_beacons_dialog;
 mod mailbox;
 mod mailbox_dialog;
 mod monitor_view;

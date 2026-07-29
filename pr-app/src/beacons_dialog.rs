@@ -4,7 +4,7 @@ use adw::prelude::*;
 
 use pr_core::{AppConfig, Beacon};
 
-use crate::ports_dialog::{dialog_window, labeled};
+use crate::ports_dialog::{dialog_window, force_uppercase, labeled};
 use crate::window::Ui;
 
 fn next_id(config: &AppConfig) -> String {
@@ -23,6 +23,30 @@ fn next_id(config: &AppConfig) -> String {
 pub fn show(ui: &Rc<Ui>) {
     let (win, root) = dialog_window(&ui.window, "Beacons", 560);
     win.set_default_height(420);
+
+    // Global kill switch for every scheduled beacon at once, independent of
+    // each row's own toggle -- acts immediately, same as the per-row
+    // switches below (this dialog has no Save button; every control here
+    // writes straight through).
+    let global_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let global_label = gtk::Label::new(Some("Outgoing Beacons Enabled"));
+    global_label.set_hexpand(true);
+    global_label.set_halign(gtk::Align::Start);
+    let global_switch = gtk::Switch::new();
+    global_switch.set_active(ui.state.config.borrow().beacon_prefs.enabled);
+    global_switch.set_valign(gtk::Align::Center);
+    {
+        let ui = ui.clone();
+        global_switch.connect_active_notify(move |sw| {
+            ui.state.config.borrow_mut().beacon_prefs.enabled = sw.is_active();
+            ui.state.save_config();
+            ui.reschedule_beacons();
+        });
+    }
+    global_row.append(&global_label);
+    global_row.append(&global_switch);
+    root.append(&global_row);
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
     list_box.add_css_class("boxed-list");
@@ -62,13 +86,27 @@ fn build_beacon_row(ui: &Rc<Ui>, entry: Beacon, list_box: &gtk::ListBox) -> gtk:
     row.set_margin_start(6);
     row.set_margin_end(6);
 
+    // Per-beacon on/off, quick to flip without opening Edit -- acts
+    // immediately, same as the dialog's global switch above it.
+    let enabled_switch = gtk::Switch::new();
+    enabled_switch.set_active(entry.enabled);
+    enabled_switch.set_valign(gtk::Align::Center);
+    {
+        let ui = ui.clone();
+        let id = entry.id.clone();
+        enabled_switch.connect_active_notify(move |sw| {
+            if let Some(b) = ui.state.config.borrow_mut().beacons.iter_mut().find(|b| b.id == id) {
+                b.enabled = sw.is_active();
+            }
+            ui.state.save_config();
+            ui.reschedule_beacons();
+        });
+    }
+    row.append(&enabled_switch);
+
     let port_name =
         ui.state.config.borrow().ports.iter().find(|p| p.id == entry.port_id).map(|p| p.name.clone()).unwrap_or_else(|| "(unknown port)".to_string());
-    let status = if entry.enabled { "" } else { " (disabled)" };
-    let label = gtk::Label::new(Some(&format!(
-        "{port_name} \u{2192} {} every {}s{status}",
-        entry.dest, entry.interval_secs
-    )));
+    let label = gtk::Label::new(Some(&format!("{port_name} \u{2192} {} every {}s", entry.dest, entry.interval_secs)));
     label.set_hexpand(true);
     label.set_halign(gtk::Align::Start);
     row.append(&label);
@@ -121,6 +159,7 @@ fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon
 
     let via_entry =
         gtk::Entry::builder().placeholder_text("WIDE1-1,WIDE2-1 (optional)").text(existing.as_ref().map(|e| e.via.as_str()).unwrap_or("")).build();
+    force_uppercase(&via_entry);
     root.append(&labeled("Via", &via_entry));
 
     let message_entry =

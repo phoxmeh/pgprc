@@ -2,9 +2,12 @@
 //! incoming connection, a monitored/received frame whose destination matches
 //! the configured default callsign, or a user's `HighlightRule` with its
 //! `notify` flag set (the same destination-address rules used for
-//! highlighting also drive notifications — one rule list, two effects). Off
-//! by default (`NotifyPrefs.enabled`) — firing OS notifications is a side
-//! effect the user should opt into, same precedent as the personal mailbox.
+//! highlighting also drive notifications — one rule list, two effects).
+//! Gated by two independent `NotifyPrefs` toggles (`directed_enabled`/
+//! `custom_enabled`) since they're genuinely different things to want on or
+//! off separately — both off by default, same precedent as the personal
+//! mailbox. Beacon-detection notifications are a separate concern entirely
+//! (see `window.rs::maybe_detect_beacon`), not handled by this matcher.
 
 use gtk::prelude::*;
 use regex::{Regex, RegexBuilder};
@@ -13,11 +16,20 @@ use pr_core::{AppConfig, HighlightRule};
 
 use crate::qrz::strip_ssid;
 
+/// Which kind of destination match fired, so the caller can pick the right
+/// notification title/wording without this module needing to know about UI
+/// formatting.
+pub enum NotifyMatch {
+    Directed,
+    Custom(String),
+}
+
 /// Compiled, ready-to-match form of the user's notification preferences.
 /// Rebuilt fresh per event rather than cached, mirroring `Highlighter` — a
 /// handful of small regexes is free at packet-radio traffic rates.
 pub struct NotifyMatcher {
-    enabled: bool,
+    directed_enabled: bool,
+    custom_enabled: bool,
     my_call_base: Option<String>,
     rules: Vec<(Regex, String)>,
 }
@@ -33,27 +45,34 @@ impl NotifyMatcher {
             .map(|s| strip_ssid(s).to_uppercase());
         let rules =
             config.highlighting.rules.iter().filter(|r| r.enabled && r.notify).filter_map(build_rule).collect();
-        NotifyMatcher { enabled: config.notify.enabled, my_call_base, rules }
+        NotifyMatcher {
+            directed_enabled: config.notify.directed_enabled,
+            custom_enabled: config.notify.custom_enabled,
+            my_call_base,
+            rules,
+        }
     }
 
-    /// If `to` should trigger a notification, returns a short reason string
-    /// to show as the notification body's lead-in; `None` otherwise
-    /// (feature disabled, or no match).
-    pub fn match_destination(&self, to: &str) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
+    /// If `to` should trigger a notification, returns which kind matched;
+    /// `None` otherwise (both toggles off, or no match). Directed takes
+    /// precedence over a custom-rule match when both would apply.
+    pub fn match_destination(&self, to: &str) -> Option<NotifyMatch> {
         // SSID-stripped only for the "is this my callsign" check — a
         // custom rule's pattern is matched verbatim (uppercased) since
         // digipeater aliases like `WIDE1-1`/`WIDE2-2` use a trailing `-N`
         // as a hop count, not an SSID, and stripping it would silently
         // break those patterns.
         let my_call_check = strip_ssid(to).to_uppercase();
-        if self.my_call_base.as_deref() == Some(my_call_check.as_str()) {
-            return Some("Directed to your callsign".to_string());
+        if self.directed_enabled && self.my_call_base.as_deref() == Some(my_call_check.as_str()) {
+            return Some(NotifyMatch::Directed);
         }
-        let upper = to.trim().to_uppercase();
-        self.rules.iter().find(|(re, _)| re.is_match(&upper)).map(|(_, label)| format!("Matches rule \u{201c}{label}\u{201d}"))
+        if self.custom_enabled {
+            let upper = to.trim().to_uppercase();
+            if let Some((_, label)) = self.rules.iter().find(|(re, _)| re.is_match(&upper)) {
+                return Some(NotifyMatch::Custom(label.clone()));
+            }
+        }
+        None
     }
 }
 
@@ -83,10 +102,11 @@ mod tests {
     use super::*;
     use pr_core::AppConfig;
 
-    fn config_with(default_call: Option<&str>, notify_enabled: bool, rules: Vec<HighlightRule>) -> AppConfig {
+    fn config_with(default_call: Option<&str>, directed_enabled: bool, custom_enabled: bool, rules: Vec<HighlightRule>) -> AppConfig {
         let mut cfg = AppConfig::default();
         cfg.ui.default_call = default_call.map(str::to_string);
-        cfg.notify.enabled = notify_enabled;
+        cfg.notify.directed_enabled = directed_enabled;
+        cfg.notify.custom_enabled = custom_enabled;
         cfg.highlighting.rules = rules;
         cfg
     }
@@ -97,41 +117,57 @@ mod tests {
 
     #[test]
     fn disabled_never_matches() {
-        let cfg = config_with(Some("KD3BFP-9"), false, vec![]);
+        let cfg = config_with(Some("KD3BFP-9"), false, false, vec![]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("KD3BFP-9").is_none());
     }
 
     #[test]
     fn matches_my_call_ignoring_ssid() {
-        let cfg = config_with(Some("KD3BFP-9"), true, vec![]);
+        let cfg = config_with(Some("KD3BFP-9"), true, false, vec![]);
         let matcher = NotifyMatcher::build(&cfg);
-        assert!(matcher.match_destination("KD3BFP").is_some());
-        assert!(matcher.match_destination("KD3BFP-5").is_some());
+        assert!(matches!(matcher.match_destination("KD3BFP"), Some(NotifyMatch::Directed)));
+        assert!(matches!(matcher.match_destination("KD3BFP-5"), Some(NotifyMatch::Directed)));
         assert!(matcher.match_destination("N0CALL-1").is_none());
     }
 
     #[test]
-    fn matches_custom_destination_rule() {
-        let cfg = config_with(None, true, vec![rule("Wide digi", "WIDE1-1, WIDE2-1", true, true)]);
+    fn directed_disabled_does_not_match_even_with_custom_enabled() {
+        let cfg = config_with(Some("KD3BFP-9"), false, true, vec![]);
         let matcher = NotifyMatcher::build(&cfg);
-        let reason = matcher.match_destination("wide1-1").expect("should match case-insensitively");
-        assert!(reason.contains("Wide digi"));
+        assert!(matcher.match_destination("KD3BFP-9").is_none());
+    }
+
+    #[test]
+    fn matches_custom_destination_rule() {
+        let cfg = config_with(None, false, true, vec![rule("Wide digi", "WIDE1-1, WIDE2-1", true, true)]);
+        let matcher = NotifyMatcher::build(&cfg);
+        match matcher.match_destination("wide1-1") {
+            Some(NotifyMatch::Custom(label)) => assert_eq!(label, "Wide digi"),
+            other => panic!("expected a custom-rule match, got {}", other.is_some()),
+        }
         assert!(matcher.match_destination("WIDE3-3").is_none());
+    }
+
+    #[test]
+    fn custom_disabled_does_not_match_even_with_directed_enabled() {
+        let cfg = config_with(None, true, false, vec![rule("CQ", "CQ", true, true)]);
+        let matcher = NotifyMatcher::build(&cfg);
+        assert!(matcher.match_destination("CQ").is_none());
     }
 
     #[test]
     fn rule_without_notify_flag_is_ignored() {
         // notify: false — a highlight-only rule shouldn't also fire
         // notifications.
-        let cfg = config_with(None, true, vec![rule("CQ", "CQ", false, true)]);
+        let cfg = config_with(None, false, true, vec![rule("CQ", "CQ", false, true)]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("CQ").is_none());
     }
 
     #[test]
     fn disabled_rule_is_ignored() {
-        let cfg = config_with(None, true, vec![rule("Off", "CQ", true, false)]);
+        let cfg = config_with(None, false, true, vec![rule("Off", "CQ", true, false)]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("CQ").is_none());
     }
@@ -140,7 +176,7 @@ mod tests {
     fn rule_pattern_is_exact_not_substring() {
         // "CQ" shouldn't match "CQD" or vice versa — a destination field is
         // the whole address, not text to search within.
-        let cfg = config_with(None, true, vec![rule("CQ", "CQ", true, true)]);
+        let cfg = config_with(None, false, true, vec![rule("CQ", "CQ", true, true)]);
         let matcher = NotifyMatcher::build(&cfg);
         assert!(matcher.match_destination("CQD").is_none());
     }

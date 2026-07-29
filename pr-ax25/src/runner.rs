@@ -89,7 +89,9 @@ impl PortRunner for Ax25RawSocketRunner {
                         Err(e) => {
                             let _ = event_tx.send_blocking(PortEvent::Monitor {
                                 line: format!("connect to {remote} failed: {e}"),
+                                from: None,
                                 to: None,
+                                message: None,
                             });
                             let _ = event_tx.send_blocking(PortEvent::ConnState {
                                 id,

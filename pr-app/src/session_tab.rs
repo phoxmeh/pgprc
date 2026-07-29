@@ -8,6 +8,7 @@ use pr_core::{AddressBookEntry, ConnectionId, PortConfig, PortEntry};
 use crate::app_state::AppState;
 use crate::highlight::{highlight_line, Highlighter, TagCache};
 use crate::mailbox::MailboxState;
+use crate::ports_dialog::force_uppercase;
 
 pub type TabId = u64;
 
@@ -127,7 +128,9 @@ impl SessionTab {
 
         let node_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let node_entry = gtk::Entry::builder().placeholder_text("Node (callsign)").width_chars(12).build();
+        force_uppercase(&node_entry);
         let via_entry = gtk::Entry::builder().placeholder_text("Via (optional)").width_chars(14).build();
+        force_uppercase(&via_entry);
 
         let mut available_address_book: Vec<AddressBookEntry> = address_book;
         available_address_book.sort_by(|a, b| a.callsign.cmp(&b.callsign));

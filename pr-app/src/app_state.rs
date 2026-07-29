@@ -7,8 +7,8 @@ use pr_ax25::{Ax25RawSocketRunner, KissRunner, KissTransport};
 use pr_core::transports::ssh::SshRunner;
 use pr_core::transports::telnet::TelnetRunner;
 use pr_core::{
-    spawn_port, AddressBookEntry, AppConfig, NotifiedPacket, PinnedSession, PortConfig, PortEntry, PortHandle,
-    QsoLogEntry,
+    spawn_port, AddressBookEntry, AppConfig, IncomingBeacon, NotifiedPacket, PinnedSession, PortConfig, PortEntry,
+    PortHandle, QsoLogEntry,
 };
 
 pub struct AppState {
@@ -64,6 +64,7 @@ impl AppState {
                 last_heard: Some(now),
                 heard_count: 1,
                 via: String::new(),
+                home_bbs: String::new(),
             }),
         }
         drop(cfg);
@@ -213,6 +214,39 @@ impl AppState {
         let mut cfg = self.config.borrow_mut();
         cfg.notified_packets.retain(|p| p.id != id);
         drop(cfg);
+        self.save_config();
+    }
+
+    /// Record a received frame that matched a `BeaconMonitorRule`, for later
+    /// review in the Incoming Beacons dialog.
+    pub fn record_incoming_beacon(&self, port_id: &str, from: &str, to: &str, message: &str) {
+        let mut cfg = self.config.borrow_mut();
+        let id = cfg.incoming_beacons.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        cfg.incoming_beacons.push(IncomingBeacon {
+            id,
+            port_id: port_id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            message: message.to_string(),
+            timestamp: now_timestamp(),
+        });
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Remove one entry from the Incoming Beacons list — used by its
+    /// two-click (arm, then confirm) delete button.
+    pub fn remove_incoming_beacon(&self, id: u64) {
+        let mut cfg = self.config.borrow_mut();
+        cfg.incoming_beacons.retain(|b| b.id != id);
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Permanently clear the whole Incoming Beacons list — used by its
+    /// "Clear All" action, after user confirmation.
+    pub fn clear_incoming_beacons(&self) {
+        self.config.borrow_mut().incoming_beacons.clear();
         self.save_config();
     }
 }

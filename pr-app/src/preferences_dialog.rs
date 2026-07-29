@@ -5,7 +5,7 @@ use adw::prelude::*;
 
 use pr_core::HighlightRule;
 
-use crate::ports_dialog::dialog_window;
+use crate::ports_dialog::{dialog_window, force_uppercase};
 use crate::window::{apply_font, Ui};
 
 pub fn show(ui: &Rc<Ui>) {
@@ -19,7 +19,27 @@ pub fn show(ui: &Rc<Ui>) {
     let current = ui.state.config.borrow().ui.clone();
     let current_hl = ui.state.config.borrow().highlighting.clone();
     let current_mailbox_enabled = ui.state.config.borrow().mailbox.enabled;
-    let current_notify_enabled = ui.state.config.borrow().notify.enabled;
+    let current_notify = ui.state.config.borrow().notify.clone();
+
+    // --- Profile: who you are, on every port you connect. Callsign lives
+    // here (not General) since it's identity, not a display preference. ---
+    let profile_group = adw::PreferencesGroup::builder().title("Profile").build();
+
+    let name_row = adw::EntryRow::builder().title("Name").build();
+    name_row.set_text(current.name.as_deref().unwrap_or(""));
+    profile_group.add(&name_row);
+
+    let callsign_row = adw::EntryRow::builder().title("Callsign").build();
+    callsign_row.set_text(current.default_call.as_deref().unwrap_or(""));
+    force_uppercase(&callsign_row);
+    profile_group.add(&callsign_row);
+
+    let home_bbs_row = adw::EntryRow::builder().title("Home BBS Address").build();
+    home_bbs_row.set_text(current.home_bbs.as_deref().unwrap_or(""));
+    force_uppercase(&home_bbs_row);
+    profile_group.add(&home_bbs_row);
+
+    content.append(&profile_group);
 
     // --- General ---
     let general_group = adw::PreferencesGroup::builder().title("General").build();
@@ -30,10 +50,6 @@ pub fn show(ui: &Rc<Ui>) {
 
     let timestamps_row = adw::SwitchRow::builder().title("Show Timestamps in Monitor").active(current.show_timestamps).build();
     general_group.add(&timestamps_row);
-
-    let default_call_row = adw::EntryRow::builder().title("Default Callsign").build();
-    default_call_row.set_text(current.default_call.as_deref().unwrap_or(""));
-    general_group.add(&default_call_row);
 
     let history_lines_row = adw::EntryRow::builder().title("History Lines").build();
     history_lines_row.set_text(&current.history_lines.to_string());
@@ -69,14 +85,30 @@ pub fn show(ui: &Rc<Ui>) {
     mailbox_group.add(&mailbox_enabled_row);
     content.append(&mailbox_group);
 
-    // --- Notifications ---
+    // --- Notifications: three independent toggles, since these track
+    // genuinely different things -- your own traffic, a user-picked rule,
+    // and beacons (tracked separately in the Incoming Beacons dialog). ---
     let notify_group = adw::PreferencesGroup::builder().title("Notifications").build();
-    let notify_enabled_row = adw::SwitchRow::builder()
-        .title("Enable Notifications")
-        .subtitle("Desktop notification for an incoming connection, a frame directed to your callsign, or a Destination Rule")
-        .active(current_notify_enabled)
+    let notify_directed_row = adw::SwitchRow::builder()
+        .title("Directed Notifications")
+        .subtitle("An incoming connection, or a frame directed to your callsign")
+        .active(current_notify.directed_enabled)
         .build();
-    notify_group.add(&notify_enabled_row);
+    notify_group.add(&notify_directed_row);
+
+    let notify_custom_row = adw::SwitchRow::builder()
+        .title("Custom Rule Notifications")
+        .subtitle("A frame matching a Custom Rule with its bell toggled on")
+        .active(current_notify.custom_enabled)
+        .build();
+    notify_group.add(&notify_custom_row);
+
+    let notify_beacon_row = adw::SwitchRow::builder()
+        .title("Beacon Notifications")
+        .subtitle("A frame matching a Beacon Monitor rule (see Incoming Beacons)")
+        .active(current_notify.beacon_enabled)
+        .build();
+    notify_group.add(&notify_beacon_row);
     content.append(&notify_group);
 
     // --- Highlighting ---
@@ -98,7 +130,7 @@ pub fn show(ui: &Rc<Ui>) {
     let my_call_color_btn = color_button(&current_hl.my_call_color);
     let my_call_color_row = adw::ActionRow::builder()
         .title("My Callsign")
-        .subtitle("Matches the Default Callsign above, wherever it's mentioned")
+        .subtitle("Matches the Profile Callsign above, wherever it's mentioned")
         .build();
     my_call_color_row.add_suffix(&my_call_color_btn);
     hl_group.add(&my_call_color_row);
@@ -169,7 +201,9 @@ pub fn show(ui: &Rc<Ui>) {
         save_button.connect_clicked(move |_| {
             let font = font_row.text().to_string();
             let show_timestamps = timestamps_row.is_active();
-            let default_call = default_call_row.text().to_string();
+            let name = name_row.text().to_string();
+            let default_call = callsign_row.text().to_string();
+            let home_bbs = home_bbs_row.text().to_string();
             let qrz_username = qrz_user_row.text().to_string();
             let qrz_password = qrz_pass_row.text().to_string();
             let history_lines = match history_lines_row.text().trim().parse::<u32>() {
@@ -184,8 +218,10 @@ pub fn show(ui: &Rc<Ui>) {
                 let mut cfg = ui.state.config.borrow_mut();
                 cfg.ui.font = if font.trim().is_empty() { None } else { Some(font.clone()) };
                 cfg.ui.show_timestamps = show_timestamps;
+                cfg.ui.name = if name.trim().is_empty() { None } else { Some(name) };
                 cfg.ui.default_call =
                     if default_call.trim().is_empty() { None } else { Some(default_call.to_uppercase()) };
+                cfg.ui.home_bbs = if home_bbs.trim().is_empty() { None } else { Some(home_bbs.to_uppercase()) };
                 cfg.ui.qrz_username = if qrz_username.trim().is_empty() { None } else { Some(qrz_username) };
                 cfg.ui.qrz_password = if qrz_password.is_empty() { None } else { Some(qrz_password) };
                 cfg.ui.history_lines = history_lines;
@@ -199,7 +235,9 @@ pub fn show(ui: &Rc<Ui>) {
 
                 cfg.mailbox.enabled = mailbox_enabled_row.is_active();
 
-                cfg.notify.enabled = notify_enabled_row.is_active();
+                cfg.notify.directed_enabled = notify_directed_row.is_active();
+                cfg.notify.custom_enabled = notify_custom_row.is_active();
+                cfg.notify.beacon_enabled = notify_beacon_row.is_active();
             }
             // Credentials may have changed; force a fresh login next lookup.
             *ui.state.qrz_session.borrow_mut() = None;

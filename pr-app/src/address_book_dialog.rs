@@ -5,7 +5,7 @@ use gtk::glib;
 
 use pr_core::AddressBookEntry;
 
-use crate::ports_dialog::{dialog_window, labeled};
+use crate::ports_dialog::{dialog_window, force_uppercase, labeled};
 use crate::window::Ui;
 
 /// Open the Address Book: stations heard automatically on any port (via
@@ -167,23 +167,28 @@ fn labeled_notes(text: &str, initial: &str) -> (gtk::Box, gtk::TextBuffer) {
 fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<AddressBookEntry>, list_box: &gtk::ListBox) {
     let (win, root) = dialog_window(parent, if existing.is_some() { "Edit Station" } else { "Add Station" }, 420);
 
-    let callsign_entry = gtk::Entry::builder().placeholder_text("N0CALL-1").build();
-    let alias_entry = gtk::Entry::builder().placeholder_text("Node/BBS alias (optional)").build();
     let name_entry = gtk::Entry::builder().placeholder_text("Operator name (optional)").build();
-    let location_entry = gtk::Entry::builder().placeholder_text("City, state, grid square\u{2026} (optional)").build();
+    let callsign_entry = gtk::Entry::builder().placeholder_text("N0CALL-1").build();
     let via_entry = gtk::Entry::builder().placeholder_text("Digipeater path, e.g. WIDE1-1,WIDE2-1 (optional)").build();
+    force_uppercase(&via_entry);
+    let home_bbs_entry = gtk::Entry::builder().placeholder_text("Home BBS address (optional)").build();
+    force_uppercase(&home_bbs_entry);
+    let alias_entry = gtk::Entry::builder().placeholder_text("Node/BBS alias (optional)").build();
+    let location_entry = gtk::Entry::builder().placeholder_text("City, state, grid square\u{2026} (optional)").build();
     if let Some(e) = &existing {
-        callsign_entry.set_text(&e.callsign);
-        alias_entry.set_text(e.alias.as_deref().unwrap_or(""));
         name_entry.set_text(e.name.as_deref().unwrap_or(""));
-        location_entry.set_text(e.location.as_deref().unwrap_or(""));
+        callsign_entry.set_text(&e.callsign);
         via_entry.set_text(&e.via);
+        home_bbs_entry.set_text(&e.home_bbs);
+        alias_entry.set_text(e.alias.as_deref().unwrap_or(""));
+        location_entry.set_text(e.location.as_deref().unwrap_or(""));
     }
-    root.append(&labeled("Callsign", &callsign_entry));
-    root.append(&labeled("Alias", &alias_entry));
     root.append(&labeled("Name", &name_entry));
-    root.append(&labeled("Location", &location_entry));
+    root.append(&labeled("Callsign", &callsign_entry));
     root.append(&labeled("Via", &via_entry));
+    root.append(&labeled("Home BBS", &home_bbs_entry));
+    root.append(&labeled("Alias", &alias_entry));
+    root.append(&labeled("Location", &location_entry));
 
     let (notes_container, notes_buffer) =
         labeled_notes("Notes", existing.as_ref().and_then(|e| e.notes.as_deref()).unwrap_or(""));
@@ -295,6 +300,7 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
             let name = name_entry.text().to_string();
             let location = location_entry.text().to_string();
             let via = via_entry.text().trim().to_uppercase();
+            let home_bbs = home_bbs_entry.text().trim().to_uppercase();
             let notes = notes_buffer.text(&notes_buffer.start_iter(), &notes_buffer.end_iter(), true).to_string();
 
             let mut cfg = ui.state.config.borrow_mut();
@@ -306,6 +312,7 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
                 slot.location = if location.is_empty() { None } else { Some(location) };
                 slot.notes = if notes.is_empty() { None } else { Some(notes) };
                 slot.via = via;
+                slot.home_bbs = home_bbs;
             } else {
                 cfg.address_book.push(AddressBookEntry {
                     callsign,
@@ -316,6 +323,7 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
                     last_heard: None,
                     heard_count: 0,
                     via,
+                    home_bbs,
                 });
             }
             drop(cfg);

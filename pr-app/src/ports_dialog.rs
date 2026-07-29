@@ -536,88 +536,6 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     win.present();
 }
 
-/// Prompt for a destination address and message, and send a one-shot
-/// unconnected (UI/beacon) frame over an already-connected AGWPE port.
-pub fn show_send_unproto(ui: &Rc<Ui>) {
-    let candidates: Vec<PortEntry> = ui
-        .state
-        .config
-        .borrow()
-        .ports
-        .iter()
-        .filter(|p| {
-            ui.state.is_active(&p.id)
-                && matches!(
-                    p.config,
-                    PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. }
-                )
-        })
-        .cloned()
-        .collect();
-
-    let (win, root) = dialog_window(&ui.window, "Send Beacon", 400);
-
-    if candidates.is_empty() {
-        root.append(&gtk::Label::new(Some(
-            "No connected AGWPE or KISS ports. Connect one first via Ports\u{2026}",
-        )));
-        win.present();
-        return;
-    }
-
-    let names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
-    let port_model = gtk::StringList::new(&names);
-    let port_dropdown = gtk::DropDown::builder().model(&port_model).build();
-    root.append(&labeled("Port", &port_dropdown));
-
-    let dest_entry = gtk::Entry::builder().placeholder_text("BEACON").text("BEACON").build();
-    root.append(&labeled("Destination", &dest_entry));
-
-    let via_entry = gtk::Entry::builder().placeholder_text("WIDE1-1,WIDE2-1 (optional)").build();
-    root.append(&labeled("Via", &via_entry));
-
-    let message_entry = gtk::Entry::builder().placeholder_text("Message text").build();
-    root.append(&labeled("Message", &message_entry));
-
-    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    button_row.set_halign(gtk::Align::End);
-    let cancel_button = gtk::Button::with_label("Cancel");
-    {
-        let win = win.clone();
-        cancel_button.connect_clicked(move |_| win.close());
-    }
-    let send_button = gtk::Button::with_label("Send");
-    send_button.add_css_class("suggested-action");
-    {
-        let ui = ui.clone();
-        let win = win.clone();
-        send_button.connect_clicked(move |_| {
-            let dest = dest_entry.text().to_string();
-            if dest.trim().is_empty() {
-                return;
-            }
-            let message = message_entry.text().to_string();
-            let via: Vec<String> = via_entry
-                .text()
-                .split([',', ' '])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_uppercase())
-                .collect();
-            let idx = port_dropdown.selected() as usize;
-            if let Some(entry) = candidates.get(idx) {
-                ui.send_unproto(&entry.id, dest.to_uppercase(), via, message.into_bytes());
-            }
-            win.close();
-        });
-    }
-    button_row.append(&cancel_button);
-    button_row.append(&send_button);
-    root.append(&button_row);
-
-    win.present();
-}
-
 /// Populate a KISS parameter form (three optional-number entries + a
 /// force-full-duplex checkbox) from a loaded `KissParams` — `None` fields
 /// are left as their "TNC default" placeholder, i.e. blank.
@@ -657,6 +575,26 @@ fn parse_kiss_params(
         slot_time: parse_optional_u8(slot_time, "Slot Time")?,
         full_duplex: if full_duplex.is_active() { Some(true) } else { None },
     })
+}
+
+/// Force an editable field's text to uppercase live as the user types (used
+/// for every Node/Via/Home BBS Address field in the app — both plain
+/// `gtk::Entry` and `adw::EntryRow`, which both implement `gtk::Editable`).
+/// `set_text` alone jumps the cursor to the end, so the cursor position is
+/// captured and restored explicitly — safe here since an uppercase
+/// transform never changes string length. Comparing before writing avoids
+/// infinite `connect_changed` recursion (the second, recursive call sees
+/// text already matching and no-ops).
+pub(crate) fn force_uppercase(entry: &impl IsA<gtk::Editable>) {
+    entry.connect_changed(|entry| {
+        let text = entry.text();
+        let upper = text.to_uppercase();
+        if text.as_str() != upper {
+            let pos = entry.position();
+            entry.set_text(&upper);
+            entry.set_position(pos);
+        }
+    });
 }
 
 pub(crate) fn labeled(text: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
