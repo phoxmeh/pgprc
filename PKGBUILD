@@ -6,7 +6,7 @@
 # tarball/git URL for a proper (e.g. AUR) submission.
 pkgname=pgprc
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Pretty Good Packet Radio Client — a Linux-native AGWPE/AX.25/KISS packet radio client"
 arch=('x86_64')
 url="https://example.invalid/packet-radio" # TODO: replace once a remote exists
@@ -37,6 +37,16 @@ build() {
 	cd "$startdir"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR="$srcdir/target"
+	# Always start from a clean target dir. This is a local/testing package
+	# rebuilt straight from a working directory that changes between builds,
+	# and cargo's incremental rebuild detection is mtime-based — on at least
+	# one dev machine used for this project, source files ended up with
+	# mtimes that didn't reliably compare as "newer" than a stale cached
+	# build artifact, so an incremental `cargo build` silently repackaged an
+	# old binary instead of rebuilding. A full rebuild is slower but never
+	# silently stale, which matters far more for a package meant to be
+	# installed and run, not iterated on.
+	rm -rf "$CARGO_TARGET_DIR"
 	cargo build --frozen --release --workspace
 }
 
