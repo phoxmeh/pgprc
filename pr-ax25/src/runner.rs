@@ -45,8 +45,9 @@ impl PortRunner for Ax25RawSocketRunner {
             let accept_events = event_tx.clone();
             let accept_sockets = sockets.clone();
             let accept_next_id = next_id.clone();
+            let accept_local_call = local_call.clone();
             let handle = thread::spawn(move || {
-                accept_loop(listener, &accept_events, &accept_sockets, &accept_next_id);
+                accept_loop(listener, &accept_events, &accept_sockets, &accept_next_id, &accept_local_call);
             });
             Some((handle, listener_shutdown))
         });
@@ -59,6 +60,7 @@ impl PortRunner for Ax25RawSocketRunner {
                     let _ = event_tx.send_blocking(PortEvent::ConnectionOpened {
                         id,
                         label: remote.clone(),
+                        to: Some(local_call.clone()),
                     });
                     let _ = event_tx.send_blocking(PortEvent::ConnState {
                         id,
@@ -156,6 +158,7 @@ fn accept_loop(
     events: &async_channel::Sender<PortEvent>,
     sockets: &Arc<Mutex<HashMap<ConnectionId, RawAx25Socket>>>,
     next_id: &Arc<AtomicU64>,
+    local_call: &str,
 ) {
     loop {
         let (socket, remote) = match listener.accept() {
@@ -164,7 +167,7 @@ fn accept_loop(
         };
         let id = next_id.fetch_add(1, Ordering::SeqCst);
         let _ = events.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
-        let _ = events.send_blocking(PortEvent::ConnectionOpened { id, label: remote });
+        let _ = events.send_blocking(PortEvent::ConnectionOpened { id, label: remote, to: Some(local_call.to_string()) });
         let _ = events.send_blocking(PortEvent::ConnState { id, state: ConnState::Connected });
         let reader_socket = match socket.try_clone() {
             Ok(s) => s,

@@ -16,6 +16,14 @@ use crate::window::Ui;
 /// persist anything, so closing (by any means) never discards a save that
 /// already happened; it's always safe to bail out with Escape.
 pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: i32) -> (adw::Window, gtk::Box) {
+    let (win, root, _header) = dialog_window_with_header(parent, title, width);
+    (win, root)
+}
+
+/// Same as `dialog_window`, but also returns the native header bar so a
+/// caller can pack a widget into its titlebar space (e.g. the mailbox
+/// window's Enable button) instead of the content area below it.
+pub(crate) fn dialog_window_with_header(parent: &impl IsA<gtk::Window>, title: &str, width: i32) -> (adw::Window, gtk::Box, adw::HeaderBar) {
     let win = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
@@ -29,8 +37,9 @@ pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: 
     root.set_margin_start(12);
     root.set_margin_end(12);
 
+    let header = adw::HeaderBar::new();
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&root));
     win.set_content(Some(&toolbar));
 
@@ -48,7 +57,7 @@ pub(crate) fn dialog_window(parent: &impl IsA<gtk::Window>, title: &str, width: 
     }
     win.add_controller(escape_controller);
 
-    (win, root)
+    (win, root, header)
 }
 
 fn next_id(config: &AppConfig) -> String {
@@ -614,4 +623,54 @@ pub(crate) fn labeled_widget(text: &str, widget: gtk::Widget) -> gtk::Box {
     widget.set_hexpand(true);
     row.append(&widget);
     row
+}
+
+/// A boxed-list of switches, one per connect-capable port, shared by any
+/// feature (mailbox, keyboard-to-keyboard mode) that listens for unsolicited
+/// connections on a configurable subset of ports. `selected` empty means
+/// "every port" (each such feature's own pre-existing behavior before this
+/// per-port filtering existed), shown as every switch defaulting on.
+/// Returns the widget to append plus each port's `(id, Switch)`, so the
+/// caller can read back which are active on Save -- see
+/// `collapse_listen_ports` for turning that back into the "empty means all"
+/// storage convention.
+pub(crate) fn port_listen_checklist(ports: &[PortEntry], selected: &[String]) -> (gtk::Widget, Vec<(String, gtk::Switch)>) {
+    let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    list_box.add_css_class("boxed-list");
+
+    let connect_ports: Vec<&PortEntry> = ports.iter().filter(|p| crate::session_tab::port_supports_connect(&p.config)).collect();
+    if connect_ports.is_empty() {
+        let label = gtk::Label::new(Some("No connect-capable ports configured yet."));
+        label.set_margin_top(8);
+        label.set_margin_bottom(8);
+        list_box.append(&label);
+        return (list_box.upcast(), Vec::new());
+    }
+
+    let mut switches = Vec::new();
+    for port in connect_ports {
+        let row = adw::ActionRow::builder().title(&port.name).build();
+        let switch = gtk::Switch::builder()
+            .active(selected.is_empty() || selected.iter().any(|p| p == &port.id))
+            .valign(gtk::Align::Center)
+            .build();
+        row.add_suffix(&switch);
+        row.set_activatable_widget(Some(&switch));
+        list_box.append(&row);
+        switches.push((port.id.clone(), switch));
+    }
+    (list_box.upcast(), switches)
+}
+
+/// Reads back a `port_listen_checklist`'s switches into the "empty means
+/// every port" storage convention: only persists an explicit subset when at
+/// least one port was actually turned off, so leaving every switch at its
+/// (all-on) default keeps listening on ports added later too.
+pub(crate) fn collapse_listen_ports(switches: &[(String, gtk::Switch)]) -> Vec<String> {
+    let chosen: Vec<String> = switches.iter().filter(|(_, sw)| sw.is_active()).map(|(id, _)| id.clone()).collect();
+    if chosen.len() == switches.len() {
+        Vec::new()
+    } else {
+        chosen
+    }
 }

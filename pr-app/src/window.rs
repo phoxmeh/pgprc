@@ -5,7 +5,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortEntry, PortEvent};
+use pr_core::{AppConfig, ConnState, ConnectionId, PortCommand, PortConfig, PortEntry, PortEvent};
 
 use crate::about_dialog;
 use crate::address_book_dialog;
@@ -16,6 +16,7 @@ use crate::direwolf::{DirewolfProcess, DirewolfState};
 use crate::direwolf_dialog;
 use crate::help_dialog;
 use crate::incoming_beacons_dialog;
+use crate::keyboard_mode_dialog;
 use crate::log_view::LogView;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
@@ -102,6 +103,11 @@ pub struct Ui {
     /// (`beacon-lit` CSS class) when a new beacon is detected, cleared the
     /// next time the dialog is actually opened.
     beacon_button: gtk::Button,
+    /// Header icon that opens the Mailbox window (left-click) or its
+    /// Settings (right-click) -- green while enabled, orange (taking
+    /// priority) while an unread message exists. See
+    /// `Ui::refresh_mailbox_button`.
+    mailbox_button: gtk::Button,
     /// Ports that have received `PortConnected` and not yet a matching
     /// `PortDisconnected` -- lets `PortError` tell a genuine connect failure
     /// (never confirmed) apart from a non-fatal error on an already-live
@@ -126,7 +132,23 @@ pub struct Ui {
     bottom_ports_snapshot: RefCell<Vec<PortEntry>>,
     dial_button: gtk::Button,
     phone_button: gtk::Button,
+    /// One-way hang-up button next to `phone_button` -- unlike it (which
+    /// toggles connect/disconnect), this only ever disconnects, so there's
+    /// always an unambiguous way to hang up regardless of what state
+    /// `phone_button` currently shows. Visible/sensitive only while the
+    /// selected tab is live.
+    disconnect_button: gtk::Button,
     message_entry: gtk::Entry,
+    /// Stored (not just a local in `build_ui`) so `refresh_bottom_bar` can
+    /// gate its sensitivity on whether the ad-hoc unproto destination is
+    /// filled in.
+    send_button: gtk::Button,
+    /// The single periodic "available for keyboard-to-keyboard" beacon
+    /// timer -- reset in full by `reschedule_keyboard_mode_beacon`.
+    keyboard_mode_beacon_timer: RefCell<Option<glib::SourceId>>,
+    /// The mailbox's own periodic availability beacon timer -- reset in
+    /// full by `reschedule_mailbox_beacon`.
+    mailbox_beacon_timer: RefCell<Option<glib::SourceId>>,
 
     pub direwolf: Rc<DirewolfProcess>,
     pub window: adw::ApplicationWindow,
@@ -274,6 +296,83 @@ impl Ui {
         }
     }
 
+    /// (Re)schedule the single "available for keyboard-to-keyboard"
+    /// availability beacon, discarding any previous timer first. Call at
+    /// startup and again whenever keyboard-to-keyboard settings change (the
+    /// header button's own toggle, or its settings dialog's Save). No-op
+    /// (stops entirely) while disabled or with empty beacon text -- matches
+    /// the scheduled-beacon convention of never spamming a port that isn't
+    /// even up, checked fresh on every tick rather than once at schedule
+    /// time.
+    pub fn reschedule_keyboard_mode_beacon(self: &Rc<Self>) {
+        if let Some(source) = self.keyboard_mode_beacon_timer.borrow_mut().take() {
+            source.remove();
+        }
+        let (enabled, beacon_text, interval_secs, listen_ports) = {
+            let cfg = self.state.config.borrow();
+            (
+                cfg.keyboard_mode.enabled,
+                cfg.keyboard_mode.beacon_text.clone(),
+                cfg.keyboard_mode.beacon_interval_secs,
+                cfg.keyboard_mode.listen_ports.clone(),
+            )
+        };
+        if !enabled || beacon_text.trim().is_empty() {
+            return;
+        }
+        let ui = self.clone();
+        let source = glib::source::timeout_add_seconds_local(interval_secs.max(1), move || {
+            // Re-read the live port list each tick (not just once at
+            // schedule time) so a port added later is picked up under the
+            // empty-list "any port" convention without needing a fresh
+            // Save. Ports that don't support unproto at all (e.g. a raw
+            // AX.25 socket) are silently skipped, same convention used
+            // everywhere else in this app for backend capability gaps.
+            let ports = ui.state.config.borrow().ports.clone();
+            for port in ports.iter().filter(|p| crate::keyboard_mode::listens_on(&listen_ports, &p.id)) {
+                if port_supports_unproto(&port.config) && ui.state.is_active(&port.id) {
+                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), beacon_text.clone().into_bytes());
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.keyboard_mode_beacon_timer.borrow_mut() = Some(source);
+    }
+
+    /// (Re)schedule the mailbox's own "available for messages" beacon,
+    /// discarding any previous timer first -- same shape as
+    /// `reschedule_keyboard_mode_beacon`, just keyed off `MailboxPrefs`
+    /// instead. Call at startup and again whenever the mailbox's enabled
+    /// state or settings change.
+    pub fn reschedule_mailbox_beacon(self: &Rc<Self>) {
+        if let Some(source) = self.mailbox_beacon_timer.borrow_mut().take() {
+            source.remove();
+        }
+        let (enabled, beacon_text, interval_secs, listen_ports) = {
+            let cfg = self.state.config.borrow();
+            (
+                cfg.mailbox.enabled,
+                cfg.mailbox.beacon_text.clone(),
+                cfg.mailbox.beacon_interval_secs,
+                cfg.mailbox.listen_ports.clone(),
+            )
+        };
+        if !enabled || beacon_text.trim().is_empty() {
+            return;
+        }
+        let ui = self.clone();
+        let source = glib::source::timeout_add_seconds_local(interval_secs.max(1), move || {
+            let ports = ui.state.config.borrow().ports.clone();
+            for port in ports.iter().filter(|p| crate::keyboard_mode::listens_on(&listen_ports, &p.id)) {
+                if port_supports_unproto(&port.config) && ui.state.is_active(&port.id) {
+                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), beacon_text.clone().into_bytes());
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.mailbox_beacon_timer.borrow_mut() = Some(source);
+    }
+
     /// Create a new connected-session tab (from the dial dialog), fixed at
     /// this identity for its whole lifetime. `connect` issues the actual
     /// dial immediately; otherwise the tab opens disconnected showing
@@ -363,13 +462,16 @@ impl Ui {
             return;
         };
 
-        let chip_root = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        chip_root.add_css_class("frame");
-        chip_root.set_margin_start(2);
-        chip_root.set_margin_end(2);
+        // Sleeker than a boxed `.frame` card per chip -- a plain row with a
+        // thin straight-line separator (`.tab-chip`, see `apply_base_css`)
+        // and tightly-padded flat buttons (`.tab-chip-button`), narrow
+        // rather than bulky.
+        let chip_root = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        chip_root.add_css_class("tab-chip");
 
         let click_area = gtk::Button::new();
         click_area.add_css_class("flat");
+        click_area.add_css_class("tab-chip-button");
         let title_label = gtk::Label::new(Some(&title_text));
         let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         title_box.append(&pin_toggle);
@@ -385,6 +487,7 @@ impl Ui {
 
         let close_button = gtk::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
+        close_button.add_css_class("tab-chip-button");
         {
             let ui = self.clone();
             close_button.connect_clicked(move |_| {
@@ -454,9 +557,11 @@ impl Ui {
     }
 
     /// Reflects whether a tab is currently expanded/selected: swaps the
-    /// dial/minimize icon, shows/hides the phone-handset button, and
-    /// switches Node/Via/Port between "ad-hoc unproto compose" (editable)
-    /// and "this tab's fixed identity" (read-only display).
+    /// dial/minimize icon, shows/hides the phone-handset button, and hides
+    /// Node/Via/Port entirely (not just disables them) once a tab is
+    /// selected -- they're the ad-hoc unproto compose destination, not a
+    /// read-only mirror of a connected tab's already-fixed identity, so
+    /// they have no reason to be visible while one is selected at all.
     fn refresh_bottom_bar(&self) {
         let tabs = self.tabs.borrow();
         match self.selected_tab.get().and_then(|id| tabs.get(&id)) {
@@ -464,45 +569,60 @@ impl Ui {
                 self.dial_button.set_icon_name("pan-down-symbolic");
                 self.dial_button.set_tooltip_text(Some("Minimize"));
                 self.phone_button.set_visible(true);
+                self.disconnect_button.set_visible(true);
                 self.refresh_phone_button(tab);
-                self.bottom_node_entry.set_text(&tab.node);
-                self.bottom_via_entry.set_text(&tab.via_raw);
-                if let Some(idx) = self.bottom_ports_snapshot.borrow().iter().position(|p| p.id == tab.port.id) {
-                    self.bottom_port_dropdown.set_selected(idx as u32);
-                }
-                self.bottom_node_entry.set_sensitive(false);
-                self.bottom_via_entry.set_sensitive(false);
-                self.bottom_port_dropdown.set_sensitive(false);
+                self.bottom_node_entry.set_visible(false);
+                self.bottom_via_entry.set_visible(false);
+                self.bottom_port_dropdown.set_visible(false);
                 self.message_entry.set_placeholder_text(Some("Type and press Enter\u{2026}"));
             }
             None => {
                 self.dial_button.set_icon_name("list-add-symbolic");
                 self.dial_button.set_tooltip_text(Some("Dial\u{2026}"));
                 self.phone_button.set_visible(false);
+                self.disconnect_button.set_visible(false);
                 // Clear any node/via left behind by whichever tab was
                 // selected before -- these fields are ad-hoc unproto entry
                 // now, not a read-only mirror of a tab, so a stale callsign
                 // here would otherwise look like a real destination.
                 self.bottom_node_entry.set_text("");
                 self.bottom_via_entry.set_text("");
-                self.bottom_node_entry.set_sensitive(true);
-                self.bottom_via_entry.set_sensitive(true);
-                self.bottom_port_dropdown.set_sensitive(true);
+                self.bottom_node_entry.set_visible(true);
+                self.bottom_via_entry.set_visible(true);
+                self.bottom_port_dropdown.set_visible(true);
                 self.message_entry.set_placeholder_text(Some("Unproto message\u{2026}"));
             }
         }
+        self.refresh_send_button_sensitivity();
+    }
+
+    /// Send is only ever blocked in the ad-hoc unproto compose mode (no tab
+    /// selected), where a destination is required but easy to forget --
+    /// once a tab is selected, Node is a read-only display of that tab's
+    /// already-fixed identity and Send always stays enabled.
+    fn refresh_send_button_sensitivity(&self) {
+        let sensitive = self.selected_tab.get().is_some() || !self.bottom_node_entry.text().trim().is_empty();
+        self.send_button.set_sensitive(sensitive);
     }
 
     /// Recolor/relabel the phone-handset button for `tab`'s current connect
-    /// state — same explicit CSS-class-swap pattern as the Direwolf button.
+    /// state — green (ready to connect) while disconnected, red (ready to
+    /// disconnect) while connected, per explicit request; same explicit
+    /// CSS-class-swap pattern as the Direwolf button. Also gates the
+    /// dedicated one-way `disconnect_button` next to it, sensitive only
+    /// while there's actually a live connection to hang up.
     fn refresh_phone_button(&self, tab: &SessionTab) {
-        self.phone_button.remove_css_class("direwolf-running");
-        if tab.conn_id.get().is_some() {
-            self.phone_button.add_css_class("direwolf-running");
+        self.phone_button.remove_css_class("state-success");
+        self.phone_button.remove_css_class("state-destructive");
+        let connected = tab.conn_id.get().is_some();
+        if connected {
+            self.phone_button.add_css_class("state-destructive");
             self.phone_button.set_tooltip_text(Some("Disconnect"));
         } else {
+            self.phone_button.add_css_class("state-success");
             self.phone_button.set_tooltip_text(Some("Connect"));
         }
+        self.disconnect_button.set_sensitive(connected);
     }
 
     /// The phone-handset button: connect or disconnect whichever tab is
@@ -573,7 +693,7 @@ impl Ui {
     /// Send the selected tab's input over its live connection.
     fn send_tab_connected(&self, tab: &SessionTab, text: &str) {
         let mut bytes = text.to_string().into_bytes();
-        bytes.push(b'\n');
+        bytes.extend_from_slice(line_ending(&tab.port.config));
         if let Some(conn_id) = tab.conn_id.get() {
             if let Some(handle) = self.state.active.borrow().get(&tab.port.id) {
                 let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
@@ -584,7 +704,7 @@ impl Ui {
             // it up there.
             if port_supports_connect(&tab.port.config) {
                 tab.append_sent_line(text);
-                self.monitor.append_line(&tab.port.id, &format!("[{}] TX > {}: {text}", tab.port.name, tab.node));
+                self.monitor.append_line(&tab.port.id, &format!("[{}] TX > {}: {text}", tab.port.name, tab.node), false);
                 self.refresh_status_bar();
             }
         }
@@ -625,7 +745,7 @@ impl Ui {
             });
         }
         let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
-        self.monitor.append_line(&port.id, &format!("[{}] TX unproto > {dest}{via_suffix}: {text}", port.name));
+        self.monitor.append_line(&port.id, &format!("[{}] TX unproto > {dest}{via_suffix}: {text}", port.name), true);
     }
 
     /// Send arbitrary text over a tab's live connection on the mailbox's
@@ -658,6 +778,7 @@ impl Ui {
             drop(cfg);
             drop(state_slot);
             self.state.save_config();
+            self.refresh_mailbox_button();
             if !response.is_empty() {
                 self.send_tab_text(tab, port_id, &response);
             }
@@ -820,13 +941,19 @@ impl Ui {
                 }
             }
             PortEvent::Monitor { line, from, to, message } => {
-                self.monitor.append_line(port_id, &format!("[{port_id}] {line}"));
+                // `from`/`to`/`message` are `Some` together only for a
+                // genuine received UI frame (see `PortEvent::Monitor`'s own
+                // doc comment); our own sent unproto lines set them to
+                // `None` instead but are tagged "[unproto TX]" in `line` --
+                // both count as "unproto" for the header's "UI" filter.
+                let is_unproto = from.is_some() || line.contains("[unproto TX]");
+                self.monitor.append_line(port_id, &format!("[{port_id}] {line}"), is_unproto);
                 if let (Some(from), Some(to), Some(message)) = (from, to, message) {
                     self.maybe_notify_directed(port_id, &from, &to, &message, &line);
                     self.maybe_detect_beacon(port_id, &from, &to, &message);
                 }
             }
-            PortEvent::ConnectionOpened { id, label } => {
+            PortEvent::ConnectionOpened { id, label, to } => {
                 let needs_node =
                     find_entry(&self.state.config.borrow(), port_id).map(|e| port_supports_connect(&e.config)).unwrap_or(false);
                 let pending_key =
@@ -848,13 +975,64 @@ impl Ui {
                     tab.append_status_line("Connected");
 
                     if needs_node && is_new_incoming {
-                        // An unsolicited connect while the mailbox is enabled
-                        // is answered automatically instead of waiting for a
-                        // human to type back.
-                        if self.state.config.borrow().mailbox.enabled {
+                        // An unsolicited connect can be auto-answered by
+                        // either keyboard-to-keyboard mode (a live tab a
+                        // human then types into) or the mailbox (a BBS-style
+                        // command prompt) -- never both. Keyboard-to-keyboard
+                        // takes priority when both would match the same
+                        // connect (e.g. the mailbox's `respond_call` left
+                        // blank/set to the same callsign), since it's the
+                        // more "a human is actually here right now" of the
+                        // two. Each has its own port allow-list (empty means
+                        // "any connect-capable port", each feature's
+                        // original behavior before per-port filtering
+                        // existed).
+                        let (k2k_enabled, k2k_identity, k2k_welcome, k2k_listen_ports) = {
+                            let cfg = self.state.config.borrow();
+                            let node_call = cfg.keyboard_mode.node_call.trim().to_uppercase();
+                            let identity =
+                                if node_call.is_empty() { cfg.ui.default_call.clone().unwrap_or_default() } else { node_call };
+                            (
+                                cfg.keyboard_mode.enabled,
+                                identity,
+                                cfg.keyboard_mode.welcome_message.clone(),
+                                cfg.keyboard_mode.listen_ports.clone(),
+                            )
+                        };
+                        let (mb_enabled, mb_respond_call, mb_intro, mb_listen_ports) = {
+                            let cfg = self.state.config.borrow();
+                            (
+                                cfg.mailbox.enabled,
+                                cfg.mailbox.respond_call.trim().to_uppercase(),
+                                cfg.mailbox.intro_message.clone(),
+                                cfg.mailbox.listen_ports.clone(),
+                            )
+                        };
+
+                        if crate::keyboard_mode::should_answer(k2k_enabled, &k2k_identity, to.as_deref())
+                            && crate::keyboard_mode::listens_on(&k2k_listen_ports, port_id)
+                        {
+                            tab.append_status_line("Keyboard-to-keyboard session");
+                            let welcome = if k2k_welcome.trim().is_empty() {
+                                crate::keyboard_mode::default_welcome(&k2k_identity)
+                            } else {
+                                format!("{}\n", k2k_welcome.trim_end())
+                            };
+                            self.send_tab_text(tab, port_id, &welcome);
+                        } else if crate::mailbox::should_answer(mb_enabled, &mb_respond_call, to.as_deref())
+                            && crate::keyboard_mode::listens_on(&mb_listen_ports, port_id)
+                        {
                             *tab.mailbox_state.borrow_mut() = Some(crate::mailbox::MailboxState::Command);
-                            let my_call = self.state.config.borrow().ui.default_call.clone().unwrap_or_else(|| "MAILBOX".to_string());
-                            self.send_tab_text(tab, port_id, &crate::mailbox::welcome_banner(&my_call));
+                            // `should_answer` above already guarantees
+                            // `mb_respond_call` is non-empty -- the mailbox
+                            // never falls back to the general Profile
+                            // callsign, unlike keyboard-to-keyboard.
+                            let banner = if mb_intro.trim().is_empty() {
+                                crate::mailbox::welcome_banner(&mb_respond_call)
+                            } else {
+                                format!("{}\n", mb_intro.trim_end())
+                            };
+                            self.send_tab_text(tab, port_id, &banner);
                         }
                         // An incoming connection is inherently "directed at
                         // me" (that's what accepting it means), so this
@@ -935,8 +1113,9 @@ impl Ui {
     /// confirmed open).
     fn send_tab_text_raw(&self, port_id: &str, conn_id: ConnectionId, text: &str) {
         if let Some(handle) = self.state.active.borrow().get(port_id) {
+            let ending = find_entry(&self.state.config.borrow(), port_id).map(|e| line_ending(&e.config)).unwrap_or(b"\n");
             let mut bytes = text.as_bytes().to_vec();
-            bytes.push(b'\n');
+            bytes.extend_from_slice(ending);
             let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
         }
     }
@@ -1004,6 +1183,30 @@ impl Ui {
         self.beacon_button.remove_css_class("beacon-lit");
     }
 
+    /// Recolor the header's Mailbox button from current config/message
+    /// state (see `mailbox::status_class` for the green/orange priority
+    /// rule). Call after anything that could change either: the mailbox's
+    /// own enable toggle, a message being saved or deleted, or at startup.
+    pub fn refresh_mailbox_button(&self) {
+        self.mailbox_button.remove_css_class("state-success");
+        self.mailbox_button.remove_css_class("state-warning");
+        let (enabled, has_unread) = {
+            let cfg = self.state.config.borrow();
+            (cfg.mailbox.enabled, cfg.mailbox.messages.iter().any(|m| !m.read))
+        };
+        if let Some(class) = crate::mailbox::status_class(enabled, has_unread) {
+            self.mailbox_button.add_css_class(class);
+        }
+        let tooltip = if has_unread {
+            "Mailbox: new message(s) \u{2014} click to open, right-click for settings"
+        } else if enabled {
+            "Mailbox: on \u{2014} click to open, right-click for settings"
+        } else {
+            "Mailbox: off \u{2014} click to open, right-click for settings"
+        };
+        self.mailbox_button.set_tooltip_text(Some(tooltip));
+    }
+
     /// Refresh the status bar's connect-state (left) and packet/byte stats
     /// (right) for whichever tab is currently selected. Call this whenever
     /// the selection changes, connects/disconnects, or sends/receives —
@@ -1066,15 +1269,31 @@ pub fn apply_font(font_desc: &str) {
 /// did not).
 fn apply_base_css() {
     let provider = gtk::CssProvider::new();
+    // Every colored-background state class pairs its background with the
+    // matching libadwaita `*_fg_color` so the icon/text on top stays
+    // readable regardless of theme -- `@success_color`/`@warning_color`/
+    // `@accent_color` alone (the previous background-only rules) are meant
+    // for tinting an icon/text sitting on the *default* button background,
+    // not for use as a background themselves, which is what made these
+    // states low-contrast before. `.state-success`/`.state-destructive` are
+    // new shared classes for widgets added after this fix (the
+    // keyboard-to-keyboard header button, the connect/disconnect buttons)
+    // rather than renaming the existing per-widget class names below and
+    // risking a missed call site.
     provider.load_from_string(
         ".pin-toggle.pin-pinned { color: @accent_color; } \
          .notify-rule-toggle.notify-rule-active { background-color: @accent_color; } \
-         .direwolf-running { background-color: @success_color; } \
-         .direwolf-failed { background-color: @warning_color; } \
-         .favorite-port-button.favorite-port-connected { background-color: @success_color; } \
-         .favorite-port-button.favorite-port-failed { background-color: @warning_color; } \
-         .beacon-lit { background-color: @accent_color; } \
-         .log-toggle-active { background-color: @accent_color; }",
+         .direwolf-running { background-color: @success_bg_color; color: @success_fg_color; } \
+         .direwolf-failed { background-color: @warning_bg_color; color: @warning_fg_color; } \
+         .favorite-port-button.favorite-port-connected { background-color: @success_bg_color; color: @success_fg_color; } \
+         .favorite-port-button.favorite-port-failed { background-color: @warning_bg_color; color: @warning_fg_color; } \
+         .beacon-lit { background-color: @accent_bg_color; color: @accent_fg_color; } \
+         .log-toggle-active { background-color: @accent_bg_color; color: @accent_fg_color; } \
+         .state-success { background-color: @success_bg_color; color: @success_fg_color; } \
+         .state-destructive { background-color: @error_bg_color; color: @error_fg_color; } \
+         .state-warning { background-color: @warning_bg_color; color: @warning_fg_color; } \
+         .tab-chip { border-right: 1px solid @borders; padding: 0 2px; } \
+         .tab-chip-button { padding: 2px 6px; min-height: 0; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -1132,6 +1351,33 @@ fn refresh_direwolf_button(button: &gtk::Button, direwolf: &DirewolfProcess) {
         }
     };
     button.set_tooltip_text(Some(tooltip));
+}
+
+fn refresh_keyboard_mode_button(button: &gtk::Button, enabled: bool) {
+    button.remove_css_class("state-success");
+    let tooltip = if enabled {
+        button.add_css_class("state-success");
+        "Keyboard-to-Keyboard: on \u{2014} click to turn off, right-click for settings"
+    } else {
+        "Keyboard-to-Keyboard: off \u{2014} click to turn on, right-click for settings"
+    };
+    button.set_tooltip_text(Some(tooltip));
+}
+
+/// The line ending to append when sending a line of text over a connected
+/// session. Telnet gets a proper CRLF -- BPQ nodes and similar raw-socket
+/// telnet BBS/node servers are commonly strict RFC854 NVT parsers that
+/// never recognize a bare LF as a completed line (this was the actual cause
+/// of "my username isn't accepted" against a BPQ node: the line was sent,
+/// just never recognized as finished). Every other backend (SSH's own PTY,
+/// AGWPE, AX.25) keeps the existing bare-LF behavior, already live-verified
+/// working -- there's no reason to risk regressing it for a Telnet-specific
+/// bug.
+fn line_ending(config: &PortConfig) -> &'static [u8] {
+    match config {
+        PortConfig::Telnet { .. } => b"\r\n",
+        _ => b"\n",
+    }
 }
 
 fn describe_state(state: ConnState) -> &'static str {
@@ -1247,6 +1493,10 @@ pub fn build_ui(app: &adw::Application) {
     let phone_button = gtk::Button::from_icon_name("call-start-symbolic");
     phone_button.add_css_class("flat");
     phone_button.set_visible(false);
+    let disconnect_button = gtk::Button::from_icon_name("call-stop-symbolic");
+    disconnect_button.add_css_class("flat");
+    disconnect_button.set_tooltip_text(Some("Disconnect"));
+    disconnect_button.set_visible(false);
     let message_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Unproto message\u{2026}").build();
     let send_button = gtk::Button::with_label("Send");
     send_button.add_css_class("suggested-action");
@@ -1261,6 +1511,7 @@ pub fn build_ui(app: &adw::Application) {
     bottom_bar.append(&bottom_via_entry);
     bottom_bar.append(&bottom_port_dropdown);
     bottom_bar.append(&phone_button);
+    bottom_bar.append(&disconnect_button);
     bottom_bar.append(&message_entry);
     bottom_bar.append(&send_button);
 
@@ -1346,6 +1597,13 @@ pub fn build_ui(app: &adw::Application) {
     // from anywhere event handling happens, not just from this setup code.
     let beacon_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
 
+    // Same reasoning as `beacon_button`: created here so it can be stored on
+    // `Ui` and recolored from `refresh_mailbox_button` wherever config or
+    // the message list changes (its own click, the Mailbox window's Enable
+    // button, a message arriving/being deleted), not just from this setup
+    // code.
+    let mailbox_button = gtk::Button::from_icon_name("mail-unread-symbolic");
+
     let ui = Rc::new(Ui {
         state,
         monitor,
@@ -1369,6 +1627,7 @@ pub fn build_ui(app: &adw::Application) {
         favorites_bar,
         favorite_buttons: RefCell::new(HashMap::new()),
         beacon_button: beacon_button.clone(),
+        mailbox_button: mailbox_button.clone(),
         confirmed_ports: RefCell::new(HashSet::new()),
         established_conns: RefCell::new(HashSet::new()),
         bottom_node_entry,
@@ -1377,7 +1636,11 @@ pub fn build_ui(app: &adw::Application) {
         bottom_ports_snapshot: RefCell::new(Vec::new()),
         dial_button: dial_button.clone(),
         phone_button: phone_button.clone(),
+        disconnect_button: disconnect_button.clone(),
         message_entry: message_entry.clone(),
+        send_button: send_button.clone(),
+        keyboard_mode_beacon_timer: RefCell::new(None),
+        mailbox_beacon_timer: RefCell::new(None),
         direwolf: DirewolfProcess::new(),
         window: window.clone(),
     });
@@ -1405,6 +1668,14 @@ pub fn build_ui(app: &adw::Application) {
     }
     {
         let ui = ui.clone();
+        disconnect_button.connect_clicked(move |_| {
+            if let Some(tab_id) = ui.selected_tab.get() {
+                ui.disconnect_tab(tab_id);
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
         message_entry.connect_activate(move |_| {
             ui.activate_message_entry();
         });
@@ -1415,12 +1686,30 @@ pub fn build_ui(app: &adw::Application) {
             ui.activate_message_entry();
         });
     }
+    {
+        // Only meaningful in the ad-hoc unproto compose mode (no tab
+        // selected) -- `refresh_bottom_bar` re-asserts sensitivity whenever
+        // that mode changes, so a stale disabled state doesn't leak into a
+        // freshly-selected tab.
+        let ui = ui.clone();
+        let bottom_node_entry = ui.bottom_node_entry.clone();
+        bottom_node_entry.connect_changed(move |_| {
+            ui.refresh_send_button_sensitivity();
+        });
+    }
 
     {
         let ui = ui.clone();
         let filter_entry = ui.monitor.filter_entry.clone();
         filter_entry.connect_changed(move |entry| {
             ui.monitor.set_filter(&entry.text());
+        });
+    }
+    {
+        let ui = ui.clone();
+        let unproto_only_check = ui.monitor.unproto_only_check.clone();
+        unproto_only_check.connect_toggled(move |check| {
+            ui.monitor.set_unproto_only(check.is_active());
         });
     }
 
@@ -1529,16 +1818,58 @@ pub fn build_ui(app: &adw::Application) {
     // Quick-access icon button for the Mailbox dialog, same tier of
     // frequent-use action as Direwolf/Incoming Beacons/Notified Packets, so
     // it lives in the header instead of behind the hamburger menu.
-    let mailbox_button = gtk::Button::from_icon_name("mail-unread-symbolic");
+    // Left-click opens the Mailbox window; right-click jumps straight to
+    // its Settings, same interaction shape as Direwolf/keyboard-to-keyboard.
     mailbox_button.add_css_class("flat");
-    mailbox_button.set_tooltip_text(Some("Mailbox"));
+    ui.refresh_mailbox_button();
     {
         let ui = ui.clone();
         mailbox_button.connect_clicked(move |_| {
             mailbox_dialog::show(&ui);
         });
     }
+    {
+        let ui = ui.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, _, _| {
+            mailbox_dialog::show_settings(&ui, &ui.window);
+        });
+        mailbox_button.add_controller(gesture);
+    }
     header_start.append(&mailbox_button);
+
+    // Incoming keyboard-to-keyboard mode -- placed left of the Direwolf
+    // button, same interaction shape: left-click toggles enabled/disabled
+    // (green via `state-success` while on), right-click opens its settings
+    // (welcome message, availability beacon, listen ports).
+    let keyboard_mode_button = gtk::Button::from_icon_name("input-keyboard-symbolic");
+    keyboard_mode_button.add_css_class("flat");
+    refresh_keyboard_mode_button(&keyboard_mode_button, ui.state.config.borrow().keyboard_mode.enabled);
+    {
+        let ui = ui.clone();
+        let button_for_recolor = keyboard_mode_button.clone();
+        keyboard_mode_button.connect_clicked(move |_| {
+            let enabled = {
+                let mut cfg = ui.state.config.borrow_mut();
+                cfg.keyboard_mode.enabled = !cfg.keyboard_mode.enabled;
+                cfg.keyboard_mode.enabled
+            };
+            ui.state.save_config();
+            refresh_keyboard_mode_button(&button_for_recolor, enabled);
+            ui.reschedule_keyboard_mode_beacon();
+        });
+    }
+    {
+        let ui = ui.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, _, _| {
+            keyboard_mode_dialog::show_settings(&ui);
+        });
+        keyboard_mode_button.add_controller(gesture);
+    }
+    header_end.append(&keyboard_mode_button);
 
     // Modem-style handset for the optional managed Direwolf process — icon
     // only, colored via CSS class to reflect state (see
@@ -1607,6 +1938,7 @@ pub fn build_ui(app: &adw::Application) {
     header_start.append(&notified_packets_button);
     header_start.append(&ui.monitor.filter_entry);
     header_start.append(&ui.monitor.port_filter_button);
+    header_start.append(&ui.monitor.unproto_only_check);
     header_end.prepend(&ui.favorites_bar);
 
     let log_toggle_button = gtk::ToggleButton::builder().icon_name("utilities-terminal-symbolic").build();
@@ -1656,4 +1988,31 @@ pub fn build_ui(app: &adw::Application) {
     }
 
     ui.reschedule_beacons();
+    ui.reschedule_keyboard_mode_beacon();
+    ui.reschedule_mailbox_beacon();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_ending_is_crlf_for_telnet_only() {
+        assert_eq!(line_ending(&PortConfig::Telnet { host: "bpq.example".to_string(), port: 8010 }), b"\r\n");
+        assert_eq!(
+            line_ending(&PortConfig::Ssh { host: "h".to_string(), port: 22, user: "u".to_string() }),
+            b"\n"
+        );
+        assert_eq!(line_ending(&PortConfig::Ax25RawSocket { device: "ax0".to_string() }), b"\n");
+        assert_eq!(
+            line_ending(&PortConfig::Agwpe {
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+                radio_port: 0,
+                my_call: "N0CALL".to_string(),
+                login: None,
+            }),
+            b"\n"
+        );
+    }
 }

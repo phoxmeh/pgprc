@@ -27,7 +27,12 @@ pub enum PortEvent {
     /// clean notification bodies and detect beacons without re-parsing
     /// `line`.
     Monitor { line: String, from: Option<String>, to: Option<String>, message: Option<String> },
-    ConnectionOpened { id: ConnectionId, label: String },
+    /// `to` is the destination callsign the connect request actually
+    /// carried, when the backend knows it (e.g. AGWPE's `call_to`, or a raw
+    /// AX.25 socket's bound local callsign) — used to filter the personal
+    /// mailbox's auto-responder down to one specific callsign instead of
+    /// answering every unsolicited connect on the port.
+    ConnectionOpened { id: ConnectionId, label: String, to: Option<String> },
     ConnectionClosed { id: ConnectionId },
     ConnState { id: ConnectionId, state: ConnState },
     Data { id: ConnectionId, bytes: Vec<u8> },

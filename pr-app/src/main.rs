@@ -10,6 +10,8 @@ mod export;
 mod help_dialog;
 mod highlight;
 mod incoming_beacons_dialog;
+mod keyboard_mode;
+mod keyboard_mode_dialog;
 mod log_view;
 mod mailbox;
 mod mailbox_dialog;

@@ -23,6 +23,12 @@ struct StoredLine {
     prefixed: String,
     /// The sanitized content alone, for highlighting offset math.
     content: String,
+    /// Whether this line is a genuine unproto/UI packet (received or our
+    /// own sent), for the "UI" filter checkbox -- computed once at the
+    /// `PortEvent::Monitor` call site (it already knows this from the
+    /// event's structured `from`/`to`/`message` fields), not re-derived
+    /// from the formatted text here.
+    is_unproto: bool,
 }
 
 /// The current text filter: the raw (lowercased) text, plus a compiled regex
@@ -46,12 +52,16 @@ pub struct MonitorView {
     pub container: gtk::Box,
     pub filter_entry: gtk::Entry,
     pub port_filter_button: gtk::MenuButton,
+    /// "UI" checkbox, right of the port filter -- restricts the visible
+    /// buffer to unproto/UI packets only when checked. See `set_unproto_only`.
+    pub unproto_only_check: gtk::CheckButton,
     port_filter_popover: gtk::Popover,
     port_checks: RefCell<HashMap<String, gtk::CheckButton>>,
     select_all_check: gtk::CheckButton,
     /// Ports the user has unchecked in the popover; empty (the default)
     /// means every port is shown.
     disabled_ports: RefCell<HashSet<String>>,
+    unproto_only: Cell<bool>,
     buffer: gtk::TextBuffer,
     text_view: gtk::TextView,
     show_timestamps: Cell<bool>,
@@ -104,6 +114,9 @@ impl MonitorView {
         let select_all_check = gtk::CheckButton::with_label("Select All");
         select_all_check.set_active(true);
 
+        let unproto_only_check = gtk::CheckButton::with_label("UI");
+        unproto_only_check.set_tooltip_text(Some("Show only unproto (UI) packets"));
+
         let container = gtk::Box::new(gtk::Orientation::Vertical, 4);
         container.append(&widget);
 
@@ -111,10 +124,12 @@ impl MonitorView {
             container,
             filter_entry,
             port_filter_button,
+            unproto_only_check,
             port_filter_popover,
             port_checks: RefCell::new(HashMap::new()),
             select_all_check,
             disabled_ports: RefCell::new(HashSet::new()),
+            unproto_only: Cell::new(false),
             buffer,
             text_view,
             show_timestamps: Cell::new(true),
@@ -212,7 +227,7 @@ impl MonitorView {
         self.select_all_check.set_active(all_enabled);
     }
 
-    pub fn append_line(&self, port_id: &str, line: &str) {
+    pub fn append_line(&self, port_id: &str, line: &str, is_unproto: bool) {
         // GTK's string marshaling panics on embedded NUL bytes; backend
         // data (e.g. AGWPE's null-padded text fields) can contain them.
         let sanitized = if line.contains('\0') { line.replace('\0', "") } else { line.to_string() };
@@ -228,7 +243,12 @@ impl MonitorView {
 
         {
             let mut lines = self.lines.borrow_mut();
-            lines.push(StoredLine { port_id: port_id.to_string(), prefixed: prefixed.clone(), content: sanitized.clone() });
+            lines.push(StoredLine {
+                port_id: port_id.to_string(),
+                prefixed: prefixed.clone(),
+                content: sanitized.clone(),
+                is_unproto,
+            });
             let max_lines = self.state.config.borrow().ui.monitor_buffer_lines as usize;
             if lines.len() > max_lines {
                 let excess = lines.len() - max_lines;
@@ -236,14 +256,24 @@ impl MonitorView {
             }
         }
 
-        if self.matches_filter(port_id, &prefixed) {
+        if self.matches_filter(port_id, &prefixed, is_unproto) {
             let highlighter = Highlighter::build(&self.state.config.borrow());
             self.render_line(&prefixed, &sanitized, &highlighter);
         }
     }
 
-    fn matches_filter(&self, port_id: &str, prefixed: &str) -> bool {
+    /// Restrict the visible buffer to unproto (UI) packets only -- the
+    /// header's "UI" checkbox next to the port filter.
+    pub fn set_unproto_only(&self, only: bool) {
+        self.unproto_only.set(only);
+        self.rerender();
+    }
+
+    fn matches_filter(&self, port_id: &str, prefixed: &str, is_unproto: bool) -> bool {
         if self.disabled_ports.borrow().contains(port_id) {
+            return false;
+        }
+        if self.unproto_only.get() && !is_unproto {
             return false;
         }
         let filter = self.filter.borrow();
@@ -277,7 +307,7 @@ impl MonitorView {
         let highlighter = Highlighter::build(&self.state.config.borrow());
         let lines = self.lines.borrow();
         for line in lines.iter() {
-            if self.matches_filter(&line.port_id, &line.prefixed) {
+            if self.matches_filter(&line.port_id, &line.prefixed, line.is_unproto) {
                 self.render_line(&line.prefixed, &line.content, &highlighter);
             }
         }

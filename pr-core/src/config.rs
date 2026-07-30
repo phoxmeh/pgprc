@@ -183,13 +183,115 @@ pub struct MailboxMessage {
 /// automatically by a small BBS-style command prompt instead of waiting for
 /// a human to type back. `messages` lives in its own `mailbox.toml` (see
 /// `AppConfig::load`/`save`), since it's data, not a preference — only
-/// `enabled` belongs in the general `config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// `enabled`/`respond_call`/`intro_message` belong in the general
+/// `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxPrefs {
     #[serde(default)]
     pub enabled: bool,
+    /// Only answer a connection addressed to this callsign (case-insensitive
+    /// match against the destination call the connect request actually
+    /// carried, not just whatever port it arrived on). Required to enable
+    /// the mailbox at all -- never falls back to any other configured
+    /// callsign (see `mailbox::should_answer`).
+    #[serde(default)]
+    pub respond_call: String,
+    /// Custom greeting sent on connect, in place of the generated
+    /// `mailbox::welcome_banner`. Empty falls back to the generated banner.
+    #[serde(default)]
+    pub intro_message: String,
+    /// Sent as a one-shot unproto frame (destination "CQ") on every enabled
+    /// listen port that supports unproto, every `beacon_interval_secs`,
+    /// while enabled. Empty means no beacon is sent, even while enabled.
+    #[serde(default)]
+    pub beacon_text: String,
+    #[serde(default = "default_mailbox_beacon_interval")]
+    pub beacon_interval_secs: u32,
+    /// Port ids to listen for unsolicited connections on. Empty means "any
+    /// connect-capable port", matching this feature's original behavior
+    /// before per-port filtering existed.
+    #[serde(default)]
+    pub listen_ports: Vec<String>,
     #[serde(skip)]
     pub messages: Vec<MailboxMessage>,
+}
+
+impl Default for MailboxPrefs {
+    fn default() -> Self {
+        MailboxPrefs {
+            enabled: false,
+            respond_call: String::new(),
+            intro_message: String::new(),
+            beacon_text: String::new(),
+            beacon_interval_secs: default_mailbox_beacon_interval(),
+            listen_ports: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+}
+
+fn default_mailbox_beacon_interval() -> u32 {
+    1200
+}
+
+/// Incoming keyboard-to-keyboard mode: when enabled, an unsolicited
+/// connection addressed to `node_call` opens a normal live session tab with
+/// a welcome message, for a human to type into directly -- unlike the
+/// mailbox, there's no command parser, and the tab behaves exactly like any
+/// manually-dialed one. Also drives a periodic "available for keyboard
+/// chat" beacon while enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyboardModePrefs {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The callsign this mode answers as -- deliberately independent of
+    /// both `UiPrefs.default_call` and the mailbox's own `respond_call`, so
+    /// the two auto-responders can run on different SSIDs of the same
+    /// station without one intercepting connects meant for the other.
+    /// Empty falls back to `UiPrefs.default_call`, for anyone who hasn't
+    /// set it explicitly. Note this only filters *incoming* connects and
+    /// picks the identity used in the welcome message -- the beacon and any
+    /// connected-mode replies still go out under whichever port sends
+    /// them, since AGWPE/AX.25 backends use one fixed callsign per port
+    /// (`PortConfig::Agwpe.my_call` / raw-socket's bound local call) for
+    /// every frame on it, not a per-feature override. For the beacon/
+    /// replies to genuinely appear as this callsign on the air, point
+    /// "Listen On" at a port whose own configured callsign is this one.
+    #[serde(default)]
+    pub node_call: String,
+    /// Sent on connect, in place of the generated
+    /// `keyboard_mode::default_welcome`. Empty falls back to the generated
+    /// greeting.
+    #[serde(default)]
+    pub welcome_message: String,
+    /// Sent as a one-shot unproto frame (destination "CQ") on every enabled
+    /// listen port that supports unproto, every `beacon_interval_secs`,
+    /// while enabled. Empty means no beacon is sent, even while enabled.
+    #[serde(default)]
+    pub beacon_text: String,
+    #[serde(default = "default_k2k_beacon_interval")]
+    pub beacon_interval_secs: u32,
+    /// Port ids to listen for unsolicited connections on (and to beacon
+    /// over). Empty means "any connect-capable port".
+    #[serde(default)]
+    pub listen_ports: Vec<String>,
+}
+
+impl Default for KeyboardModePrefs {
+    fn default() -> Self {
+        KeyboardModePrefs {
+            enabled: false,
+            node_call: String::new(),
+            welcome_message: String::new(),
+            beacon_text: String::new(),
+            beacon_interval_secs: default_k2k_beacon_interval(),
+            listen_ports: Vec::new(),
+        }
+    }
+}
+
+fn default_k2k_beacon_interval() -> u32 {
+    600
 }
 
 /// Preferences for optionally launching Direwolf as a managed child process
@@ -522,6 +624,8 @@ pub struct AppConfig {
     pub qso_log: Vec<QsoLogEntry>,
     #[serde(default)]
     pub mailbox: MailboxPrefs,
+    #[serde(default)]
+    pub keyboard_mode: KeyboardModePrefs,
     #[serde(default)]
     pub notify: NotifyPrefs,
     #[serde(skip)]

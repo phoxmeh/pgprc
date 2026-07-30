@@ -18,7 +18,6 @@ pub fn show(ui: &Rc<Ui>) {
 
     let current = ui.state.config.borrow().ui.clone();
     let current_hl = ui.state.config.borrow().highlighting.clone();
-    let current_mailbox_enabled = ui.state.config.borrow().mailbox.enabled;
     let current_notify = ui.state.config.borrow().notify.clone();
 
     // --- Profile: who you are, on every port you connect. Callsign lives
@@ -75,15 +74,9 @@ pub fn show(ui: &Rc<Ui>) {
 
     content.append(&qrz_group);
 
-    // --- Personal Mailbox ---
-    let mailbox_group = adw::PreferencesGroup::builder().title("Personal Mailbox").build();
-    let mailbox_enabled_row = adw::SwitchRow::builder()
-        .title("Enable Mailbox")
-        .subtitle("Answer unsolicited connections with a BBS-style prompt (local only)")
-        .active(current_mailbox_enabled)
-        .build();
-    mailbox_group.add(&mailbox_enabled_row);
-    content.append(&mailbox_group);
+    // --- Personal Mailbox: enable toggle, respond-from callsign, and intro
+    // message all live in the Mailbox window itself now (Header menu ->
+    // Mailbox), alongside the message list, instead of here. ---
 
     // --- Notifications: three independent toggles, since these track
     // genuinely different things -- your own traffic, a user-picked rule,
@@ -232,8 +225,6 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.highlighting.my_call_color = rgba_to_hex(&my_call_color_btn.rgba());
                 cfg.highlighting.ax25_command_color = rgba_to_hex(&ax25_color_btn.rgba());
                 cfg.highlighting.rules = rules.borrow().clone();
-
-                cfg.mailbox.enabled = mailbox_enabled_row.is_active();
 
                 cfg.notify.directed_enabled = notify_directed_row.is_active();
                 cfg.notify.custom_enabled = notify_custom_row.is_active();

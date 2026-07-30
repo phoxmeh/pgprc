@@ -54,7 +54,7 @@ impl PortRunner for SshRunner {
 
         let label = format!("{}@{}:{}", self.user, self.host, self.port);
         let _ = event_tx.send_blocking(PortEvent::PortConnected);
-        let _ = event_tx.send_blocking(PortEvent::ConnectionOpened { id: CONN_ID, label });
+        let _ = event_tx.send_blocking(PortEvent::ConnectionOpened { id: CONN_ID, label, to: None });
         let _ = event_tx.send_blocking(PortEvent::ConnState {
             id: CONN_ID,
             state: ConnState::Connected,

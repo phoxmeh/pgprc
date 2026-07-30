@@ -16,6 +16,40 @@ pub fn welcome_banner(my_call: &str) -> String {
     format!("{my_call} BBS. Commands: L)ist  R)ead <id>  S)end <call>  B)ye\n")
 }
 
+/// Whether an unsolicited incoming connection addressed to `to` should be
+/// auto-answered by the mailbox, given its enabled flag and the configured
+/// respond-from callsign. Case-insensitive exact match against the
+/// destination the connect request actually carried. A blank
+/// `respond_call` always declines -- the mailbox requires an explicit
+/// callsign of its own (never falling back to the general Profile
+/// callsign) and can't even be enabled without one (enforced in
+/// `mailbox_dialog`'s Enable button), so this is really just a defensive
+/// second check, not the primary guard.
+pub fn should_answer(enabled: bool, respond_call: &str, to: Option<&str>) -> bool {
+    if !enabled {
+        return false;
+    }
+    let respond_call = respond_call.trim();
+    if respond_call.is_empty() {
+        return false;
+    }
+    to.map(|t| t.eq_ignore_ascii_case(respond_call)).unwrap_or(false)
+}
+
+/// Which shared color-state CSS class (if any) the mailbox's controls
+/// should show: an unread message is more urgent/attention-grabbing than
+/// merely "enabled", so it takes priority over the plain enabled/green
+/// state.
+pub fn status_class(enabled: bool, has_unread: bool) -> Option<&'static str> {
+    if has_unread {
+        Some("state-warning")
+    } else if enabled {
+        Some("state-success")
+    } else {
+        None
+    }
+}
+
 fn prompt() -> String {
     "Cmd: ".to_string()
 }
@@ -175,5 +209,44 @@ mod tests {
         let (resp, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "ZZZ", TS);
         assert!(!close);
         assert!(resp.contains("Unknown command"));
+    }
+
+    #[test]
+    fn should_answer_respects_enabled_flag() {
+        assert!(!should_answer(false, "", Some("KD3BFP-5")));
+        assert!(!should_answer(false, "KD3BFP-5", Some("KD3BFP-5")));
+    }
+
+    #[test]
+    fn should_answer_declines_with_no_respond_call() {
+        // The mailbox never falls back to any general/default callsign --
+        // it requires its own explicit one (also enforced up front by the
+        // Enable button, which refuses to turn on without one).
+        assert!(!should_answer(true, "", Some("KD3BFP-1")));
+        assert!(!should_answer(true, "", None));
+    }
+
+    #[test]
+    fn should_answer_only_matches_configured_callsign() {
+        // Exact scenario from the feature request: mailbox configured to
+        // respond as KD3BFP-5 must not answer a connect addressed to a
+        // different SSID of the same base callsign.
+        assert!(should_answer(true, "KD3BFP-5", Some("KD3BFP-5")));
+        assert!(!should_answer(true, "KD3BFP-5", Some("KD3BFP-6")));
+        // Case-insensitive, and tolerant of incidental whitespace in the
+        // configured value.
+        assert!(should_answer(true, " kd3bfp-5 ", Some("KD3BFP-5")));
+        // No known destination (a backend that doesn't report `to`) can't be
+        // confirmed as addressed to the configured call, so it's declined
+        // rather than assumed.
+        assert!(!should_answer(true, "KD3BFP-5", None));
+    }
+
+    #[test]
+    fn status_class_prioritizes_unread_over_enabled() {
+        assert_eq!(status_class(false, false), None);
+        assert_eq!(status_class(true, false), Some("state-success"));
+        assert_eq!(status_class(false, true), Some("state-warning"));
+        assert_eq!(status_class(true, true), Some("state-warning"));
     }
 }

@@ -29,6 +29,7 @@ impl PortRunner for TelnetRunner {
         let _ = event_tx.send_blocking(PortEvent::ConnectionOpened {
             id: CONN_ID,
             label: addr.clone(),
+            to: None,
         });
         let _ = event_tx.send_blocking(PortEvent::ConnState {
             id: CONN_ID,

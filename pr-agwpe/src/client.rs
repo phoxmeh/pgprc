@@ -119,6 +119,7 @@ impl PortRunner for AgwpeRunner {
                     let _ = event_tx.send_blocking(PortEvent::ConnectionOpened {
                         id,
                         label: remote.clone(),
+                        to: Some(my_call.clone()),
                     });
                     let _ = event_tx.send_blocking(PortEvent::ConnState {
                         id,
@@ -247,7 +248,7 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             let text = text_from_bytes(&frame.data);
             emit_heard(events, &remote)?;
             events
-                .send_blocking(PortEvent::ConnectionOpened { id, label: remote })
+                .send_blocking(PortEvent::ConnectionOpened { id, label: remote, to: Some(frame.call_to.clone()) })
                 .map_err(|_| ())?;
             events
                 .send_blocking(PortEvent::ConnState { id, state: ConnState::Connected })
