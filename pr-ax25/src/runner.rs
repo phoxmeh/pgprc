@@ -35,6 +35,13 @@ impl PortRunner for Ax25RawSocketRunner {
         let next_id = Arc::new(AtomicU64::new(1));
         let mut readers = Vec::new();
 
+        // Best-effort, same reasoning as the listener below: a `SOCK_DGRAM`
+        // bind alongside the SEQPACKET listener/connections on the same
+        // callsign might not be permitted on every axports/kernel setup, so
+        // a failure here just means unproto sending isn't available on this
+        // port, not a fatal port error.
+        let unproto_socket = RawAx25Socket::bind_dgram(&local_call).ok();
+
         // Best-effort: not every axports/kernel setup necessarily allows a
         // separate listening bind alongside outgoing sockets on the same
         // callsign, so a failure here just means incoming connections
@@ -115,9 +122,34 @@ impl PortRunner for Ax25RawSocketRunner {
                 }
                 Ok(PortCommand::Disconnect) => break,
                 Ok(PortCommand::Connect) => {}
-                // Sending unconnected UI frames over a raw AF_AX25 socket
-                // would need a separate SOCK_DGRAM socket; not implemented yet.
-                Ok(PortCommand::SendUnproto { .. }) => {}
+                Ok(PortCommand::SendUnproto { dest, via, bytes }) => {
+                    // A raw AF_AX25 socket (unlike AGWPE's TNC-hosted
+                    // monitor stream) never echoes our own transmission
+                    // back to us, so log it locally -- same reasoning as
+                    // the KISS backend.
+                    let text = String::from_utf8_lossy(&bytes).replace('\0', "");
+                    let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
+                    match unproto_socket.as_ref().map(|s| s.send_to(&dest, &via, &bytes)) {
+                        Some(Ok(())) => {
+                            let _ = event_tx.send_blocking(PortEvent::Monitor {
+                                line: format!("{local_call} > {dest}{via_suffix} [unproto TX]: {text}"),
+                                from: None,
+                                to: None,
+                                message: None,
+                            });
+                        }
+                        Some(Err(e)) => {
+                            let _ = event_tx.send_blocking(PortEvent::PortError {
+                                message: format!("send unproto to {dest}: {e}"),
+                            });
+                        }
+                        None => {
+                            let _ = event_tx.send_blocking(PortEvent::PortError {
+                                message: "unproto sending unavailable on this AX.25 port".to_string(),
+                            });
+                        }
+                    }
+                }
                 Err(_) => break,
             }
         }

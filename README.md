@@ -16,7 +16,9 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
     SoundModem, etc.) over TCP. Supports connected-mode sessions and
     unproto/UI frames, with an optional digipeater `via` path.
   - **AX.25 raw socket** (`AF_AX25`) — talks directly to a kernel AX.25
-    interface (`kissattach`, etc.). Connected-mode only.
+    interface (`kissattach`, etc.). Supports connected-mode sessions and
+    unproto/UI frames, with an optional digipeater `via` path (a `SOCK_DGRAM`
+    socket bound alongside the connected-mode `SOCK_SEQPACKET` one).
   - **KISS (TCP or serial)** — talks directly to a bare KISS TNC.
     Unproto/UI traffic only — a bare KISS TNC has no connected-mode ARQ
     state machine of its own, and this app doesn't implement one.

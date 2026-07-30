@@ -330,9 +330,9 @@ impl Ui {
             // Re-read the live port list each tick (not just once at
             // schedule time) so a port added later is picked up under the
             // empty-list "any port" convention without needing a fresh
-            // Save. Ports that don't support unproto at all (e.g. a raw
-            // AX.25 socket) are silently skipped, same convention used
-            // everywhere else in this app for backend capability gaps.
+            // Save. Ports that don't support unproto at all (e.g. Telnet/
+            // SSH) are silently skipped, same convention used everywhere
+            // else in this app for backend capability gaps.
             let ports = ui.state.config.borrow().ports.clone();
             let text = crate::template_vars::TemplateVars::from_config(&ui.state.config.borrow(), identity.clone()).apply(&beacon_text);
             for port in ports.iter().filter(|p| crate::keyboard_mode::listens_on(&listen_ports, &p.id)) {

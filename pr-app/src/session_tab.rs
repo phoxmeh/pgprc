@@ -29,7 +29,10 @@ pub fn port_dialable(config: &PortConfig) -> bool {
 /// True for port kinds that can send one-shot unconnected (UI) traffic —
 /// used by the shared bottom bar's default/no-tab-selected compose mode.
 pub fn port_supports_unproto(config: &PortConfig) -> bool {
-    matches!(config, PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. })
+    matches!(
+        config,
+        PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. } | PortConfig::Ax25RawSocket { .. }
+    )
 }
 
 /// A connected-session tab: created by the dial dialog with a fixed

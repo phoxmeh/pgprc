@@ -106,10 +106,8 @@ pub struct RawAx25Socket {
 }
 
 impl RawAx25Socket {
-    /// Create the socket and bind it to `local_call` (the callsign
-    /// associated with the target device/port in `/etc/ax25/axports`).
-    pub fn bind(local_call: &str) -> Result<Self, Ax25Error> {
-        let raw = unsafe { libc::socket(libc::AF_AX25, libc::SOCK_SEQPACKET, 0) };
+    fn open_bound(local_call: &str, sock_type: libc::c_int) -> Result<Self, Ax25Error> {
+        let raw = unsafe { libc::socket(libc::AF_AX25, sock_type, 0) };
         if raw < 0 {
             return Err(Ax25Error::Io(io::Error::last_os_error()));
         }
@@ -135,8 +133,21 @@ impl RawAx25Socket {
         Ok(socket)
     }
 
-    /// Connect to `remote_call`, optionally via up to 8 digipeaters.
-    pub fn connect(&self, remote_call: &str, digis: &[String]) -> Result<(), Ax25Error> {
+    /// Create a connected-mode socket and bind it to `local_call` (the
+    /// callsign associated with the target device/port in
+    /// `/etc/ax25/axports`).
+    pub fn bind(local_call: &str) -> Result<Self, Ax25Error> {
+        Self::open_bound(local_call, libc::SOCK_SEQPACKET)
+    }
+
+    /// Create a connectionless (UI-frame) socket bound to `local_call`, for
+    /// one-shot unproto sends via [`send_to`](Self::send_to) — no ARQ
+    /// session, same as `SOCK_DGRAM` over any other address family.
+    pub fn bind_dgram(local_call: &str) -> Result<Self, Ax25Error> {
+        Self::open_bound(local_call, libc::SOCK_DGRAM)
+    }
+
+    fn full_sockaddr(remote_call: &str, digis: &[String]) -> Result<(FullSockaddrAx25, usize), Ax25Error> {
         let remote = encode_callsign(remote_call)?;
         let mut addr = FullSockaddrAx25 {
             fsa_ax25: SockaddrAx25 {
@@ -154,9 +165,39 @@ impl RawAx25Socket {
         } else {
             mem::size_of::<FullSockaddrAx25>()
         };
+        Ok((addr, len))
+    }
+
+    /// Connect to `remote_call`, optionally via up to 8 digipeaters.
+    pub fn connect(&self, remote_call: &str, digis: &[String]) -> Result<(), Ax25Error> {
+        let (addr, len) = Self::full_sockaddr(remote_call, digis)?;
         let ret = unsafe {
             libc::connect(
                 self.fd.as_raw_fd(),
+                &addr as *const FullSockaddrAx25 as *const libc::sockaddr,
+                len as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(Ax25Error::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Send one unconnected UI frame's payload to `remote_call`, optionally
+    /// via up to 8 digipeaters — the kernel builds the actual UI frame from
+    /// this socket's bound local call, `remote_call`, and `bytes`. Requires
+    /// a `SOCK_DGRAM` socket from [`bind_dgram`](Self::bind_dgram); calling
+    /// this on a `SOCK_SEQPACKET` socket from [`bind`](Self::bind) will fail
+    /// at the kernel level.
+    pub fn send_to(&self, remote_call: &str, digis: &[String], bytes: &[u8]) -> Result<(), Ax25Error> {
+        let (addr, len) = Self::full_sockaddr(remote_call, digis)?;
+        let ret = unsafe {
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
                 &addr as *const FullSockaddrAx25 as *const libc::sockaddr,
                 len as libc::socklen_t,
             )
