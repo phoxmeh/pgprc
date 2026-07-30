@@ -22,7 +22,13 @@ pub fn show(ui: &Rc<Ui>) {
 
     // --- Profile: who you are, on every port you connect. Callsign lives
     // here (not General) since it's identity, not a display preference. ---
-    let profile_group = adw::PreferencesGroup::builder().title("Profile").build();
+    let profile_group = adw::PreferencesGroup::builder()
+        .title("Profile")
+        .description(
+            "Available as $$NAME, $$LOC, $$BBSHOME in mailbox/keyboard-to-keyboard/beacon message text \
+             ($$NODE resolves separately for each of those)",
+        )
+        .build();
 
     let name_row = adw::EntryRow::builder().title("Name").build();
     name_row.set_text(current.name.as_deref().unwrap_or(""));
@@ -32,6 +38,10 @@ pub fn show(ui: &Rc<Ui>) {
     callsign_row.set_text(current.default_call.as_deref().unwrap_or(""));
     force_uppercase(&callsign_row);
     profile_group.add(&callsign_row);
+
+    let location_row = adw::EntryRow::builder().title("Location").build();
+    location_row.set_text(current.location.as_deref().unwrap_or(""));
+    profile_group.add(&location_row);
 
     let home_bbs_row = adw::EntryRow::builder().title("Home BBS Address").build();
     home_bbs_row.set_text(current.home_bbs.as_deref().unwrap_or(""));
@@ -196,6 +206,7 @@ pub fn show(ui: &Rc<Ui>) {
             let show_timestamps = timestamps_row.is_active();
             let name = name_row.text().to_string();
             let default_call = callsign_row.text().to_string();
+            let location = location_row.text().to_string();
             let home_bbs = home_bbs_row.text().to_string();
             let qrz_username = qrz_user_row.text().to_string();
             let qrz_password = qrz_pass_row.text().to_string();
@@ -214,6 +225,7 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.ui.name = if name.trim().is_empty() { None } else { Some(name) };
                 cfg.ui.default_call =
                     if default_call.trim().is_empty() { None } else { Some(default_call.to_uppercase()) };
+                cfg.ui.location = if location.trim().is_empty() { None } else { Some(location) };
                 cfg.ui.home_bbs = if home_bbs.trim().is_empty() { None } else { Some(home_bbs.to_uppercase()) };
                 cfg.ui.qrz_username = if qrz_username.trim().is_empty() { None } else { Some(qrz_username) };
                 cfg.ui.qrz_password = if qrz_password.is_empty() { None } else { Some(qrz_password) };

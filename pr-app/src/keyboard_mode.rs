@@ -36,6 +36,20 @@ pub fn listens_on(listen_ports: &[String], port_id: &str) -> bool {
     listen_ports.is_empty() || listen_ports.iter().any(|p| p == port_id)
 }
 
+/// Resolves the callsign keyboard-to-keyboard mode actually answers/beacons
+/// as: `node_call` if set, otherwise falling back to `UiPrefs.default_call`.
+/// Centralizes the exact resolution rule so it's applied identically
+/// everywhere it's needed -- matching an incoming connect, the welcome
+/// message, and the availability beacon's `$$NODE` substitution.
+pub fn resolve_identity(node_call: &str, default_call: &str) -> String {
+    let node_call = node_call.trim().to_uppercase();
+    if node_call.is_empty() {
+        default_call.to_string()
+    } else {
+        node_call
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +81,16 @@ mod tests {
         let ports = vec!["port-1".to_string(), "port-2".to_string()];
         assert!(listens_on(&ports, "port-1"));
         assert!(!listens_on(&ports, "port-3"));
+    }
+
+    #[test]
+    fn resolve_identity_prefers_node_call_over_default() {
+        assert_eq!(resolve_identity("kd3bfp-1", "KD3BFP-9"), "KD3BFP-1");
+    }
+
+    #[test]
+    fn resolve_identity_falls_back_to_default_when_unset() {
+        assert_eq!(resolve_identity("", "KD3BFP-9"), "KD3BFP-9");
+        assert_eq!(resolve_identity("   ", "KD3BFP-9"), "KD3BFP-9");
     }
 }

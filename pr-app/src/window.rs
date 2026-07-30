@@ -288,7 +288,9 @@ impl Ui {
                 // unproto-send behavior elsewhere, no need to spam the
                 // Monitor every interval while a port happens to be down.
                 if ui.state.is_active(&port_id) {
-                    ui.send_unproto(&port_id, dest.clone(), via.clone(), message.clone().into_bytes());
+                    let default_call = ui.state.config.borrow().ui.default_call.clone().unwrap_or_default();
+                    let text = crate::template_vars::TemplateVars::from_config(&ui.state.config.borrow(), default_call).apply(&message);
+                    ui.send_unproto(&port_id, dest.clone(), via.clone(), text.into_bytes());
                 }
                 glib::ControlFlow::Continue
             });
@@ -308,13 +310,16 @@ impl Ui {
         if let Some(source) = self.keyboard_mode_beacon_timer.borrow_mut().take() {
             source.remove();
         }
-        let (enabled, beacon_text, interval_secs, listen_ports) = {
+        let (enabled, beacon_text, interval_secs, listen_ports, identity) = {
             let cfg = self.state.config.borrow();
+            let identity =
+                crate::keyboard_mode::resolve_identity(&cfg.keyboard_mode.node_call, cfg.ui.default_call.as_deref().unwrap_or(""));
             (
                 cfg.keyboard_mode.enabled,
                 cfg.keyboard_mode.beacon_text.clone(),
                 cfg.keyboard_mode.beacon_interval_secs,
                 cfg.keyboard_mode.listen_ports.clone(),
+                identity,
             )
         };
         if !enabled || beacon_text.trim().is_empty() {
@@ -329,9 +334,10 @@ impl Ui {
             // AX.25 socket) are silently skipped, same convention used
             // everywhere else in this app for backend capability gaps.
             let ports = ui.state.config.borrow().ports.clone();
+            let text = crate::template_vars::TemplateVars::from_config(&ui.state.config.borrow(), identity.clone()).apply(&beacon_text);
             for port in ports.iter().filter(|p| crate::keyboard_mode::listens_on(&listen_ports, &p.id)) {
                 if port_supports_unproto(&port.config) && ui.state.is_active(&port.id) {
-                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), beacon_text.clone().into_bytes());
+                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), text.clone().into_bytes());
                 }
             }
             glib::ControlFlow::Continue
@@ -348,13 +354,14 @@ impl Ui {
         if let Some(source) = self.mailbox_beacon_timer.borrow_mut().take() {
             source.remove();
         }
-        let (enabled, beacon_text, interval_secs, listen_ports) = {
+        let (enabled, beacon_text, interval_secs, listen_ports, respond_call) = {
             let cfg = self.state.config.borrow();
             (
                 cfg.mailbox.enabled,
                 cfg.mailbox.beacon_text.clone(),
                 cfg.mailbox.beacon_interval_secs,
                 cfg.mailbox.listen_ports.clone(),
+                cfg.mailbox.respond_call.clone(),
             )
         };
         if !enabled || beacon_text.trim().is_empty() {
@@ -363,9 +370,11 @@ impl Ui {
         let ui = self.clone();
         let source = glib::source::timeout_add_seconds_local(interval_secs.max(1), move || {
             let ports = ui.state.config.borrow().ports.clone();
+            let text =
+                crate::template_vars::TemplateVars::from_config(&ui.state.config.borrow(), respond_call.clone()).apply(&beacon_text);
             for port in ports.iter().filter(|p| crate::keyboard_mode::listens_on(&listen_ports, &p.id)) {
                 if port_supports_unproto(&port.config) && ui.state.is_active(&port.id) {
-                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), beacon_text.clone().into_bytes());
+                    ui.send_unproto(&port.id, "CQ".to_string(), Vec::new(), text.clone().into_bytes());
                 }
             }
             glib::ControlFlow::Continue
@@ -989,9 +998,10 @@ impl Ui {
                         // existed).
                         let (k2k_enabled, k2k_identity, k2k_welcome, k2k_listen_ports) = {
                             let cfg = self.state.config.borrow();
-                            let node_call = cfg.keyboard_mode.node_call.trim().to_uppercase();
-                            let identity =
-                                if node_call.is_empty() { cfg.ui.default_call.clone().unwrap_or_default() } else { node_call };
+                            let identity = crate::keyboard_mode::resolve_identity(
+                                &cfg.keyboard_mode.node_call,
+                                cfg.ui.default_call.as_deref().unwrap_or(""),
+                            );
                             (
                                 cfg.keyboard_mode.enabled,
                                 identity,
@@ -1016,7 +1026,8 @@ impl Ui {
                             let welcome = if k2k_welcome.trim().is_empty() {
                                 crate::keyboard_mode::default_welcome(&k2k_identity)
                             } else {
-                                format!("{}\n", k2k_welcome.trim_end())
+                                let vars = crate::template_vars::TemplateVars::from_config(&self.state.config.borrow(), k2k_identity.clone());
+                                format!("{}\n", vars.apply(k2k_welcome.trim_end()))
                             };
                             self.send_tab_text(tab, port_id, &welcome);
                         } else if crate::mailbox::should_answer(mb_enabled, &mb_respond_call, to.as_deref())
@@ -1030,7 +1041,8 @@ impl Ui {
                             let banner = if mb_intro.trim().is_empty() {
                                 crate::mailbox::welcome_banner(&mb_respond_call)
                             } else {
-                                format!("{}\n", mb_intro.trim_end())
+                                let vars = crate::template_vars::TemplateVars::from_config(&self.state.config.borrow(), mb_respond_call.clone());
+                                format!("{}\n", vars.apply(mb_intro.trim_end()))
                             };
                             self.send_tab_text(tab, port_id, &banner);
                         }

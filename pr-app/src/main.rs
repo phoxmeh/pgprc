@@ -22,6 +22,7 @@ mod ports_dialog;
 mod preferences_dialog;
 mod qrz;
 mod session_tab;
+mod template_vars;
 mod window;
 
 use adw::prelude::*;

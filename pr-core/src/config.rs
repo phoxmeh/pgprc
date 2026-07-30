@@ -532,6 +532,11 @@ pub struct UiPrefs {
     /// Operator's own name, shown in Preferences' Profile section.
     #[serde(default)]
     pub name: Option<String>,
+    /// Free-text location (city/state, grid square, ...), shown in
+    /// Preferences' Profile section. Used by the `$$LOC` template
+    /// variable in automated message text.
+    #[serde(default)]
+    pub location: Option<String>,
     /// Home BBS/mailbox address, shown in Preferences' Profile section.
     #[serde(default)]
     pub home_bbs: Option<String>,
@@ -582,6 +587,7 @@ impl Default for UiPrefs {
             show_timestamps: true,
             default_call: None,
             name: None,
+            location: None,
             home_bbs: None,
             qrz_username: None,
             qrz_password: None,

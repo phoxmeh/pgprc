@@ -127,7 +127,10 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
 
     let beacon_group = adw::PreferencesGroup::builder()
         .title("Availability Beacon")
-        .description("Sent periodically on every listen port that supports unproto, while enabled")
+        .description(
+            "Sent periodically on every listen port that supports unproto, while enabled. \
+             $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Mailbox Callsign.",
+        )
         .build();
     let beacon_text_row = adw::EntryRow::builder().title("Beacon Text").build();
     beacon_text_row.set_text(&current.beacon_text);
@@ -205,7 +208,10 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
 fn edit_intro_message(parent: &adw::Window, intro_row: &adw::ActionRow, intro_message: &Rc<std::cell::RefCell<String>>) {
     let (win, root) = dialog_window(parent, "Intro Message", 480);
 
-    let label = gtk::Label::new(Some("Sent when a station connects to the mailbox. Leave blank to use the default greeting."));
+    let label = gtk::Label::new(Some(
+        "Sent when a station connects to the mailbox. Leave blank to use the default greeting. \
+         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is the Mailbox Callsign.",
+    ));
     label.set_halign(gtk::Align::Start);
     label.set_wrap(true);
     root.append(&label);

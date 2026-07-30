@@ -52,7 +52,10 @@ pub fn show_settings(ui: &Rc<Ui>) {
         });
     }
 
-    let beacon_text_row = adw::EntryRow::builder().title("Availability Beacon Text").build();
+    let beacon_text_row = adw::EntryRow::builder()
+        .title("Availability Beacon Text")
+        .tooltip_text("$$NODE/$$NAME/$$LOC/$$BBSHOME available; $$NODE is this Node Callsign")
+        .build();
     beacon_text_row.set_text(&current.beacon_text);
     settings_group.add(&beacon_text_row);
 
@@ -123,7 +126,10 @@ pub fn show_settings(ui: &Rc<Ui>) {
 fn edit_welcome_message(parent: &adw::Window, welcome_row: &adw::ActionRow, welcome_message: &Rc<RefCell<String>>) {
     let (win, root) = dialog_window(parent, "Welcome Message", 480);
 
-    let label = gtk::Label::new(Some("Sent when a station connects for keyboard-to-keyboard. Leave blank to use the default greeting."));
+    let label = gtk::Label::new(Some(
+        "Sent when a station connects for keyboard-to-keyboard. Leave blank to use the default greeting. \
+         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Node Callsign.",
+    ));
     label.set_halign(gtk::Align::Start);
     label.set_wrap(true);
     root.append(&label);
