@@ -13,7 +13,7 @@ const USAGE_STEPS: &str = "\
 1. Open the menu (hamburger icon) \u{2192} Ports\u{2026} and add a port.
 2. Click + on the tab bar to open a new session tab, pick the port, and \
 (for node-capable ports) enter a destination callsign \u{2014} or pick one \
-from the Address Book via the small arrow next to the node field.
+from the Address Book via the button next to the node field.
 3. Press Connect. Type in the input box and press Enter or click Send.
 4. Check Unproto in a tab to send one-shot unconnected frames instead of \
 opening a session.

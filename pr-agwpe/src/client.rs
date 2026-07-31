@@ -289,6 +289,22 @@ fn handle_frame(frame: AgwFrame, events: &async_channel::Sender<PortEvent>, conn
             let text = text_from_bytes(&frame.data);
             let pid_suffix = pr_ax25::pid_label(frame.pid).map(|l| format!(" [PID: {l}]")).unwrap_or_default();
             emit_heard(events, &frame.call_from)?;
+            if kind == 'U' && frame.pid == 0xCF && frame.call_to.eq_ignore_ascii_case("NODES") {
+                if let Some(broadcast) = pr_ax25::netrom::parse_nodes_broadcast(&frame.data) {
+                    let entries = broadcast
+                        .entries
+                        .into_iter()
+                        .map(|e| pr_core::NodesBroadcastEntry { callsign: e.callsign, alias: e.alias })
+                        .collect();
+                    events
+                        .send_blocking(PortEvent::NodesBroadcast {
+                            from: frame.call_from.clone(),
+                            sender_alias: broadcast.sender_alias,
+                            entries,
+                        })
+                        .map_err(|_| ())?;
+                }
+            }
             // Only 'U' (UI/unproto) is notification-eligible. 'I'/'S' belong
             // to an active connected-mode conversation (already visible in
             // its own tab — notifying on every reply would just be noise),

@@ -43,15 +43,17 @@ pub enum PortConfig {
         device: String,
     },
     /// KISS TNC reachable over TCP (e.g. Direwolf's/UZ7HO's raw KISS port).
-    /// Unconnected (UI/beacon) traffic only — connected-mode AX.25 over bare
-    /// KISS would require reimplementing the modulus-8 ARQ state machine,
-    /// which AGWPE and AF_AX25 raw sockets otherwise offload for us.
+    /// Supports connected-mode AX.25 (modulus-8 ARQ, hand-rolled in
+    /// `pr_ax25::arq` since a bare KISS TNC has no ARQ of its own) as well
+    /// as unconnected (UI/beacon) traffic.
     KissTcp {
         host: String,
         port: u16,
         my_call: String,
         #[serde(default)]
         kiss_params: KissParams,
+        #[serde(default)]
+        kiss_arq: KissArqParams,
     },
     /// KISS TNC on a serial/USB port.
     KissSerial {
@@ -60,6 +62,8 @@ pub enum PortConfig {
         my_call: String,
         #[serde(default)]
         kiss_params: KissParams,
+        #[serde(default)]
+        kiss_arq: KissArqParams,
     },
 }
 
@@ -79,6 +83,26 @@ pub struct KissParams {
     pub slot_time: Option<u8>,
     #[serde(default)]
     pub full_duplex: Option<bool>,
+}
+
+/// Modulus-8 ARQ tuning for bare-KISS connected mode (`pr_ax25::arq`).
+/// `None` (the default for every field) means "use this app's own built-in
+/// default" — see `pr_ax25::arq::ArqConfig::default()` — so an existing
+/// config with no `kiss_arq` section behaves identically to a fresh one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KissArqParams {
+    /// Window size k, 1-7.
+    #[serde(default)]
+    pub window: Option<u8>,
+    /// T1 acknowledge/retransmit timer, milliseconds.
+    #[serde(default)]
+    pub t1_ms: Option<u32>,
+    /// N2, max retries before giving up.
+    #[serde(default)]
+    pub n2: Option<u32>,
+    /// N1, max I-frame payload size in bytes (paclen).
+    #[serde(default)]
+    pub n1_bytes: Option<usize>,
 }
 
 impl PortConfig {
@@ -131,6 +155,27 @@ pub struct AddressBookEntry {
     /// reach the station directly), this is where its own mail lives.
     #[serde(default)]
     pub home_bbs: String,
+    /// `true` once we've directly received a transmission *from* this
+    /// station ourselves (`PortEvent::StationHeard`). `false` for an entry
+    /// that only exists because another node's NET/ROM NODES broadcast
+    /// mentioned it (see `PortEvent::NodesBroadcast`) — never downgraded
+    /// back to `false` once set. Serde default is `true`, not `false`, so
+    /// every entry from a config saved before this field existed — which
+    /// could only ever have been created by a direct hear under the old
+    /// code — deserializes correctly.
+    #[serde(default = "default_true")]
+    pub heard_direct: bool,
+    /// Last 5 unique message texts this station sent to destination
+    /// "BEACON", most-recent-first — see `AppState::record_beacon_packet`.
+    #[serde(default)]
+    pub recent_beacons: Vec<BeaconPacketLogEntry>,
+}
+
+/// One entry in `AddressBookEntry::recent_beacons`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconPacketLogEntry {
+    pub text: String,
+    pub when: String,
 }
 
 /// A tab the user pinned: its (port, node) shell is recreated automatically
@@ -913,5 +958,41 @@ impl AppConfig {
         )?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kiss_arq_params_default_round_trips_as_all_none() {
+        let default = KissArqParams::default();
+        let text = toml::to_string(&default).unwrap();
+        let back: KissArqParams = toml::from_str(&text).unwrap();
+        assert_eq!(back.window, None);
+        assert_eq!(back.t1_ms, None);
+        assert_eq!(back.n2, None);
+        assert_eq!(back.n1_bytes, None);
+    }
+
+    #[test]
+    fn kiss_tcp_without_a_kiss_arq_key_still_deserializes() {
+        // Matches an existing saved ports.toml entry from before this field
+        // existed -- `#[serde(default)]` must make this a no-op migration.
+        let toml_text = r#"
+            kind = "KissTcp"
+            host = "127.0.0.1"
+            port = 8001
+            my_call = "N0CALL"
+        "#;
+        let config: PortConfig = toml::from_str(toml_text).unwrap();
+        match config {
+            PortConfig::KissTcp { kiss_arq, .. } => {
+                assert_eq!(kiss_arq.window, None);
+                assert_eq!(kiss_arq.n1_bytes, None);
+            }
+            _ => panic!("expected KissTcp"),
+        }
     }
 }

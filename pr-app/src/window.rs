@@ -960,6 +960,7 @@ impl Ui {
                 if let (Some(from), Some(to), Some(message)) = (from, to, message) {
                     self.maybe_notify_directed(port_id, &from, &to, &message, &line);
                     self.maybe_detect_beacon(port_id, &from, &to, &message);
+                    self.maybe_record_beacon_packet(&from, &to, &message);
                 }
             }
             PortEvent::ConnectionOpened { id, label, to } => {
@@ -1116,6 +1117,9 @@ impl Ui {
             PortEvent::StationHeard { callsign } => {
                 self.state.record_heard(&callsign);
             }
+            PortEvent::NodesBroadcast { from, sender_alias, entries } => {
+                self.state.record_nodes_broadcast(&from, &sender_alias, &entries);
+            }
         }
     }
 
@@ -1179,6 +1183,17 @@ impl Ui {
             let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
             let title = format!("Packet Radio \u{2014} {port_name} (Beacon: {label})");
             crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
+        }
+    }
+
+    /// Log a message a station sent to the literal destination "BEACON" into
+    /// that station's own address-book entry (`AddressBookEntry.recent_beacons`)
+    /// — distinct from `maybe_detect_beacon` above, which is about the
+    /// user's own configurable destination-pattern rules and a global
+    /// cross-station log, not a per-station one.
+    fn maybe_record_beacon_packet(&self, from: &str, to: &str, message: &str) {
+        if to.eq_ignore_ascii_case("BEACON") {
+            self.state.record_beacon_packet(from, message);
         }
     }
 
@@ -1305,7 +1320,8 @@ fn apply_base_css() {
          .state-destructive { background-color: @error_bg_color; color: @error_fg_color; } \
          .state-warning { background-color: @warning_bg_color; color: @warning_fg_color; } \
          .tab-chip { border-right: 1px solid @borders; padding: 0 2px; } \
-         .tab-chip-button { padding: 2px 6px; min-height: 0; }",
+         .tab-chip-button { padding: 2px 6px; min-height: 0; } \
+         .heard-indirect-dot { color: #E8A33D; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);

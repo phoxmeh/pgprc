@@ -9,8 +9,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::object::IsA;
 
-use pr_core::{AddressBookEntry, PortConfig, PortEntry};
+use pr_core::{PortConfig, PortEntry};
 
+use crate::address_book_dialog;
 use crate::ports_dialog::{dialog_window, force_uppercase};
 use crate::session_tab::{port_dialable, port_supports_connect};
 use crate::window::Ui;
@@ -52,52 +53,33 @@ pub fn show(ui: &Rc<Ui>) {
     let (node_row, _) = labeled_dynamic("Node", &node_entry);
     root.append(&node_row);
 
-    // A one-shot picker: selecting an entry copies its callsign (and, if
-    // set, its via path) into node_entry/via_entry. Blank factory for the
-    // closed button (leaves just the dropdown's own arrow visible) but a
-    // real text factory for the popup list, matching the address-book
-    // picker's original look before it moved here from the (now much
-    // simpler) session tab.
-    let mut address_book: Vec<AddressBookEntry> = ui.state.config.borrow().address_book.clone();
-    address_book.sort_by(|a, b| a.callsign.cmp(&b.callsign));
-    let address_book_names: Vec<String> = address_book
-        .iter()
-        .map(|e| {
-            let extra = e.name.as_deref().or(e.alias.as_deref());
-            match extra {
-                Some(extra) if !extra.is_empty() => format!("{} \u{2014} {extra}", e.callsign),
-                _ => e.callsign.clone(),
-            }
-        })
-        .collect();
-    let address_book_refs: Vec<&str> = address_book_names.iter().map(String::as_str).collect();
-    let address_book_dropdown = gtk::DropDown::builder().model(&gtk::StringList::new(&address_book_refs)).build();
-    address_book_dropdown.set_tooltip_text(Some("From Address Book\u{2026}"));
-    let blank_factory = gtk::SignalListItemFactory::new();
-    blank_factory.connect_setup(|_, _list_item| {});
-    address_book_dropdown.set_factory(Some(&blank_factory));
-    let list_factory = gtk::SignalListItemFactory::new();
-    list_factory.connect_setup(|_, list_item| {
-        let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
-        let label = gtk::Label::new(None);
-        label.set_halign(gtk::Align::Start);
-        list_item.set_child(Some(&label));
-    });
-    list_factory.connect_bind(|_, list_item| {
-        let Some(list_item) = list_item.downcast_ref::<gtk::ListItem>() else { return };
-        let label = list_item.child().and_then(|c| c.downcast::<gtk::Label>().ok());
-        let text = list_item.item().and_then(|o| o.downcast::<gtk::StringObject>().ok());
-        if let (Some(label), Some(text)) = (label, text) {
-            label.set_text(&text.string());
-        }
-    });
-    address_book_dropdown.set_list_factory(Some(&list_factory));
-    node_row.append(&address_book_dropdown);
-
     let via_entry = gtk::Entry::builder().build();
     force_uppercase(&via_entry);
     let (via_row, via_label) = labeled_dynamic("Via", &via_entry);
     root.append(&via_row);
+
+    // Opens a dedicated picker dialog (filterable/sortable, selection-only)
+    // rather than an inline dropdown -- selecting an entry copies its
+    // callsign (and, if set, its via path) into node_entry/via_entry.
+    let address_book_button = gtk::Button::from_icon_name("address-book-new-symbolic");
+    address_book_button.set_tooltip_text(Some("Choose from Address Book\u{2026}"));
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        let node_entry = node_entry.clone();
+        let via_entry = via_entry.clone();
+        address_book_button.connect_clicked(move |_| {
+            let node_entry = node_entry.clone();
+            let via_entry = via_entry.clone();
+            address_book_dialog::show_picker(&ui, &win, move |entry| {
+                node_entry.set_text(&entry.callsign);
+                if !entry.via.trim().is_empty() {
+                    via_entry.set_text(&entry.via);
+                }
+            });
+        });
+    }
+    node_row.append(&address_book_button);
 
     // Relabel/placeholder-swap Via <-> Address, and show/hide Node,
     // depending on the selected port's kind.
@@ -122,20 +104,6 @@ pub fn show(ui: &Rc<Ui>) {
     {
         let update_for_port = update_for_port.clone();
         port_dropdown.connect_selected_notify(move |dd| update_for_port(dd));
-    }
-
-    {
-        let address_book = address_book.clone();
-        let node_entry = node_entry.clone();
-        let via_entry = via_entry.clone();
-        address_book_dropdown.connect_selected_notify(move |dropdown| {
-            if let Some(entry) = address_book.get(dropdown.selected() as usize) {
-                node_entry.set_text(&entry.callsign);
-                if !entry.via.trim().is_empty() {
-                    via_entry.set_text(&entry.via);
-                }
-            }
-        });
     }
 
     let error_label = gtk::Label::new(None);

@@ -41,6 +41,19 @@ pub enum PortEvent {
     /// Separate from `Monitor` (which is just display text) so the UI
     /// doesn't need to re-parse callsigns back out of formatted strings.
     StationHeard { callsign: String },
+    /// A NET/ROM "NODES" routing broadcast was decoded: `from` (which we
+    /// did directly hear) announced knowledge of each station in `entries`,
+    /// which we haven't necessarily heard ourselves — see
+    /// `AppState::record_nodes_broadcast`. `sender_alias` is `from`'s own
+    /// mnemonic alias, if the broadcast carried one.
+    NodesBroadcast { from: String, sender_alias: String, entries: Vec<NodesBroadcastEntry> },
+}
+
+/// One destination station listed in a NET/ROM NODES broadcast.
+#[derive(Debug, Clone)]
+pub struct NodesBroadcastEntry {
+    pub callsign: String,
+    pub alias: String,
 }
 
 /// Commands flowing from the UI to a port's background thread.

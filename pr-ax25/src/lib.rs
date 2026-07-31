@@ -1,7 +1,11 @@
+pub mod arq;
 pub mod kiss;
 pub mod kiss_runner;
+pub mod netrom;
 pub mod raw_socket;
 pub mod runner;
+pub mod wire;
+pub mod xid;
 
 pub use kiss_runner::{KissRunner, KissTransport};
 pub use runner::Ax25RawSocketRunner;

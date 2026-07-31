@@ -12,16 +12,18 @@ use crate::mailbox::MailboxState;
 pub type TabId = u64;
 
 /// True for port kinds that support opening a connected-mode session to a
-/// specific remote callsign (AGWPE, AX.25 raw socket). Telnet/SSH have no
-/// node concept — connecting the port *is* the whole session, and KISS
-/// ports have no connected mode at all.
+/// specific remote callsign (AGWPE, AX.25 raw socket, and bare KISS via a
+/// hand-rolled modulus-8 ARQ state machine — see `pr_ax25::arq`). Telnet/
+/// SSH have no node concept — connecting the port *is* the whole session.
 pub fn port_supports_connect(config: &PortConfig) -> bool {
-    matches!(config, PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. })
+    matches!(
+        config,
+        PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. }
+    )
 }
 
 /// True for port kinds the dial dialog can offer at all — every connect-
 /// capable port plus Telnet/SSH (whose "connection" is the whole port).
-/// KISS ports are unproto-only and never appear here.
 pub fn port_dialable(config: &PortConfig) -> bool {
     port_supports_connect(config) || matches!(config, PortConfig::Telnet { .. } | PortConfig::Ssh { .. })
 }
@@ -357,5 +359,64 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pr_core::{KissArqParams, KissParams};
+
+    fn all_variants() -> Vec<(&'static str, PortConfig)> {
+        vec![
+            ("Telnet", PortConfig::Telnet { host: "h".into(), port: 23 }),
+            ("Ssh", PortConfig::Ssh { host: "h".into(), port: 22, user: "u".into() }),
+            ("Agwpe", PortConfig::Agwpe { host: "h".into(), port: 8000, radio_port: 0, my_call: "N0CALL".into(), login: None }),
+            ("Ax25RawSocket", PortConfig::Ax25RawSocket { device: "wl2k".into() }),
+            (
+                "KissTcp",
+                PortConfig::KissTcp {
+                    host: "h".into(),
+                    port: 8001,
+                    my_call: "N0CALL".into(),
+                    kiss_params: KissParams::default(),
+                    kiss_arq: KissArqParams::default(),
+                },
+            ),
+            (
+                "KissSerial",
+                PortConfig::KissSerial {
+                    device: "/dev/ttyUSB0".into(),
+                    baud: 9600,
+                    my_call: "N0CALL".into(),
+                    kiss_params: KissParams::default(),
+                    kiss_arq: KissArqParams::default(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn port_supports_connect_covers_agwpe_raw_socket_and_kiss() {
+        for (name, config) in all_variants() {
+            let expected = matches!(name, "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial");
+            assert_eq!(port_supports_connect(&config), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn port_dialable_adds_telnet_and_ssh_on_top_of_connect_capable() {
+        for (name, config) in all_variants() {
+            let expected = matches!(name, "Telnet" | "Ssh" | "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial");
+            assert_eq!(port_dialable(&config), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn port_supports_unproto_covers_agwpe_kiss_and_raw_socket_not_telnet_ssh() {
+        for (name, config) in all_variants() {
+            let expected = matches!(name, "Agwpe" | "KissTcp" | "KissSerial" | "Ax25RawSocket");
+            assert_eq!(port_supports_unproto(&config), expected, "{name}");
+        }
     }
 }

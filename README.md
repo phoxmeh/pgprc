@@ -19,9 +19,11 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
     interface (`kissattach`, etc.). Supports connected-mode sessions and
     unproto/UI frames, with an optional digipeater `via` path (a `SOCK_DGRAM`
     socket bound alongside the connected-mode `SOCK_SEQPACKET` one).
-  - **KISS (TCP or serial)** — talks directly to a bare KISS TNC.
-    Unproto/UI traffic only — a bare KISS TNC has no connected-mode ARQ
-    state machine of its own, and this app doesn't implement one.
+  - **KISS (TCP or serial)** — talks directly to a bare KISS TNC. Supports
+    unproto/UI traffic and connected-mode sessions (a hand-rolled modulus-8
+    ARQ state machine, since a bare KISS TNC has no ARQ of its own — see
+    "Not supported" below for what this doesn't cover), including a
+    digipeater `via` path and per-port tuning of window size/T1/N2/paclen.
 - **Managed Direwolf process** (optional): a handset-icon header button
   starts/stops a local `direwolf` process directly — green while running,
   yellow if it failed to start. Right-click for the **Direwolf Console**
@@ -52,12 +54,17 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
   CQ or a digipeater alias) are colored in both the Monitor and session
   scrollback — each rule's bell toggle can also raise a desktop
   notification on a match.
-- **Address Book**: tracks "last heard" automatically as callsigns show up
-  on the air, plus manually-entered name/alias/location/notes/**via path**.
-  Picking an entry from a session tab's address-book dropdown fills in both
-  its callsign and via path, since a station usually needs the same
-  digipeater route every time. Includes an online **QRZ.com lookup** and
-  **ADIF export** of logged QSOs.
+- **Address Book**: a heard list. Callsigns are tracked automatically as they
+  show up on the air (heard count, last-heard time), plus manually-entered
+  name/alias/location/notes/**via path**. Also processes NET/ROM NODES
+  routing broadcasts (KISS and AGWPE ports), adding the stations they list
+  even when not heard directly — those entries show a pale-orange dot until
+  actually heard firsthand. Every list view (the Address Book itself, and
+  the dial dialog's picker) has a filter field and a sort toggle
+  (callsign/last-heard). Clicking an entry opens a detail view with its
+  read-only telemetry — heard count, last heard, and the last 5 unique
+  packets it sent to "BEACON" — plus an editable alias. Includes an online
+  **QRZ.com lookup** and **ADIF export** of logged QSOs.
 - **Scheduled beacons**: configure one or more periodic unproto beacons
   (port, destination, via path, message, interval) that fire automatically
   while their port is connected.
@@ -87,11 +94,14 @@ supporting AGWPE, AX.25 (raw kernel sockets), and bare KISS TNCs.
 - **APRS.**
 - **Digipeating** (auto-relaying other stations' frames) — out of scope for
   a client application.
-- **Connected-mode AX.25 over bare KISS** — would require reimplementing
-  the modulus-8 ARQ state machine that AGWPE hosts and the Linux kernel's
-  `AF_AX25` stack otherwise provide.
-- **AX.25 v2.2 XID negotiation** — inherently owned by whichever side runs
-  the ARQ state machine (the AGWPE host or the kernel), not by this app.
+- **AX.25 v2.2 extended (modulus-128) mode.** Connected-mode over bare KISS
+  and XID parameter negotiation are both implemented, but modulus-8 only —
+  the `ax25` crate this app depends on has no support for SABME or extended
+  (7-bit) sequence numbering at all, and hand-rolling a second, parallel
+  frame format for a mode that's rare in practice on amateur VHF packet
+  wasn't judged worth it. A peer that requests extended mode (via SABME or
+  an XID proposing modulus-128/SREJ/extended addressing) gets a graceful
+  DM decline, not a hang.
 
 ## Building from source
 

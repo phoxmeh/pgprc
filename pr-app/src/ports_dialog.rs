@@ -4,7 +4,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::object::IsA;
 
-use pr_core::{AgwpeLogin, AppConfig, KissParams, PortConfig, PortEntry};
+use pr_core::{AgwpeLogin, AppConfig, KissArqParams, KissParams, PortConfig, PortEntry};
 
 use crate::window::Ui;
 
@@ -289,6 +289,10 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let kt_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
     let kt_slot_time = gtk::Entry::builder().placeholder_text("TNC default").build();
     let kt_full_duplex = gtk::CheckButton::with_label("Force full duplex");
+    let kt_window = gtk::Entry::builder().placeholder_text("app default (4)").build();
+    let kt_t1_ms = gtk::Entry::builder().placeholder_text("app default (4000)").build();
+    let kt_n2 = gtk::Entry::builder().placeholder_text("app default (10)").build();
+    let kt_paclen = gtk::Entry::builder().placeholder_text("app default (256)").build();
     let kt_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     kt_box.append(&labeled("Host", &kt_host));
     kt_box.append(&labeled("Port", &kt_port));
@@ -297,6 +301,10 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     kt_box.append(&labeled("Persistence", &kt_persistence));
     kt_box.append(&labeled("Slot Time (x10ms)", &kt_slot_time));
     kt_box.append(&kt_full_duplex);
+    kt_box.append(&labeled("Window Size (k)", &kt_window));
+    kt_box.append(&labeled("Ack Timer T1 (ms)", &kt_t1_ms));
+    kt_box.append(&labeled("Max Retries (N2)", &kt_n2));
+    kt_box.append(&labeled("Max I-Frame Size (N1, bytes)", &kt_paclen));
     stack.add_named(&kt_box, Some("KISS (TCP)"));
 
     // KISS (Serial)
@@ -307,6 +315,10 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let ks_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
     let ks_slot_time = gtk::Entry::builder().placeholder_text("TNC default").build();
     let ks_full_duplex = gtk::CheckButton::with_label("Force full duplex");
+    let ks_window = gtk::Entry::builder().placeholder_text("app default (4)").build();
+    let ks_t1_ms = gtk::Entry::builder().placeholder_text("app default (4000)").build();
+    let ks_n2 = gtk::Entry::builder().placeholder_text("app default (10)").build();
+    let ks_paclen = gtk::Entry::builder().placeholder_text("app default (256)").build();
     let ks_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     ks_box.append(&labeled("Device", &ks_device));
     ks_box.append(&labeled("Baud", &ks_baud));
@@ -315,6 +327,10 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     ks_box.append(&labeled("Persistence", &ks_persistence));
     ks_box.append(&labeled("Slot Time (x10ms)", &ks_slot_time));
     ks_box.append(&ks_full_duplex);
+    ks_box.append(&labeled("Window Size (k)", &ks_window));
+    ks_box.append(&labeled("Ack Timer T1 (ms)", &ks_t1_ms));
+    ks_box.append(&labeled("Max Retries (N2)", &ks_n2));
+    ks_box.append(&labeled("Max I-Frame Size (N1, bytes)", &ks_paclen));
     stack.add_named(&ks_box, Some("KISS (Serial)"));
 
     if existing.is_none() {
@@ -366,17 +382,19 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
             PortConfig::Ax25RawSocket { device } => {
                 ax25_device.set_text(device);
             }
-            PortConfig::KissTcp { host, port, my_call, kiss_params } => {
+            PortConfig::KissTcp { host, port, my_call, kiss_params, kiss_arq } => {
                 kt_host.set_text(host);
                 kt_port.set_text(&port.to_string());
                 kt_my_call.set_text(my_call);
                 load_kiss_params(kiss_params, &kt_tx_delay, &kt_persistence, &kt_slot_time, &kt_full_duplex);
+                load_kiss_arq_params(kiss_arq, &kt_window, &kt_t1_ms, &kt_n2, &kt_paclen);
             }
-            PortConfig::KissSerial { device, baud, my_call, kiss_params } => {
+            PortConfig::KissSerial { device, baud, my_call, kiss_params, kiss_arq } => {
                 ks_device.set_text(device);
                 ks_baud.set_text(&baud.to_string());
                 ks_my_call.set_text(my_call);
                 load_kiss_params(kiss_params, &ks_tx_delay, &ks_persistence, &ks_slot_time, &ks_full_duplex);
+                load_kiss_arq_params(kiss_arq, &ks_window, &ks_t1_ms, &ks_n2, &ks_paclen);
             }
         }
     }
@@ -491,11 +509,19 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                             return;
                         }
                     };
+                    let kiss_arq = match parse_kiss_arq_params(&kt_window, &kt_t1_ms, &kt_n2, &kt_paclen) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
                     PortConfig::KissTcp {
                         host: kt_host.text().to_string(),
                         port,
                         my_call: kt_my_call.text().to_string(),
                         kiss_params,
+                        kiss_arq,
                     }
                 }
                 _ => {
@@ -513,11 +539,19 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                             return;
                         }
                     };
+                    let kiss_arq = match parse_kiss_arq_params(&ks_window, &ks_t1_ms, &ks_n2, &ks_paclen) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
                     PortConfig::KissSerial {
                         device: ks_device.text().to_string(),
                         baud,
                         my_call: ks_my_call.text().to_string(),
                         kiss_params,
+                        kiss_arq,
                     }
                 }
             };
@@ -587,6 +621,54 @@ fn parse_kiss_params(
         persistence: parse_optional_u8(persistence, "Persistence")?,
         slot_time: parse_optional_u8(slot_time, "Slot Time")?,
         full_duplex: if full_duplex.is_active() { Some(true) } else { None },
+    })
+}
+
+/// Populate a KISS connected-mode ARQ tuning form (four optional-number
+/// entries) from a loaded `KissArqParams` — `None` fields are left blank,
+/// showing this app's own built-in default via the entry's placeholder.
+fn load_kiss_arq_params(params: &KissArqParams, window: &gtk::Entry, t1_ms: &gtk::Entry, n2: &gtk::Entry, paclen: &gtk::Entry) {
+    if let Some(v) = params.window {
+        window.set_text(&v.to_string());
+    }
+    if let Some(v) = params.t1_ms {
+        t1_ms.set_text(&v.to_string());
+    }
+    if let Some(v) = params.n2 {
+        n2.set_text(&v.to_string());
+    }
+    if let Some(v) = params.n1_bytes {
+        paclen.set_text(&v.to_string());
+    }
+}
+
+/// Parse a KISS ARQ tuning form back into a `KissArqParams`, blank = `None`
+/// (this app's own default).
+fn parse_kiss_arq_params(window: &gtk::Entry, t1_ms: &gtk::Entry, n2: &gtk::Entry, paclen: &gtk::Entry) -> Result<KissArqParams, String> {
+    let text = window.text();
+    let window_text = text.trim();
+    let window = if window_text.is_empty() {
+        None
+    } else {
+        let value: u8 = window_text.parse().map_err(|_| "Window size must be a number.".to_string())?;
+        if !(1..=7).contains(&value) {
+            return Err("Window size must be 1-7.".to_string());
+        }
+        Some(value)
+    };
+    let parse_optional_u32 = |entry: &gtk::Entry, field: &str| -> Result<Option<u32>, String> {
+        let text = entry.text();
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.parse::<u32>().map(Some).map_err(|_| format!("{field} must be a non-negative number."))
+    };
+    Ok(KissArqParams {
+        window,
+        t1_ms: parse_optional_u32(t1_ms, "Ack Timer T1")?,
+        n2: parse_optional_u32(n2, "Max Retries (N2)")?,
+        n1_bytes: parse_optional_u32(paclen, "Max I-Frame Size (N1)")?.map(|v| v as usize),
     })
 }
 

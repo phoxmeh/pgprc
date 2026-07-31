@@ -54,6 +54,7 @@ impl AppState {
             Some(entry) => {
                 entry.last_heard = Some(now);
                 entry.heard_count += 1;
+                entry.heard_direct = true;
             }
             None => cfg.address_book.push(AddressBookEntry {
                 callsign,
@@ -65,8 +66,108 @@ impl AppState {
                 heard_count: 1,
                 via: String::new(),
                 home_bbs: String::new(),
+                heard_direct: true,
+                recent_beacons: Vec::new(),
             }),
         }
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Record entries seen in a NET/ROM NODES routing broadcast from `from`
+    /// (which we did directly hear, hence also gets a direct-hear bump via
+    /// `record_heard`): each listed destination is added/refreshed as an
+    /// *indirect* sighting — we only know about it because `from` mentioned
+    /// it, not because we heard it ourselves — unless it's already known
+    /// directly, in which case only its `last_heard` is refreshed.
+    /// `heard_count` is direct-hear telemetry only and is never touched
+    /// here. Aliases are backfilled only when currently empty, so a
+    /// user-set alias (or one learned from an earlier, still-accurate
+    /// broadcast) is never clobbered.
+    pub fn record_nodes_broadcast(&self, from: &str, sender_alias: &str, entries: &[pr_core::NodesBroadcastEntry]) {
+        let from = from.trim().to_uppercase();
+        if from.is_empty() {
+            return;
+        }
+        self.record_heard(&from);
+
+        let now = now_timestamp();
+        let mut cfg = self.config.borrow_mut();
+
+        if !sender_alias.is_empty() {
+            if let Some(entry) = cfg.address_book.iter_mut().find(|e| e.callsign == from) {
+                if entry.alias.as_deref().unwrap_or("").is_empty() {
+                    entry.alias = Some(sender_alias.to_string());
+                }
+            }
+        }
+
+        for entry in entries {
+            let callsign = entry.callsign.trim().to_uppercase();
+            if callsign.is_empty() {
+                continue;
+            }
+            let alias = entry.alias.trim();
+            match cfg.address_book.iter_mut().find(|e| e.callsign == callsign) {
+                Some(existing) => {
+                    existing.last_heard = Some(now.clone());
+                    if !existing.heard_direct && !alias.is_empty() && existing.alias.as_deref().unwrap_or("").is_empty() {
+                        existing.alias = Some(alias.to_string());
+                    }
+                }
+                None => cfg.address_book.push(AddressBookEntry {
+                    callsign,
+                    name: None,
+                    alias: if alias.is_empty() { None } else { Some(alias.to_string()) },
+                    location: None,
+                    notes: None,
+                    last_heard: Some(now.clone()),
+                    heard_count: 0,
+                    via: String::new(),
+                    home_bbs: String::new(),
+                    heard_direct: false,
+                    recent_beacons: Vec::new(),
+                }),
+            }
+        }
+        drop(cfg);
+        self.save_config();
+    }
+
+    /// Record one message a station sent to destination "BEACON", keeping
+    /// only the last 5 *unique* texts (a repeat moves back to the front
+    /// with a fresh timestamp instead of adding a duplicate). No-op for an
+    /// empty message.
+    pub fn record_beacon_packet(&self, from: &str, message: &str) {
+        let from = from.trim().to_uppercase();
+        if from.is_empty() || message.is_empty() {
+            return;
+        }
+        let now = now_timestamp();
+
+        let mut cfg = self.config.borrow_mut();
+        let entry = match cfg.address_book.iter_mut().find(|e| e.callsign == from) {
+            Some(entry) => entry,
+            None => {
+                cfg.address_book.push(AddressBookEntry {
+                    callsign: from.clone(),
+                    name: None,
+                    alias: None,
+                    location: None,
+                    notes: None,
+                    last_heard: None,
+                    heard_count: 0,
+                    via: String::new(),
+                    home_bbs: String::new(),
+                    heard_direct: false,
+                    recent_beacons: Vec::new(),
+                });
+                cfg.address_book.iter_mut().find(|e| e.callsign == from).expect("just pushed")
+            }
+        };
+        entry.recent_beacons.retain(|b| b.text != message);
+        entry.recent_beacons.insert(0, pr_core::BeaconPacketLogEntry { text: message.to_string(), when: now });
+        entry.recent_beacons.truncate(5);
         drop(cfg);
         self.save_config();
     }
@@ -265,15 +366,17 @@ pub fn spawn_for_config(config: &PortConfig) -> PortHandle {
             login: login.as_ref().map(|l| (l.username.clone(), l.password.clone())),
         }),
         PortConfig::Ax25RawSocket { device } => spawn_port(Ax25RawSocketRunner { device: device.clone() }),
-        PortConfig::KissTcp { host, port, my_call, kiss_params } => spawn_port(KissRunner {
+        PortConfig::KissTcp { host, port, my_call, kiss_params, kiss_arq } => spawn_port(KissRunner {
             transport: KissTransport::Tcp { host: host.clone(), port: *port },
             my_call: my_call.clone(),
             params: kiss_params.clone(),
+            arq: kiss_arq.clone(),
         }),
-        PortConfig::KissSerial { device, baud, my_call, kiss_params } => spawn_port(KissRunner {
+        PortConfig::KissSerial { device, baud, my_call, kiss_params, kiss_arq } => spawn_port(KissRunner {
             transport: KissTransport::Serial { device: device.clone(), baud: *baud },
             my_call: my_call.clone(),
             params: kiss_params.clone(),
+            arq: kiss_arq.clone(),
         }),
     }
 }

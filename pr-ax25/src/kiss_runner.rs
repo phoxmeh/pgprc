@@ -9,27 +9,37 @@
 //! read-timeout + stop-flag for the serial case, which has no socket-level
 //! shutdown to rely on.
 //!
-//! Scope: unconnected (UI/beacon) traffic and monitor decode only — see
-//! `raw_socket.rs`/`runner.rs` doc comments for why connected mode is out of
-//! scope for bare KISS.
+//! Scope: unconnected (UI/beacon) traffic, connected-mode AX.25 (modulus-8
+//! ARQ, see `crate::arq`), and XID/SABME handling (declined, see
+//! `crate::xid`/`crate::wire` -- this app only supports modulus-8).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ax25::frame::{Address, Ax25Frame, FrameContent, ProtocolIdentifier, RouteEntry};
 
-use pr_core::{KissParams, PortCommand, PortEvent, PortRunner};
+use pr_core::{ConnState, ConnectionId, KissArqParams, KissParams, NodesBroadcastEntry, PortCommand, PortEvent, PortRunner};
 
+use crate::arq::{arq_config_from, Action, ArqConfig, ArqSession};
 use crate::kiss::{encode_data_frame, encode_param_frame, KissDecoder, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_SLOT_TIME, CMD_TX_DELAY};
+use crate::netrom;
+use crate::wire;
+use crate::xid::{self, XidDecision};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(300);
 /// Every KISS frame we send/receive uses this port; Direwolf's/most TNCs'
 /// raw KISS servers are single-channel, so there's nothing to configure here.
 const KISS_PORT: u8 = 0;
+/// How often `command_loop` wakes up with no real command pending, to drive
+/// ARQ timer checks. Keeps all ARQ state and the stream writer on one
+/// thread (no locks) at the cost of up to this much latency reacting to an
+/// inbound frame -- negligible against multi-second T1 timers.
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 pub enum KissTransport {
     Tcp { host: String, port: u16 },
@@ -40,14 +50,15 @@ pub struct KissRunner {
     pub transport: KissTransport,
     pub my_call: String,
     pub params: KissParams,
+    pub arq: KissArqParams,
 }
 
 impl PortRunner for KissRunner {
     fn run(self: Box<Self>, cmd_rx: mpsc::Receiver<PortCommand>, event_tx: async_channel::Sender<PortEvent>) {
-        let KissRunner { transport, my_call, params } = *self;
+        let KissRunner { transport, my_call, params, arq } = *self;
         match transport {
-            KissTransport::Tcp { host, port } => run_tcp(&host, port, &my_call, &params, cmd_rx, event_tx),
-            KissTransport::Serial { device, baud } => run_serial(&device, baud, &my_call, &params, cmd_rx, event_tx),
+            KissTransport::Tcp { host, port } => run_tcp(&host, port, &my_call, &params, &arq, cmd_rx, event_tx),
+            KissTransport::Serial { device, baud } => run_serial(&device, baud, &my_call, &params, &arq, cmd_rx, event_tx),
         }
     }
 }
@@ -77,9 +88,19 @@ fn run_tcp(
     port: u16,
     my_call: &str,
     params: &KissParams,
+    arq: &KissArqParams,
     cmd_rx: mpsc::Receiver<PortCommand>,
     event_tx: async_channel::Sender<PortEvent>,
 ) {
+    let local = match parse_address(my_call) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            return;
+        }
+    };
+    let arq_cfg = arq_config_from(arq);
+
     let addr = format!("{host}:{port}");
     let mut stream = match TcpStream::connect(&addr) {
         Ok(s) => s,
@@ -107,12 +128,14 @@ fn run_tcp(
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = stop.clone();
     let reader_events = event_tx.clone();
+    let (internal_tx, internal_rx) = mpsc::channel();
+    let reader_local = local.clone();
     let reader_handle = thread::spawn(move || {
-        kiss_read_loop(reader_stream, &reader_events, &reader_stop);
+        kiss_read_loop(reader_stream, &reader_events, &reader_stop, &internal_tx, &reader_local);
     });
 
     let mut writer = stream;
-    command_loop(&mut writer, my_call, &cmd_rx, &event_tx);
+    command_loop(&mut writer, &local, &arq_cfg, &cmd_rx, &internal_rx, &event_tx);
 
     stop.store(true, Ordering::Relaxed);
     let _ = writer.shutdown(std::net::Shutdown::Both);
@@ -125,9 +148,19 @@ fn run_serial(
     baud: u32,
     my_call: &str,
     params: &KissParams,
+    arq: &KissArqParams,
     cmd_rx: mpsc::Receiver<PortCommand>,
     event_tx: async_channel::Sender<PortEvent>,
 ) {
+    let local = match parse_address(my_call) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            return;
+        }
+    };
+    let arq_cfg = arq_config_from(arq);
+
     let mut port = match serialport::new(device, baud).timeout(READ_TIMEOUT).open() {
         Ok(p) => p,
         Err(e) => {
@@ -153,61 +186,310 @@ fn run_serial(
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = stop.clone();
     let reader_events = event_tx.clone();
+    let (internal_tx, internal_rx) = mpsc::channel();
+    let reader_local = local.clone();
     let reader_handle = thread::spawn(move || {
-        kiss_read_loop(reader_port, &reader_events, &reader_stop);
+        kiss_read_loop(reader_port, &reader_events, &reader_stop, &internal_tx, &reader_local);
     });
 
     let mut writer = port;
-    command_loop(&mut writer, my_call, &cmd_rx, &event_tx);
+    command_loop(&mut writer, &local, &arq_cfg, &cmd_rx, &internal_rx, &event_tx);
 
     stop.store(true, Ordering::Relaxed);
     let _ = event_tx.send_blocking(PortEvent::PortDisconnected { reason: None });
     let _ = reader_handle.join();
 }
 
-/// Shared by both transports: blocks on commands and writes KISS-framed
-/// AX.25 frames until told to disconnect.
-fn command_loop(writer: &mut impl Write, my_call: &str, cmd_rx: &mpsc::Receiver<PortCommand>, event_tx: &async_channel::Sender<PortEvent>) {
-    loop {
-        match cmd_rx.recv() {
-            Ok(PortCommand::SendUnproto { dest, via, bytes }) => {
-                // A raw KISS TNC (unlike AGWPE) won't echo our own
-                // transmission back to us, so log it locally.
-                let text = String::from_utf8_lossy(&bytes).replace('\0', "");
-                match build_ui_frame(my_call, &dest, &via, bytes) {
-                    Ok(frame) => {
-                        let kiss_bytes = encode_data_frame(KISS_PORT, &frame.to_bytes());
-                        if writer.write_all(&kiss_bytes).is_err() {
-                            break;
-                        }
-                        let via_suffix =
-                            if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
-                        // `to: None` — our own transmission, never "directed
-                        // at me" regardless of `dest`.
-                        let _ = event_tx.send_blocking(PortEvent::Monitor {
-                            line: format!("{my_call} > {dest}{via_suffix} [unproto TX]: {text}"),
-                            from: None,
-                            to: None,
-                            message: None,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
-                    }
-                }
-            }
-            Ok(PortCommand::Disconnect) => break,
-            // Connected-mode over bare KISS isn't implemented; ignore.
-            Ok(_) => {}
-            Err(_) => break,
+/// One connected-mode session per remote callsign, multiplexed over the
+/// one shared KISS stream -- mirrors AGWPE's `ConnMap` precedent (AX.25
+/// addressing has no numeric connection id of its own either), except a
+/// single monotonic id counter is enough here since only `command_loop`'s
+/// thread ever touches this map (no incoming/outgoing id-range race to
+/// avoid, unlike AGWPE's reader+writer-thread-shared `Mutex<ConnMap>`).
+struct ConnMap {
+    sessions: HashMap<ConnectionId, ArqSession>,
+    call_to_id: HashMap<String, ConnectionId>,
+    next_id: AtomicU64,
+}
+
+impl ConnMap {
+    fn new() -> Self {
+        Self { sessions: HashMap::new(), call_to_id: HashMap::new(), next_id: AtomicU64::new(1) }
+    }
+    fn alloc_id(&self) -> ConnectionId {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+    fn id_for_call(&self, call: &str) -> Option<ConnectionId> {
+        self.call_to_id.get(call).copied()
+    }
+    fn insert(&mut self, id: ConnectionId, call: String, session: ArqSession) {
+        self.call_to_id.insert(call, id);
+        self.sessions.insert(id, session);
+    }
+    fn remove(&mut self, id: ConnectionId) {
+        if self.sessions.remove(&id).is_some() {
+            self.call_to_id.retain(|_, v| *v != id);
         }
     }
 }
 
+fn remove_if_disconnected(id: ConnectionId, conns: &mut ConnMap) {
+    if conns.sessions.get(&id).map(ArqSession::state) == Some(ConnState::Disconnected) {
+        conns.remove(id);
+    }
+}
+
+/// A decoded-off-the-wire event handed from the reader thread to
+/// `command_loop`, which owns all ARQ state and the stream writer.
+enum InternalEvent {
+    /// An ARQ-relevant frame the `ax25` crate could decode, addressed to us.
+    Frame(Ax25Frame),
+    /// SABME (extended-mode connect) -- the crate can't decode this at all;
+    /// `wire::parse_header` recovered just the addressing.
+    RawSabme { remote: Address, route: Vec<RouteEntry> },
+    /// XID (parameter negotiation) -- same situation as SABME.
+    RawXid { remote: Address, route: Vec<RouteEntry>, payload: Vec<u8> },
+}
+
+/// Shared by both transports: owns the ARQ state for every live connection
+/// on this port, drains decoded frames from the reader thread, handles UI
+/// commands, and drives periodic T1 timer checks -- all on this one
+/// thread, so no locking is needed anywhere in `crate::arq`.
+fn command_loop(
+    writer: &mut impl Write,
+    local: &Address,
+    arq_cfg: &ArqConfig,
+    cmd_rx: &mpsc::Receiver<PortCommand>,
+    internal_rx: &mpsc::Receiver<InternalEvent>,
+    event_tx: &async_channel::Sender<PortEvent>,
+) {
+    let mut conns = ConnMap::new();
+    'outer: loop {
+        while let Ok(ev) = internal_rx.try_recv() {
+            if !handle_internal_event(ev, local, arq_cfg, &mut conns, writer, event_tx) {
+                break 'outer;
+            }
+        }
+
+        let alive = match cmd_rx.recv_timeout(TICK_INTERVAL) {
+            Ok(PortCommand::SendUnproto { dest, via, bytes }) => send_unproto(writer, local, &dest, &via, bytes, event_tx),
+            Ok(PortCommand::OpenConnection { remote, via }) => open_connection(local, remote, via, arq_cfg, &mut conns, writer, event_tx),
+            Ok(PortCommand::Send { id, bytes }) => {
+                if let Some(session) = conns.sessions.get_mut(&id) {
+                    let actions = session.send(bytes, Instant::now());
+                    let ok = apply_actions(id, actions, writer, event_tx);
+                    remove_if_disconnected(id, &mut conns);
+                    ok
+                } else {
+                    true
+                }
+            }
+            Ok(PortCommand::CloseConnection { id }) => {
+                if let Some(session) = conns.sessions.get_mut(&id) {
+                    let actions = session.close(Instant::now());
+                    let ok = apply_actions(id, actions, writer, event_tx);
+                    remove_if_disconnected(id, &mut conns);
+                    ok
+                } else {
+                    true
+                }
+            }
+            Ok(PortCommand::Disconnect) => break 'outer,
+            Ok(PortCommand::Connect) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+        };
+        if !alive {
+            break 'outer;
+        }
+
+        let ids: Vec<ConnectionId> = conns.sessions.keys().copied().collect();
+        for id in ids {
+            if let Some(session) = conns.sessions.get_mut(&id) {
+                let actions = session.tick(Instant::now());
+                if !apply_actions(id, actions, writer, event_tx) {
+                    break 'outer;
+                }
+            }
+            remove_if_disconnected(id, &mut conns);
+        }
+    }
+
+    // Give every still-live peer a real DISC instead of just vanishing.
+    // Best-effort: ignore further write failures, we're exiting either way.
+    let ids: Vec<ConnectionId> = conns.sessions.keys().copied().collect();
+    for id in ids {
+        if let Some(session) = conns.sessions.get_mut(&id) {
+            let actions = session.close(Instant::now());
+            apply_actions(id, actions, writer, event_tx);
+        }
+    }
+}
+
+/// Returns `false` if a write failed (dead socket) -- the caller then tears
+/// the whole port down, matching the pre-existing single-purpose behavior
+/// this generalizes (the old `SendUnproto`-only `command_loop` broke out of
+/// its loop on a failed `write_all`).
+fn handle_internal_event(
+    ev: InternalEvent,
+    local: &Address,
+    arq_cfg: &ArqConfig,
+    conns: &mut ConnMap,
+    writer: &mut impl Write,
+    event_tx: &async_channel::Sender<PortEvent>,
+) -> bool {
+    match ev {
+        InternalEvent::RawSabme { remote, route } => {
+            let dm = wire::build_dm(local, &remote, wire::reverse_route(&route), true);
+            let ok = write_frame(writer, &dm);
+            let _ = event_tx.send_blocking(PortEvent::Monitor {
+                line: format!("{remote} > {local} [SABME] declined (extended mode not supported)"),
+                from: None,
+                to: None,
+                message: None,
+            });
+            ok
+        }
+        InternalEvent::RawXid { remote, route, payload } => match xid::handle_peer_xid(local, &remote, &route, &payload, arq_cfg) {
+            XidDecision::Reply(bytes) => write_raw(writer, &bytes),
+            XidDecision::Decline(dm) => write_frame(writer, &dm),
+        },
+        InternalEvent::Frame(frame) => {
+            let remote_call = frame.source.to_string();
+            if let Some(id) = conns.id_for_call(&remote_call) {
+                let ok = if let Some(session) = conns.sessions.get_mut(&id) {
+                    let actions = session.on_frame(&frame, Instant::now());
+                    apply_actions(id, actions, writer, event_tx)
+                } else {
+                    true
+                };
+                remove_if_disconnected(id, conns);
+                ok
+            } else if let FrameContent::SetAsynchronousBalancedMode(s) = &frame.content {
+                // A bare incoming SABM with no existing session -- mint one
+                // and accept it, mirroring the raw-socket backend's accept
+                // path (StationHeard -> ConnectionOpened -> Connected
+                // directly, skipping Connecting).
+                let id = conns.alloc_id();
+                let _ = event_tx.send_blocking(PortEvent::StationHeard { callsign: remote_call.clone() });
+                let _ = event_tx.send_blocking(PortEvent::ConnectionOpened { id, label: remote_call.clone(), to: Some(local.to_string()) });
+                let route = wire::reverse_route(&frame.route);
+                let mut session = ArqSession::new(local.clone(), frame.source.clone(), route, arq_cfg.clone());
+                let actions = session.accept_incoming(s.poll, Instant::now());
+                conns.insert(id, remote_call, session);
+                apply_actions(id, actions, writer, event_tx)
+            } else if matches!(frame.content, FrameContent::Disconnect(_)) {
+                // A DISC for a link we have no record of -- decline politely
+                // rather than staying silent.
+                let dm = wire::build_dm(local, &frame.source, wire::reverse_route(&frame.route), true);
+                write_frame(writer, &dm)
+            } else {
+                // I/RR/RNR/REJ/UA/DM/FRMR with no matching session: stale or
+                // unroutable traffic -- already Monitor-logged by the reader
+                // thread, nothing more to do.
+                true
+            }
+        }
+    }
+}
+
+fn send_unproto(writer: &mut impl Write, local: &Address, dest: &str, via: &[String], bytes: Vec<u8>, event_tx: &async_channel::Sender<PortEvent>) -> bool {
+    // A raw KISS TNC (unlike AGWPE) won't echo our own transmission back to
+    // us, so log it locally.
+    let my_call = local.to_string();
+    let text = String::from_utf8_lossy(&bytes).replace('\0', "");
+    match build_ui_frame(&my_call, dest, via, bytes) {
+        Ok(frame) => {
+            let ok = write_frame(writer, &frame);
+            let via_suffix = if via.is_empty() { String::new() } else { format!(" via {}", via.join(",")) };
+            // `to: None` — our own transmission, never "directed at me"
+            // regardless of `dest`.
+            let _ = event_tx.send_blocking(PortEvent::Monitor {
+                line: format!("{my_call} > {dest}{via_suffix} [unproto TX]: {text}"),
+                from: None,
+                to: None,
+                message: None,
+            });
+            ok
+        }
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            true // a bad address isn't a dead socket -- don't tear the port down over it
+        }
+    }
+}
+
+fn open_connection(
+    local: &Address,
+    remote: String,
+    via: Vec<String>,
+    arq_cfg: &ArqConfig,
+    conns: &mut ConnMap,
+    writer: &mut impl Write,
+    event_tx: &async_channel::Sender<PortEvent>,
+) -> bool {
+    let remote_addr = match parse_address(&remote) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            return true;
+        }
+    };
+    let mut route = Vec::with_capacity(via.len());
+    for digi in &via {
+        match parse_address(digi) {
+            Ok(repeater) => route.push(RouteEntry { repeater, has_repeated: false }),
+            Err(e) => {
+                let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+                return true;
+            }
+        }
+    }
+
+    let id = conns.alloc_id();
+    let _ = event_tx.send_blocking(PortEvent::StationHeard { callsign: remote.clone() });
+    let _ = event_tx.send_blocking(PortEvent::ConnectionOpened { id, label: remote.clone(), to: Some(local.to_string()) });
+    let mut session = ArqSession::new(local.clone(), remote_addr, route, arq_cfg.clone());
+    let actions = session.open(Instant::now());
+    conns.insert(id, remote, session);
+    apply_actions(id, actions, writer, event_tx)
+}
+
+fn apply_actions(id: ConnectionId, actions: Vec<Action>, writer: &mut impl Write, event_tx: &async_channel::Sender<PortEvent>) -> bool {
+    let mut ok = true;
+    for action in actions {
+        match action {
+            Action::Transmit(frame) => ok &= write_frame(writer, &frame),
+            Action::TransmitRaw(bytes) => ok &= write_raw(writer, &bytes),
+            Action::Data(bytes) => {
+                let _ = event_tx.send_blocking(PortEvent::Data { id, bytes });
+            }
+            Action::StateChanged(state) => {
+                let _ = event_tx.send_blocking(PortEvent::ConnState { id, state });
+            }
+            Action::Monitor(line) => {
+                let _ = event_tx.send_blocking(PortEvent::Monitor { line, from: None, to: None, message: None });
+            }
+            Action::Closed => {
+                let _ = event_tx.send_blocking(PortEvent::ConnectionClosed { id });
+            }
+        }
+    }
+    ok
+}
+
+fn write_frame(writer: &mut impl Write, frame: &Ax25Frame) -> bool {
+    writer.write_all(&encode_data_frame(KISS_PORT, &frame.to_bytes())).is_ok()
+}
+
+fn write_raw(writer: &mut impl Write, bytes: &[u8]) -> bool {
+    writer.write_all(&encode_data_frame(KISS_PORT, bytes)).is_ok()
+}
+
 /// Read loop shared by TCP and serial: both have a read timeout set so this
-/// wakes up periodically to check `stop`, since neither transport gives us a
-/// single portable "you're cancelled now" signal otherwise.
-fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEvent>, stop: &AtomicBool) {
+/// wakes up periodically to check `stop`, since neither transport gives us
+/// a single portable "you're cancelled now" signal otherwise.
+fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEvent>, stop: &AtomicBool, internal_tx: &mpsc::Sender<InternalEvent>, local: &Address) {
     let mut decoder = KissDecoder::new();
     let mut buf = [0u8; 1024];
     while !stop.load(Ordering::Relaxed) {
@@ -218,24 +500,7 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
                     if cmd & 0x0F != 0 {
                         continue; // only interested in data frames
                     }
-                    if let Ok(frame) = Ax25Frame::from_bytes(&payload) {
-                        let _ = events.send_blocking(PortEvent::StationHeard { callsign: frame.source.to_string() });
-                        // Only UI frames are notification-eligible — I/S/etc
-                        // frames belong to someone else's connected-mode
-                        // session we're passively monitoring, not a
-                        // standalone directed message, and would otherwise
-                        // fire once per frame of an ongoing conversation.
-                        let (to, from, message) = match &frame.content {
-                            FrameContent::UnnumberedInformation(ui) => (
-                                Some(frame.destination.to_string()),
-                                Some(frame.source.to_string()),
-                                Some(String::from_utf8_lossy(&ui.info).replace('\0', "")),
-                            ),
-                            _ => (None, None, None),
-                        };
-                        let _ =
-                            events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame), from, to, message });
-                    }
+                    handle_kiss_payload(&payload, events, internal_tx, local);
                 }
             }
             Err(e)
@@ -248,6 +513,91 @@ fn kiss_read_loop(mut reader: impl Read, events: &async_channel::Sender<PortEven
             }
             Err(_) => break,
         }
+    }
+}
+
+/// Classifies one decoded KISS payload and both logs it (Monitor/
+/// StationHeard, exactly as before this feature existed) and, for traffic
+/// addressed to us that's relevant to the ARQ engine, forwards it to
+/// `command_loop` via `internal_tx`.
+fn handle_kiss_payload(payload: &[u8], events: &async_channel::Sender<PortEvent>, internal_tx: &mpsc::Sender<InternalEvent>, local: &Address) {
+    let Some(header) = wire::parse_header(payload) else { return };
+    let Some(control) = wire::control_byte(payload, &header) else { return };
+
+    if wire::is_sabme(control) {
+        let _ = events.send_blocking(PortEvent::StationHeard { callsign: header.source.to_string() });
+        let _ = events.send_blocking(PortEvent::Monitor {
+            line: format!("{} > {} [SABME]", header.source, header.destination),
+            from: None,
+            to: None,
+            message: None,
+        });
+        if header.destination == *local {
+            let _ = internal_tx.send(InternalEvent::RawSabme { remote: header.source, route: header.route });
+        }
+        return;
+    }
+    if wire::is_xid(control) {
+        let _ = events.send_blocking(PortEvent::StationHeard { callsign: header.source.to_string() });
+        let _ = events.send_blocking(PortEvent::Monitor {
+            line: format!("{} > {} [XID]", header.source, header.destination),
+            from: None,
+            to: None,
+            message: None,
+        });
+        if header.destination == *local {
+            let xid_payload = payload[header.control_offset + 1..].to_vec();
+            let _ = internal_tx.send(InternalEvent::RawXid { remote: header.source, route: header.route, payload: xid_payload });
+        }
+        return;
+    }
+
+    let Ok(frame) = Ax25Frame::from_bytes(payload) else { return };
+    let _ = events.send_blocking(PortEvent::StationHeard { callsign: frame.source.to_string() });
+    // Only UI frames are notification-eligible — I/S/etc frames belong to
+    // someone else's connected-mode session we're passively monitoring, not
+    // a standalone directed message, and would otherwise fire once per
+    // frame of an ongoing conversation.
+    let (to, from, message) = match &frame.content {
+        FrameContent::UnnumberedInformation(ui) => (
+            Some(frame.destination.to_string()),
+            Some(frame.source.to_string()),
+            Some(String::from_utf8_lossy(&ui.info).replace('\0', "")),
+        ),
+        _ => (None, None, None),
+    };
+    if let FrameContent::UnnumberedInformation(ui) = &frame.content {
+        if ui.pid == ProtocolIdentifier::NetRom && frame.destination.callsign().eq_ignore_ascii_case("NODES") {
+            if let Some(broadcast) = netrom::parse_nodes_broadcast(&ui.info) {
+                let entries = broadcast
+                    .entries
+                    .into_iter()
+                    .map(|e| NodesBroadcastEntry { callsign: e.callsign, alias: e.alias })
+                    .collect();
+                let _ = events.send_blocking(PortEvent::NodesBroadcast {
+                    from: frame.source.to_string(),
+                    sender_alias: broadcast.sender_alias,
+                    entries,
+                });
+            }
+        }
+    }
+    let _ = events.send_blocking(PortEvent::Monitor { line: describe_frame(&frame), from, to, message });
+
+    let is_arq_relevant = matches!(
+        frame.content,
+        FrameContent::Information(_)
+            | FrameContent::ReceiveReady(_)
+            | FrameContent::ReceiveNotReady(_)
+            | FrameContent::Reject(_)
+            | FrameContent::SetAsynchronousBalancedMode(_)
+            | FrameContent::Disconnect(_)
+            | FrameContent::DisconnectedMode(_)
+            | FrameContent::UnnumberedAcknowledge(_)
+            | FrameContent::FrameReject(_)
+    );
+    if is_arq_relevant && frame.destination == *local {
+        let _ = internal_tx.send(InternalEvent::Frame(frame));
     }
 }
 
@@ -327,4 +677,160 @@ fn parse_address(input: &str) -> Result<Address, String> {
         None => (input, 0),
     };
     Address::from_parts(call.to_string(), ssid).map_err(|e| format!("invalid callsign '{input}': {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ax25::frame::{CommandResponse, SetAsynchronousBalancedMode};
+
+    fn addr(s: &str) -> Address {
+        s.parse().unwrap()
+    }
+
+    fn drain_events(rx: &async_channel::Receiver<PortEvent>) -> Vec<PortEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn conn_map_alloc_insert_remove() {
+        let mut conns = ConnMap::new();
+        let id1 = conns.alloc_id();
+        let id2 = conns.alloc_id();
+        assert_ne!(id1, id2);
+        conns.insert(id1, "N0CALL-1".to_string(), ArqSession::new(addr("KD3BFP-9"), addr("N0CALL-1"), vec![], ArqConfig::default()));
+        assert_eq!(conns.id_for_call("N0CALL-1"), Some(id1));
+        conns.remove(id1);
+        assert_eq!(conns.id_for_call("N0CALL-1"), None);
+    }
+
+    #[test]
+    fn handle_kiss_payload_forwards_sabme_addressed_to_us_and_tags_monitor() {
+        let local = addr("N0CALL-1");
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let (internal_tx, internal_rx) = mpsc::channel();
+
+        let scaffold = Ax25Frame {
+            source: addr("KD3BFP-9"),
+            destination: local.clone(),
+            route: vec![],
+            command_or_response: Some(CommandResponse::Command),
+            content: FrameContent::SetAsynchronousBalancedMode(SetAsynchronousBalancedMode { poll: true }),
+        };
+        let mut bytes = scaffold.to_bytes();
+        let header = wire::parse_header(&bytes).unwrap();
+        bytes[header.control_offset] = wire::CTRL_SABME;
+
+        handle_kiss_payload(&bytes, &events_tx, &internal_tx, &local);
+
+        let events = drain_events(&events_rx);
+        assert!(events.iter().any(|e| matches!(e, PortEvent::StationHeard { callsign } if callsign == "KD3BFP-9")));
+        assert!(events.iter().any(|e| matches!(e, PortEvent::Monitor { line, .. } if line.contains("[SABME]"))));
+        match internal_rx.try_recv() {
+            Ok(InternalEvent::RawSabme { remote, .. }) => assert_eq!(remote, addr("KD3BFP-9")),
+            Ok(_) => panic!("expected RawSabme"),
+            Err(_) => panic!("internal channel was empty"),
+        }
+    }
+
+    #[test]
+    fn handle_kiss_payload_does_not_forward_sabme_addressed_to_someone_else() {
+        let local = addr("N0CALL-1");
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let (internal_tx, internal_rx) = mpsc::channel();
+
+        let scaffold = Ax25Frame {
+            source: addr("KD3BFP-9"),
+            destination: addr("OTHER-2"),
+            route: vec![],
+            command_or_response: Some(CommandResponse::Command),
+            content: FrameContent::SetAsynchronousBalancedMode(SetAsynchronousBalancedMode { poll: true }),
+        };
+        let mut bytes = scaffold.to_bytes();
+        let header = wire::parse_header(&bytes).unwrap();
+        bytes[header.control_offset] = wire::CTRL_SABME;
+
+        handle_kiss_payload(&bytes, &events_tx, &internal_tx, &local);
+
+        // Still logged for passive monitoring...
+        let events = drain_events(&events_rx);
+        assert!(events.iter().any(|e| matches!(e, PortEvent::Monitor { line, .. } if line.contains("[SABME]"))));
+        // ...but never handed to the ARQ engine, since it's not for us.
+        assert!(internal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_kiss_payload_forwards_xid_addressed_to_us() {
+        let local = addr("N0CALL-1");
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let (internal_tx, internal_rx) = mpsc::channel();
+
+        let scaffold = Ax25Frame {
+            source: addr("KD3BFP-9"),
+            destination: local.clone(),
+            route: vec![],
+            command_or_response: Some(CommandResponse::Command),
+            content: FrameContent::SetAsynchronousBalancedMode(SetAsynchronousBalancedMode { poll: true }),
+        };
+        let mut bytes = scaffold.to_bytes();
+        let header = wire::parse_header(&bytes).unwrap();
+        bytes.truncate(header.control_offset);
+        bytes.push(wire::CTRL_XID);
+        bytes.extend_from_slice(&crate::xid::encode(&crate::xid::our_params(&ArqConfig::default())));
+
+        handle_kiss_payload(&bytes, &events_tx, &internal_tx, &local);
+
+        let events = drain_events(&events_rx);
+        assert!(events.iter().any(|e| matches!(e, PortEvent::Monitor { line, .. } if line.contains("[XID]"))));
+        match internal_rx.try_recv() {
+            Ok(InternalEvent::RawXid { remote, payload, .. }) => {
+                assert_eq!(remote, addr("KD3BFP-9"));
+                assert!(crate::xid::decode(&payload).is_ok());
+            }
+            Ok(_) => panic!("expected RawXid"),
+            Err(_) => panic!("internal channel was empty"),
+        }
+    }
+
+    #[test]
+    fn handle_kiss_payload_forwards_arq_relevant_frame_addressed_to_us() {
+        let local = addr("N0CALL-1");
+        let (events_tx, _events_rx) = async_channel::unbounded();
+        let (internal_tx, internal_rx) = mpsc::channel();
+
+        let frame = Ax25Frame {
+            source: addr("KD3BFP-9"),
+            destination: local.clone(),
+            route: vec![],
+            command_or_response: Some(CommandResponse::Command),
+            content: FrameContent::SetAsynchronousBalancedMode(SetAsynchronousBalancedMode { poll: true }),
+        };
+        let bytes = frame.to_bytes();
+
+        handle_kiss_payload(&bytes, &events_tx, &internal_tx, &local);
+
+        match internal_rx.try_recv() {
+            Ok(InternalEvent::Frame(f)) => assert_eq!(f.source, addr("KD3BFP-9")),
+            Ok(_) => panic!("expected Frame"),
+            Err(_) => panic!("internal channel was empty"),
+        }
+    }
+
+    #[test]
+    fn handle_kiss_payload_does_not_forward_ui_frames_to_the_arq_engine() {
+        let local = addr("N0CALL-1");
+        let (events_tx, _events_rx) = async_channel::unbounded();
+        let (internal_tx, internal_rx) = mpsc::channel();
+
+        let frame = Ax25Frame::new_simple_ui_frame(addr("KD3BFP-9"), local.clone(), b"CQ CQ".to_vec());
+        let bytes = frame.to_bytes();
+
+        handle_kiss_payload(&bytes, &events_tx, &internal_tx, &local);
+
+        assert!(internal_rx.try_recv().is_err());
+    }
 }
