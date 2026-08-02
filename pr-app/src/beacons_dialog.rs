@@ -73,8 +73,11 @@ fn rebuild_list(ui: &Rc<Ui>, list_box: &gtk::ListBox) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
     }
-    let entries: Vec<Beacon> = ui.state.config.borrow().beacons.clone();
-    for entry in entries {
+    // Pinned beacons first, then the rest in their stored order.
+    let all: Vec<Beacon> = ui.state.config.borrow().beacons.clone();
+    let pinned: Vec<_> = all.iter().filter(|b| b.pinned).cloned().collect();
+    let normal: Vec<_> = all.iter().filter(|b| !b.pinned).cloned().collect();
+    for entry in pinned.into_iter().chain(normal) {
         list_box.append(&build_beacon_row(ui, entry, list_box));
     }
 }
@@ -123,25 +126,35 @@ fn build_beacon_row(ui: &Rc<Ui>, entry: Beacon, list_box: &gtk::ListBox) -> gtk:
     }
     row.append(&edit_button);
 
-    let remove_button = gtk::Button::with_label("Remove");
-    {
-        let ui = ui.clone();
-        let id = entry.id.clone();
-        let list_box = list_box.clone();
-        remove_button.connect_clicked(move |_| {
-            ui.state.config.borrow_mut().beacons.retain(|b| b.id != id);
-            ui.state.save_config();
-            ui.reschedule_beacons();
-            rebuild_list(&ui, &list_box);
-        });
+    if !entry.pinned {
+        let remove_button = gtk::Button::with_label("Remove");
+        {
+            let ui = ui.clone();
+            let id = entry.id.clone();
+            let list_box = list_box.clone();
+            remove_button.connect_clicked(move |_| {
+                ui.state.config.borrow_mut().beacons.retain(|b| b.id != id);
+                ui.state.save_config();
+                ui.reschedule_beacons();
+                rebuild_list(&ui, &list_box);
+            });
+        }
+        row.append(&remove_button);
     }
-    row.append(&remove_button);
 
     row.upcast()
 }
 
 fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon>, list_box: &gtk::ListBox) {
-    let (win, root) = dialog_window(parent, if existing.is_some() { "Edit Beacon" } else { "Add Beacon" }, 420);
+    let is_pinned = existing.as_ref().is_some_and(|e| e.pinned);
+    let title = if is_pinned {
+        existing.as_ref().map(|e| format!("Edit {} Beacon", e.dest)).unwrap_or_else(|| "Edit Beacon".to_string())
+    } else if existing.is_some() {
+        "Edit Beacon".to_string()
+    } else {
+        "Add Beacon".to_string()
+    };
+    let (win, root) = dialog_window(parent, &title, 420);
 
     let ports = ui.state.config.borrow().ports.clone();
     let port_names: Vec<&str> = ports.iter().map(|p| p.name.as_str()).collect();
@@ -154,8 +167,23 @@ fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon
     }
     root.append(&labeled("Port", &port_dropdown));
 
-    let dest_entry = gtk::Entry::builder().placeholder_text("BEACON").text(existing.as_ref().map(|e| e.dest.as_str()).unwrap_or("BEACON")).build();
-    root.append(&labeled("Destination", &dest_entry));
+    // Pinned beacons have a fixed destination — show it as a read-only label
+    // so it's visible but can't be accidentally changed.
+    let dest_text = existing.as_ref().map(|e| e.dest.as_str()).unwrap_or("BEACON");
+    if is_pinned {
+        let dest_label = gtk::Label::new(Some(dest_text));
+        dest_label.set_halign(gtk::Align::Start);
+        dest_label.add_css_class("dim-label");
+        root.append(&labeled("Destination", &dest_label));
+    }
+    let dest_entry = if is_pinned {
+        // Entry still needed for the save handler; just hidden.
+        gtk::Entry::builder().text(dest_text).build()
+    } else {
+        let e = gtk::Entry::builder().placeholder_text("BEACON").text(dest_text).build();
+        root.append(&labeled("Destination", &e));
+        e
+    };
 
     let via_entry =
         gtk::Entry::builder().placeholder_text("WIDE1-1,WIDE2-1 (optional)").text(existing.as_ref().map(|e| e.via.as_str()).unwrap_or("")).build();
@@ -225,6 +253,7 @@ fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon
                     slot.message = message;
                     slot.interval_secs = interval_secs;
                     slot.enabled = enabled_check.is_active();
+                    // `pinned` is never changed through the UI.
                 }
             } else {
                 let id = next_id(&cfg);
@@ -236,6 +265,7 @@ fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon
                     message,
                     interval_secs,
                     enabled: enabled_check.is_active(),
+                    pinned: false,
                 });
             }
             drop(cfg);

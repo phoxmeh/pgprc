@@ -19,6 +19,18 @@ pub fn show(ui: &Rc<Ui>) {
     let enable_button = gtk::Button::with_label("Enable");
     recolor_enable_button(&enable_button, current_state(ui));
     header.pack_start(&enable_button);
+
+    let settings_button = gtk::Button::from_icon_name("emblem-system-symbolic");
+    settings_button.set_tooltip_text(Some("Mailbox Settings\u{2026}"));
+    settings_button.add_css_class("flat");
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        settings_button.connect_clicked(move |_| {
+            show_settings(&ui, &win);
+        });
+    }
+    header.pack_end(&settings_button);
     {
         let ui = ui.clone();
         let win = win.clone();

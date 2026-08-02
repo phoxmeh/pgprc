@@ -4,9 +4,10 @@ pub mod port;
 pub mod transports;
 
 pub use config::{
-    AddressBookEntry, AgwpeLogin, AppConfig, Beacon, BeaconMonitorRule, BeaconPacketLogEntry, BeaconPrefs, DirewolfPrefs,
+    AddressBookEntry, AgwpeLogin, AppConfig, Beacon, BeaconMonitorRule, BeaconPrefs, DirewolfPrefs,
     HighlightPrefs, HighlightRule, IncomingBeacon, KeyboardModePrefs, KissArqParams, KissParams, MailboxMessage,
     MailboxPrefs, NodeHistory, NotifiedPacket, NotifyPrefs, PinnedSession, PortConfig, PortEntry, QsoLogEntry, UiPrefs,
+    DEFAULT_ID_BEACON_ID,
 };
 pub use history_paths::{history_dir, history_file_path, sanitize_component};
 pub use port::{spawn_port, ConnState, ConnectionId, NodesBroadcastEntry, PortCommand, PortEvent, PortHandle, PortRunner};

@@ -165,17 +165,10 @@ pub struct AddressBookEntry {
     /// code — deserializes correctly.
     #[serde(default = "default_true")]
     pub heard_direct: bool,
-    /// Last 5 unique message texts this station sent to destination
-    /// "BEACON", most-recent-first — see `AppState::record_beacon_packet`.
+    /// The most recent identification/beacon text received from this station
+    /// (to destination "BEACON"). Updated only when the text actually changes.
     #[serde(default)]
-    pub recent_beacons: Vec<BeaconPacketLogEntry>,
-}
-
-/// One entry in `AddressBookEntry::recent_beacons`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeaconPacketLogEntry {
-    pub text: String,
-    pub when: String,
+    pub id_packet: Option<String>,
 }
 
 /// A tab the user pinned: its (port, node) shell is recreated automatically
@@ -359,20 +352,27 @@ pub struct DirewolfPrefs {
 }
 
 /// Desktop notification preferences. Off by default, like the mailbox —
-/// firing OS notifications is a side effect the user should opt into. Three
-/// independent toggles since these are genuinely different kinds of traffic
-/// a user may want to track separately: an incoming connection or a frame
-/// directed at your own callsign, a frame matching a user `HighlightRule`
-/// with its `notify` flag set, and a frame matching a `BeaconMonitorRule`
-/// (tracked in the Incoming Beacons list, not user-destination traffic).
+/// firing OS notifications is a side effect the user should opt into. Two
+/// independent controls: a per-type toggle for directed traffic (an incoming
+/// connection or a frame addressed to your own callsign), and a global
+/// "silenced" flag that suppresses desktop alerts and sound without losing
+/// the in-app log. Destination Monitor Rule matches always log and notify
+/// (unless silenced); there is no separate per-rule toggle.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotifyPrefs {
+    /// Fire a desktop notification when traffic is directed at your callsign
+    /// or an unsolicited incoming connection arrives.
     #[serde(default)]
     pub directed_enabled: bool,
+    /// When true: still log all notifications and light up the header button,
+    /// but suppress desktop alerts and sound. Toggled via right-click on the
+    /// Notifications header button.
     #[serde(default)]
-    pub custom_enabled: bool,
+    pub notifications_silenced: bool,
+    /// Optional path to an audio file (WAV/OGG/FLAC) played via `paplay`/
+    /// `aplay` when a notification fires and is not silenced.
     #[serde(default)]
-    pub beacon_enabled: bool,
+    pub notification_sound: Option<String>,
 }
 
 /// A packet whose destination triggered a desktop notification, kept for
@@ -417,7 +417,13 @@ pub struct Beacon {
     pub interval_secs: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Built-in entry that cannot be removed, only disabled. Pinned at the
+    /// top of the beacons list. (Currently used for the ID beacon.)
+    #[serde(default)]
+    pub pinned: bool,
 }
+
+pub const DEFAULT_ID_BEACON_ID: &str = "beacon-default-id";
 
 /// Global on/off switch for every scheduled outgoing beacon at once,
 /// independent of each `Beacon.enabled` flag — lives in general
@@ -435,18 +441,26 @@ impl Default for BeaconPrefs {
     }
 }
 
-/// A user-defined rule for detecting "this looks like a beacon" among
-/// incoming UI frames, tracked in the Incoming Beacons list. Uses a real
-/// regex against the frame's destination — unlike `HighlightRule`'s comma/
-/// pipe literal list — since beacon destination formats vary widely (not
-/// just literal tokens like "CQ"/"BEACON").
+/// A user-defined rule for custom notifications: matches incoming UI frames
+/// whose destination matches `pattern` (regex) and, if `sender` is non-empty,
+/// whose source callsign (SSID-stripped) matches `sender`. An empty `sender`
+/// means "any sender" (@ALL).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeaconMonitorRule {
     pub id: String,
     pub label: String,
+    /// Case-insensitive regex matched against the frame's destination field.
     pub pattern: String,
+    /// If non-empty, only match frames from this callsign (SSID-stripped
+    /// case-insensitive). Empty = match any sender.
+    #[serde(default)]
+    pub sender: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Rule was auto-created from an address book entry. Pinned at top of
+    /// list; shown with an address-book icon instead of an enable checkbox.
+    #[serde(default)]
+    pub from_address_book: bool,
 }
 
 /// One received frame that matched a `BeaconMonitorRule`, kept for later
@@ -468,13 +482,9 @@ pub struct AgwpeLogin {
 }
 
 /// A user-defined destination-address rule: any line containing a token
-/// matching `pattern` gets that span colored, and — when `notify` is set —
-/// a frame whose destination exactly matches also raises a desktop
-/// notification (subject to `NotifyPrefs.enabled`). One rule list drives
-/// both features, since "addresses I want to highlight" and "addresses I
-/// want to be notified about" are the same underlying concept. Seeded by
-/// default with common traffic keywords (CQ, BEACON, IDENT); users add more
-/// of these for their own nets/bulletins/watched callsigns.
+/// matching `pattern` gets that span colored. Seeded by default with common
+/// traffic keywords (CQ, BEACON, IDENT); users add more for their own
+/// nets/bulletins/watched callsigns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighlightRule {
     pub label: String,
@@ -483,10 +493,6 @@ pub struct HighlightRule {
     pub pattern: String,
     /// A CSS-style color, e.g. `"#FFD700"`.
     pub color: String,
-    /// Also raise a desktop notification when a frame's destination
-    /// exactly matches this rule.
-    #[serde(default)]
-    pub notify: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -537,14 +543,8 @@ fn default_ax25_command_color() -> String {
 
 fn default_rules() -> Vec<HighlightRule> {
     vec![
-        HighlightRule { label: "CQ".to_string(), pattern: "CQ".to_string(), color: "#FFD700".to_string(), notify: false, enabled: true },
-        HighlightRule {
-            label: "BEACON/IDENT".to_string(),
-            pattern: "BEACON,IDENT".to_string(),
-            color: "#FF8C00".to_string(),
-            notify: false,
-            enabled: true,
-        },
+        HighlightRule { label: "CQ".to_string(), pattern: "CQ".to_string(), color: "#FFD700".to_string(), enabled: true },
+        HighlightRule { label: "BEACON/IDENT".to_string(), pattern: "BEACON,IDENT".to_string(), color: "#FF8C00".to_string(), enabled: true },
     ]
 }
 
@@ -922,6 +922,19 @@ impl AppConfig {
         cfg.highlighting.rules = load_part::<RulesFile>(&Self::rules_path(&dir))?.rules;
         cfg.pinned_sessions = load_part::<PinnedSessionsFile>(&Self::pinned_sessions_path(&dir))?.pinned_sessions;
         cfg.beacons = load_part::<BeaconsFile>(&Self::beacons_path(&dir))?.beacons;
+        // Ensure the built-in ID beacon always exists (can't be removed via UI).
+        if !cfg.beacons.iter().any(|b| b.id == DEFAULT_ID_BEACON_ID) {
+            cfg.beacons.insert(0, Beacon {
+                id: DEFAULT_ID_BEACON_ID.to_string(),
+                port_id: String::new(),
+                dest: "ID".to_string(),
+                via: String::new(),
+                message: String::new(),
+                interval_secs: 1800,
+                enabled: false,
+                pinned: true,
+            });
+        }
         cfg.mailbox.messages = load_part::<MailboxFile>(&Self::mailbox_path(&dir))?.messages;
         cfg.beacon_rules = load_part::<BeaconRulesFile>(&Self::beacon_rules_path(&dir))?.beacon_rules;
         cfg.incoming_beacons = load_part::<IncomingBeaconsFile>(&Self::incoming_beacons_path(&dir))?.incoming_beacons;

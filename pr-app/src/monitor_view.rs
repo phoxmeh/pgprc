@@ -52,9 +52,9 @@ pub struct MonitorView {
     pub container: gtk::Box,
     pub filter_entry: gtk::Entry,
     pub port_filter_button: gtk::MenuButton,
-    /// "UI" checkbox, right of the port filter -- restricts the visible
-    /// buffer to unproto/UI packets only when checked. See `set_unproto_only`.
-    pub unproto_only_check: gtk::CheckButton,
+    /// "UI only" switch -- restricts the visible buffer to unproto/UI packets
+    /// only when active. Lives in the filter bar below the header.
+    pub unproto_only_switch: gtk::Switch,
     port_filter_popover: gtk::Popover,
     port_checks: RefCell<HashMap<String, gtk::CheckButton>>,
     select_all_check: gtk::CheckButton,
@@ -114,8 +114,9 @@ impl MonitorView {
         let select_all_check = gtk::CheckButton::with_label("Select All");
         select_all_check.set_active(true);
 
-        let unproto_only_check = gtk::CheckButton::with_label("UI");
-        unproto_only_check.set_tooltip_text(Some("Show only unproto (UI) packets"));
+        let unproto_only_switch = gtk::Switch::new();
+        unproto_only_switch.set_tooltip_text(Some("Show only unproto (UI) packets"));
+        unproto_only_switch.set_valign(gtk::Align::Center);
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 4);
         container.append(&widget);
@@ -124,7 +125,7 @@ impl MonitorView {
             container,
             filter_entry,
             port_filter_button,
-            unproto_only_check,
+            unproto_only_switch,
             port_filter_popover,
             port_checks: RefCell::new(HashMap::new()),
             select_all_check,

@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::object::IsA;
 
-use pr_core::AddressBookEntry;
+use pr_core::{AddressBookEntry, BeaconMonitorRule};
 
 use crate::ports_dialog::{dialog_window, force_uppercase, labeled};
 use crate::window::Ui;
@@ -82,8 +82,8 @@ fn filter_sort_row(sort_state: &Rc<Cell<SortMode>>) -> (gtk::Box, gtk::Entry, gt
     (row, filter_entry, sort_button)
 }
 
-/// The dot + callsign/alias + last-heard subtitle content, shared by the
-/// main list and the picker rows.
+/// The dot + callsign/alias + last-heard subtitle + ID packet content,
+/// shared by the main list and the picker rows.
 fn entry_row_content(entry: &AddressBookEntry) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.set_margin_top(6);
@@ -106,7 +106,7 @@ fn entry_row_content(entry: &AddressBookEntry) -> gtk::Widget {
     if let Some(alias) = entry.alias.as_deref().filter(|s| !s.is_empty()) {
         summary.push_str(&format!("  \u{2014}  {alias}"));
     }
-    let detail = match &entry.last_heard {
+    let heard_detail = match &entry.last_heard {
         Some(when) => format!("Last heard {when}"),
         None => "Manual entry".to_string(),
     };
@@ -115,13 +115,23 @@ fn entry_row_content(entry: &AddressBookEntry) -> gtk::Widget {
     let summary_label = gtk::Label::new(Some(&summary));
     summary_label.set_halign(gtk::Align::Start);
     summary_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let detail_label = gtk::Label::new(Some(&detail));
+    let detail_label = gtk::Label::new(Some(&heard_detail));
     detail_label.set_halign(gtk::Align::Start);
     detail_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     detail_label.add_css_class("dim-label");
     detail_label.add_css_class("caption");
     text_box.append(&summary_label);
     text_box.append(&detail_label);
+
+    if let Some(id_text) = entry.id_packet.as_deref().filter(|s| !s.is_empty()) {
+        let id_label = gtk::Label::new(Some(id_text));
+        id_label.set_halign(gtk::Align::Start);
+        id_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        id_label.add_css_class("dim-label");
+        id_label.add_css_class("caption");
+        text_box.append(&id_label);
+    }
+
     text_box.set_hexpand(true);
     text_box.set_valign(gtk::Align::Center);
     row.append(&text_box);
@@ -279,18 +289,23 @@ fn build_entry_row(ui: &Rc<Ui>, entry: AddressBookEntry, refresh: Rc<dyn Fn()>) 
     outer.upcast()
 }
 
-/// Per-station detail view: read-only heard-telemetry (direct/indirect
-/// status, heard count/last heard, last 5 unique BEACON packets) plus one
-/// editable field (Alias). An "Edit Details..." button reaches the existing
-/// `edit_entry_dialog` for name/location/notes/via/home_bbs/QRZ lookup.
-fn show_detail(ui: &Rc<Ui>, entry: AddressBookEntry, parent: &adw::Window, refresh: Rc<dyn Fn()>) {
-    let (win, root) = dialog_window(parent, &entry.callsign, 420);
+fn addr_book_rule_id(callsign: &str) -> String {
+    format!("addr-book-{}", callsign.to_uppercase())
+}
 
-    let status_text = if entry.heard_direct {
-        "Heard directly"
-    } else {
-        "Known only via a NET/ROM NODES broadcast \u{2014} never heard directly"
-    };
+fn has_addr_book_rule(ui: &Rc<Ui>, callsign: &str) -> bool {
+    let id = addr_book_rule_id(callsign);
+    ui.state.config.borrow().beacon_rules.iter().any(|r| r.id == id)
+}
+
+/// Per-station detail view: fully read-only. Shows all fields plus a
+/// notification toggle that pins/unpins a Custom Notification rule for this
+/// station's BEACON frames. "Edit Details…" opens the editable dialog.
+fn show_detail(ui: &Rc<Ui>, entry: AddressBookEntry, parent: &adw::Window, refresh: Rc<dyn Fn()>) {
+    let (win, root) = dialog_window(parent, &entry.callsign, 440);
+
+    // --- Identification ---
+    let status_text = if entry.heard_direct { "Heard directly" } else { "Known via NET/ROM NODES broadcast only" };
     let status_label = gtk::Label::new(Some(status_text));
     status_label.set_halign(gtk::Align::Start);
     status_label.add_css_class("dim-label");
@@ -298,38 +313,103 @@ fn show_detail(ui: &Rc<Ui>, entry: AddressBookEntry, parent: &adw::Window, refre
 
     let heard_text = match &entry.last_heard {
         Some(when) => format!("Heard {} time(s) \u{2014} last: {when}", entry.heard_count),
-        None => "Never heard".to_string(),
+        None => "Never heard \u{2014} manual entry".to_string(),
     };
     let heard_label = gtk::Label::new(Some(&heard_text));
     heard_label.set_halign(gtk::Align::Start);
     root.append(&heard_label);
 
-    let alias_entry = gtk::Entry::builder().placeholder_text("Node/BBS alias (optional)").build();
-    alias_entry.set_text(entry.alias.as_deref().unwrap_or(""));
-    root.append(&labeled("Alias", &alias_entry));
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-    let beacons_heading = gtk::Label::new(Some("Last BEACON packets"));
-    beacons_heading.set_halign(gtk::Align::Start);
-    beacons_heading.set_margin_top(6);
-    root.append(&beacons_heading);
-    if entry.recent_beacons.is_empty() {
-        let none_label = gtk::Label::new(Some("No packets to \u{201c}BEACON\u{201d} seen yet."));
-        none_label.set_halign(gtk::Align::Start);
-        none_label.add_css_class("dim-label");
-        root.append(&none_label);
-    } else {
-        for beacon in &entry.recent_beacons {
-            let line = gtk::Label::new(Some(&format!("{}  \u{2014}  {}", beacon.when, beacon.text)));
-            line.set_halign(gtk::Align::Start);
-            line.set_wrap(true);
-            line.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            root.append(&line);
+    // --- Read-only fields ---
+    let fields: &[(&str, Option<&str>)] = &[
+        ("Name", entry.name.as_deref()),
+        ("Alias", entry.alias.as_deref()),
+        ("Callsign", Some(entry.callsign.as_str())),
+        ("Via", if entry.via.is_empty() { None } else { Some(entry.via.as_str()) }),
+        ("Home BBS", if entry.home_bbs.is_empty() { None } else { Some(entry.home_bbs.as_str()) }),
+        ("Location", entry.location.as_deref()),
+    ];
+    for (label_text, value) in fields {
+        if let Some(v) = value.filter(|s| !s.is_empty()) {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let key = gtk::Label::new(Some(label_text));
+            key.set_width_chars(9);
+            key.set_halign(gtk::Align::Start);
+            key.add_css_class("dim-label");
+            let val = gtk::Label::new(Some(v));
+            val.set_halign(gtk::Align::Start);
+            val.set_wrap(true);
+            val.set_hexpand(true);
+            row.append(&key);
+            row.append(&val);
+            root.append(&row);
         }
     }
 
+    if let Some(notes) = entry.notes.as_deref().filter(|s| !s.is_empty()) {
+        let notes_label = gtk::Label::new(Some("Notes"));
+        notes_label.set_halign(gtk::Align::Start);
+        notes_label.add_css_class("dim-label");
+        root.append(&notes_label);
+        let notes_val = gtk::Label::new(Some(notes));
+        notes_val.set_halign(gtk::Align::Start);
+        notes_val.set_wrap(true);
+        root.append(&notes_val);
+    }
+
+    if let Some(id_text) = entry.id_packet.as_deref().filter(|s| !s.is_empty()) {
+        root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let id_heading = gtk::Label::new(Some("ID Packet"));
+        id_heading.set_halign(gtk::Align::Start);
+        id_heading.add_css_class("dim-label");
+        root.append(&id_heading);
+        let id_val = gtk::Label::new(Some(id_text));
+        id_val.set_halign(gtk::Align::Start);
+        id_val.set_wrap(true);
+        root.append(&id_val);
+    }
+
+    // --- Button row ---
     let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    button_row.set_halign(gtk::Align::End);
-    button_row.set_margin_top(6);
+    button_row.set_margin_top(8);
+
+    // Notification toggle: adds/removes an address-book Custom Notification
+    // rule watching for BEACON frames from this callsign.
+    let notify_toggle = gtk::ToggleButton::new();
+    notify_toggle.set_icon_name("notifications-symbolic");
+    notify_toggle.set_tooltip_text(Some("Watch for BEACON frames from this station"));
+    notify_toggle.add_css_class("flat");
+    notify_toggle.set_active(has_addr_book_rule(ui, &entry.callsign));
+    if notify_toggle.is_active() {
+        notify_toggle.add_css_class("state-success");
+    }
+    {
+        let ui = ui.clone();
+        let callsign = entry.callsign.clone();
+        notify_toggle.connect_toggled(move |btn| {
+            let id = addr_book_rule_id(&callsign);
+            if btn.is_active() {
+                btn.add_css_class("state-success");
+                let mut cfg = ui.state.config.borrow_mut();
+                if !cfg.beacon_rules.iter().any(|r| r.id == id) {
+                    cfg.beacon_rules.push(BeaconMonitorRule {
+                        id,
+                        label: callsign.clone(),
+                        pattern: "^BEACON$".to_string(),
+                        sender: callsign.clone(),
+                        enabled: true,
+                        from_address_book: true,
+                    });
+                }
+            } else {
+                btn.remove_css_class("state-success");
+                ui.state.config.borrow_mut().beacon_rules.retain(|r| r.id != id);
+            }
+            ui.state.save_config();
+        });
+    }
+    button_row.append(&notify_toggle);
 
     let edit_details_button = gtk::Button::with_label("Edit Details\u{2026}");
     {
@@ -338,30 +418,35 @@ fn show_detail(ui: &Rc<Ui>, entry: AddressBookEntry, parent: &adw::Window, refre
         let entry = entry.clone();
         let refresh = refresh.clone();
         edit_details_button.connect_clicked(move |_| {
-            edit_entry_dialog(&ui, &win, Some(entry.clone()), refresh.clone());
+            let detail_win = win.clone();
+            let ui_re = ui.clone();
+            let callsign = entry.callsign.clone();
+            let refresh_re = refresh.clone();
+            // After save: close this detail window and reopen it with fresh data.
+            let after_save: Rc<dyn Fn()> = Rc::new(move || {
+                refresh_re();
+                let updated = ui_re.state.config.borrow().address_book.iter().find(|e| e.callsign == callsign).cloned();
+                if let Some(updated_entry) = updated {
+                    let parent = detail_win.transient_for().and_downcast::<adw::Window>().unwrap_or_else(|| detail_win.clone().upcast());
+                    show_detail(&ui_re, updated_entry, &parent, refresh_re.clone());
+                }
+                detail_win.close();
+            });
+            edit_entry_dialog(&ui, &win, Some(entry.clone()), after_save);
         });
     }
     button_row.append(&edit_details_button);
 
-    let save_button = gtk::Button::with_label("Save Alias");
-    save_button.add_css_class("suggested-action");
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    button_row.append(&spacer);
+
+    let close_button = gtk::Button::with_label("Close Entry");
     {
-        let ui = ui.clone();
         let win = win.clone();
-        let callsign = entry.callsign.clone();
-        save_button.connect_clicked(move |_| {
-            let alias = alias_entry.text().trim().to_string();
-            let mut cfg = ui.state.config.borrow_mut();
-            if let Some(slot) = cfg.address_book.iter_mut().find(|e| e.callsign == callsign) {
-                slot.alias = if alias.is_empty() { None } else { Some(alias) };
-            }
-            drop(cfg);
-            ui.state.save_config();
-            refresh();
-            win.close();
-        });
+        close_button.connect_clicked(move |_| win.close());
     }
-    button_row.append(&save_button);
+    button_row.append(&close_button);
 
     root.append(&button_row);
 
@@ -538,14 +623,16 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
         root.append(&detail_label);
     }
 
-    let lookup_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let lookup_button = gtk::Button::with_label("Lookup QRZ\u{2026}");
     let lookup_status = gtk::Label::new(None);
     lookup_status.set_halign(gtk::Align::Start);
     lookup_status.add_css_class("dim-label");
-    lookup_row.append(&lookup_button);
-    lookup_row.append(&lookup_status);
-    root.append(&lookup_row);
+    root.append(&lookup_status);
+
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("error");
+    root.append(&error_label);
+
+    let lookup_button = gtk::Button::with_label("Lookup QRZ\u{2026}");
     {
         let ui = ui.clone();
         let callsign_entry = callsign_entry.clone();
@@ -605,12 +692,11 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
         });
     }
 
-    let error_label = gtk::Label::new(None);
-    error_label.add_css_class("error");
-    root.append(&error_label);
-
     let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    button_row.set_halign(gtk::Align::End);
+    button_row.append(&lookup_button);
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    button_row.append(&spacer);
     let cancel_button = gtk::Button::with_label("Cancel");
     {
         let win = win.clone();
@@ -657,7 +743,7 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
                     via,
                     home_bbs,
                     heard_direct: true,
-                    recent_beacons: Vec::new(),
+                    id_packet: None,
                 });
             }
             drop(cfg);

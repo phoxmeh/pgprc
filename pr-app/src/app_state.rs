@@ -67,7 +67,7 @@ impl AppState {
                 via: String::new(),
                 home_bbs: String::new(),
                 heard_direct: true,
-                recent_beacons: Vec::new(),
+                id_packet: None,
             }),
         }
         drop(cfg);
@@ -126,7 +126,7 @@ impl AppState {
                     via: String::new(),
                     home_bbs: String::new(),
                     heard_direct: false,
-                    recent_beacons: Vec::new(),
+                    id_packet: None,
                 }),
             }
         }
@@ -134,17 +134,14 @@ impl AppState {
         self.save_config();
     }
 
-    /// Record one message a station sent to destination "BEACON", keeping
-    /// only the last 5 *unique* texts (a repeat moves back to the front
-    /// with a fresh timestamp instead of adding a duplicate). No-op for an
-    /// empty message.
-    pub fn record_beacon_packet(&self, from: &str, message: &str) {
+    /// Record an ID/beacon packet from a station. Updates `id_packet` only
+    /// when the text actually changes (a repeat of the same text is a no-op),
+    /// which keeps writes cheap and avoids unnecessary disk I/O.
+    pub fn record_id_packet(&self, from: &str, message: &str) {
         let from = from.trim().to_uppercase();
         if from.is_empty() || message.is_empty() {
             return;
         }
-        let now = now_timestamp();
-
         let mut cfg = self.config.borrow_mut();
         let entry = match cfg.address_book.iter_mut().find(|e| e.callsign == from) {
             Some(entry) => entry,
@@ -160,16 +157,16 @@ impl AppState {
                     via: String::new(),
                     home_bbs: String::new(),
                     heard_direct: false,
-                    recent_beacons: Vec::new(),
+                    id_packet: None,
                 });
                 cfg.address_book.iter_mut().find(|e| e.callsign == from).expect("just pushed")
             }
         };
-        entry.recent_beacons.retain(|b| b.text != message);
-        entry.recent_beacons.insert(0, pr_core::BeaconPacketLogEntry { text: message.to_string(), when: now });
-        entry.recent_beacons.truncate(5);
-        drop(cfg);
-        self.save_config();
+        if entry.id_packet.as_deref() != Some(message) {
+            entry.id_packet = Some(message.to_string());
+            drop(cfg);
+            self.save_config();
+        }
     }
 
     pub fn is_pinned(&self, port_id: &str, remote: &str) -> bool {

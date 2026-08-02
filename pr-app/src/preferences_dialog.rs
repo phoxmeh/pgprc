@@ -88,9 +88,8 @@ pub fn show(ui: &Rc<Ui>) {
     // message all live in the Mailbox window itself now (Header menu ->
     // Mailbox), alongside the message list, instead of here. ---
 
-    // --- Notifications: three independent toggles, since these track
-    // genuinely different things -- your own traffic, a user-picked rule,
-    // and beacons (tracked separately in the Incoming Beacons dialog). ---
+    // --- Notifications: directed-at-me toggle only. Sound and silence are
+    // configured in the Notifications dialog (header bell button). ---
     let notify_group = adw::PreferencesGroup::builder().title("Notifications").build();
     let notify_directed_row = adw::SwitchRow::builder()
         .title("Directed Notifications")
@@ -98,20 +97,6 @@ pub fn show(ui: &Rc<Ui>) {
         .active(current_notify.directed_enabled)
         .build();
     notify_group.add(&notify_directed_row);
-
-    let notify_custom_row = adw::SwitchRow::builder()
-        .title("Custom Rule Notifications")
-        .subtitle("A frame matching a Custom Rule with its bell toggled on")
-        .active(current_notify.custom_enabled)
-        .build();
-    notify_group.add(&notify_custom_row);
-
-    let notify_beacon_row = adw::SwitchRow::builder()
-        .title("Beacon Notifications")
-        .subtitle("A frame matching a Beacon Monitor rule (see Incoming Beacons)")
-        .active(current_notify.beacon_enabled)
-        .build();
-    notify_group.add(&notify_beacon_row);
     content.append(&notify_group);
 
     // --- Highlighting ---
@@ -145,12 +130,11 @@ pub fn show(ui: &Rc<Ui>) {
 
     content.append(&hl_group);
 
-    // --- Custom Rules: one list of destination-address rules that both
-    // highlight matching traffic and (via the bell toggle) can also raise a
-    // desktop notification ---
+    // --- Custom Rules: destination-address rules that highlight matching
+    // traffic. Managed here, used by the Monitor and session scrollbacks. ---
     let rules_group = adw::PreferencesGroup::builder()
         .title("Custom Rules")
-        .description("Destination addresses to highlight, e.g. CQ or a digipeater alias \u{2014} tap the bell to also notify on a match")
+        .description("Destination addresses to highlight, e.g. CQ or a digipeater alias")
         .build();
 
     let rules_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
@@ -173,7 +157,6 @@ pub fn show(ui: &Rc<Ui>) {
                 label: "New Rule".to_string(),
                 pattern: String::new(),
                 color: default_color.clone(),
-                notify: false,
                 enabled: true,
             });
             rebuild_rules_list(&rules_list, &rules);
@@ -239,8 +222,6 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.highlighting.rules = rules.borrow().clone();
 
                 cfg.notify.directed_enabled = notify_directed_row.is_active();
-                cfg.notify.custom_enabled = notify_custom_row.is_active();
-                cfg.notify.beacon_enabled = notify_beacon_row.is_active();
             }
             // Credentials may have changed; force a fresh login next lookup.
             *ui.state.qrz_session.borrow_mut() = None;
@@ -312,32 +293,6 @@ fn build_rule_row(list_box: &gtk::ListBox, rules: &Rc<RefCell<Vec<HighlightRule>
         });
     }
     row.append(&pattern_entry);
-
-    // Bell toggle: also raise a desktop notification on a match, lighting up
-    // (accent color, via the same `.notify-rule-active` class pattern as the
-    // tab pin toggle) when active.
-    let notify_toggle =
-        gtk::ToggleButton::builder().icon_name("notifications-symbolic").tooltip_text("Notify on match").build();
-    notify_toggle.add_css_class("flat");
-    notify_toggle.add_css_class("notify-rule-toggle");
-    notify_toggle.set_active(rule.notify);
-    if rule.notify {
-        notify_toggle.add_css_class("notify-rule-active");
-    }
-    {
-        let rules = rules.clone();
-        notify_toggle.connect_toggled(move |btn| {
-            if btn.is_active() {
-                btn.add_css_class("notify-rule-active");
-            } else {
-                btn.remove_css_class("notify-rule-active");
-            }
-            if let Some(r) = rules.borrow_mut().get_mut(idx) {
-                r.notify = btn.is_active();
-            }
-        });
-    }
-    row.append(&notify_toggle);
 
     let color_btn = color_button(&rule.color);
     {

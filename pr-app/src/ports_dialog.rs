@@ -130,15 +130,16 @@ fn move_port(ui: &Rc<Ui>, id: &str, direction: isize) {
 }
 
 fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_box: &gtk::ListBox) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.set_margin_top(6);
-    row.set_margin_bottom(6);
-    row.set_margin_start(6);
-    row.set_margin_end(6);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    row.set_margin_top(3);
+    row.set_margin_bottom(3);
+    row.set_margin_start(4);
+    row.set_margin_end(4);
 
     let reorder_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let up_button = gtk::Button::from_icon_name("go-up-symbolic");
     up_button.add_css_class("flat");
+    up_button.add_css_class("compact");
     up_button.set_sensitive(idx > 0);
     {
         let ui = ui.clone();
@@ -152,6 +153,7 @@ fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_
     reorder_box.append(&up_button);
     let down_button = gtk::Button::from_icon_name("go-down-symbolic");
     down_button.add_css_class("flat");
+    down_button.add_css_class("compact");
     down_button.set_sensitive(idx + 1 < count);
     {
         let ui = ui.clone();

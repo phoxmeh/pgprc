@@ -20,7 +20,6 @@ use crate::keyboard_mode_dialog;
 use crate::log_view::LogView;
 use crate::mailbox_dialog;
 use crate::monitor_view::MonitorView;
-use crate::notified_packets_dialog;
 use crate::ports_dialog;
 use crate::preferences_dialog;
 use crate::session_tab::{port_supports_connect, port_supports_unproto, SessionTab, TabId};
@@ -99,10 +98,10 @@ pub struct Ui {
     /// per favorite-flagged port. Rebuilt whenever the port list changes.
     favorites_bar: gtk::Box,
     favorite_buttons: RefCell<HashMap<String, gtk::Button>>,
-    /// Header icon that opens the Incoming Beacons dialog. Lights up
-    /// (`beacon-lit` CSS class) when a new beacon is detected, cleared the
-    /// next time the dialog is actually opened.
-    beacon_button: gtk::Button,
+    /// Header Notifications button. Lights up (`beacon-lit` CSS class) when a
+    /// new notification arrives, cleared when the dialog is opened. Turns
+    /// yellow (`state-warning`) while notifications are silenced.
+    notifications_button: gtk::Button,
     /// Header icon that opens the Mailbox window (left-click) or its
     /// Settings (right-click) -- green while enabled, orange (taking
     /// priority) while an unread message exists. See
@@ -132,17 +131,20 @@ pub struct Ui {
     bottom_ports_snapshot: RefCell<Vec<PortEntry>>,
     dial_button: gtk::Button,
     phone_button: gtk::Button,
-    /// One-way hang-up button next to `phone_button` -- unlike it (which
-    /// toggles connect/disconnect), this only ever disconnects, so there's
-    /// always an unambiguous way to hang up regardless of what state
-    /// `phone_button` currently shows. Visible/sensitive only while the
-    /// selected tab is live.
-    disconnect_button: gtk::Button,
     message_entry: gtk::Entry,
     /// Stored (not just a local in `build_ui`) so `refresh_bottom_bar` can
     /// gate its sensitivity on whether the ad-hoc unproto destination is
     /// filled in.
     send_button: gtk::Button,
+    /// Lines sent so far this session — navigated with Up/Down in the
+    /// message entry. Duplicates (identical adjacent entries) are suppressed.
+    send_history: RefCell<Vec<String>>,
+    /// Current position inside `send_history` during Up/Down navigation
+    /// (0 = most-recent, `len-1` = oldest). `None` while editing new text.
+    history_pos: Cell<Option<usize>>,
+    /// The in-progress text the user was typing before they pressed Up for
+    /// the first time — restored when they press Down back past history[0].
+    history_draft: RefCell<String>,
     /// The single periodic "available for keyboard-to-keyboard" beacon
     /// timer -- reset in full by `reschedule_keyboard_mode_beacon`.
     keyboard_mode_beacon_timer: RefCell<Option<glib::SourceId>>,
@@ -459,7 +461,12 @@ impl Ui {
     /// both its port and node are immutable once dialed.
     fn tab_title_text(&self, tab: &SessionTab) -> String {
         let port_index = self.bottom_ports_snapshot.borrow().iter().position(|p| p.id == tab.port.id).unwrap_or(0);
-        format!("{port_index}:{}", tab.node)
+        let via = tab.via();
+        if via.is_empty() {
+            format!("{port_index}:{}", tab.node)
+        } else {
+            format!("{port_index}:{} via {}", tab.node, via.join(","))
+        }
     }
 
     /// Build this tab's strip chip (pin left of title, close on the right)
@@ -578,7 +585,6 @@ impl Ui {
                 self.dial_button.set_icon_name("pan-down-symbolic");
                 self.dial_button.set_tooltip_text(Some("Minimize"));
                 self.phone_button.set_visible(true);
-                self.disconnect_button.set_visible(true);
                 self.refresh_phone_button(tab);
                 self.bottom_node_entry.set_visible(false);
                 self.bottom_via_entry.set_visible(false);
@@ -589,7 +595,6 @@ impl Ui {
                 self.dial_button.set_icon_name("list-add-symbolic");
                 self.dial_button.set_tooltip_text(Some("Dial\u{2026}"));
                 self.phone_button.set_visible(false);
-                self.disconnect_button.set_visible(false);
                 // Clear any node/via left behind by whichever tab was
                 // selected before -- these fields are ad-hoc unproto entry
                 // now, not a read-only mirror of a tab, so a stale callsign
@@ -605,21 +610,24 @@ impl Ui {
         self.refresh_send_button_sensitivity();
     }
 
-    /// Send is only ever blocked in the ad-hoc unproto compose mode (no tab
-    /// selected), where a destination is required but easy to forget --
-    /// once a tab is selected, Node is a read-only display of that tab's
-    /// already-fixed identity and Send always stays enabled.
+    /// Send is blocked in two situations: in the ad-hoc unproto mode (no tab
+    /// selected) when no destination has been typed, and in the connected-tab
+    /// mode when the tab is currently disconnected — there is nothing to send
+    /// to yet. The "Not connected" log message path in `activate_message_entry`
+    /// handles the edge case of typing fast right as a connection drops.
     fn refresh_send_button_sensitivity(&self) {
-        let sensitive = self.selected_tab.get().is_some() || !self.bottom_node_entry.text().trim().is_empty();
+        let tabs = self.tabs.borrow();
+        let sensitive = match self.selected_tab.get().and_then(|id| tabs.get(&id)) {
+            Some(tab) => tab.conn_id.get().is_some(),
+            None => !self.bottom_node_entry.text().trim().is_empty(),
+        };
         self.send_button.set_sensitive(sensitive);
     }
 
     /// Recolor/relabel the phone-handset button for `tab`'s current connect
     /// state — green (ready to connect) while disconnected, red (ready to
-    /// disconnect) while connected, per explicit request; same explicit
-    /// CSS-class-swap pattern as the Direwolf button. Also gates the
-    /// dedicated one-way `disconnect_button` next to it, sensitive only
-    /// while there's actually a live connection to hang up.
+    /// disconnect) while connected; same explicit CSS-class-swap pattern as
+    /// the Direwolf button.
     fn refresh_phone_button(&self, tab: &SessionTab) {
         self.phone_button.remove_css_class("state-success");
         self.phone_button.remove_css_class("state-destructive");
@@ -631,7 +639,6 @@ impl Ui {
             self.phone_button.add_css_class("state-success");
             self.phone_button.set_tooltip_text(Some("Connect"));
         }
-        self.disconnect_button.set_sensitive(connected);
     }
 
     /// The phone-handset button: connect or disconnect whichever tab is
@@ -643,6 +650,52 @@ impl Ui {
             self.disconnect_tab(tab_id);
         } else {
             self.connect_tab(tab_id);
+        }
+    }
+
+    /// Handle Up/Down arrow keys in the message entry to navigate send
+    /// history. Up goes back (older), Down goes forward (newer); pressing
+    /// Down past the most-recent entry restores whatever the user was typing
+    /// before they first pressed Up.
+    fn on_message_entry_key_pressed(&self, key: gtk::gdk::Key) -> glib::Propagation {
+        let history = self.send_history.borrow();
+        let len = history.len();
+        if len == 0 {
+            return glib::Propagation::Proceed;
+        }
+        match key {
+            gtk::gdk::Key::Up => {
+                let new_pos = match self.history_pos.get() {
+                    None => {
+                        *self.history_draft.borrow_mut() = self.message_entry.text().to_string();
+                        0
+                    }
+                    Some(i) if i + 1 < len => i + 1,
+                    Some(i) => i,
+                };
+                self.history_pos.set(Some(new_pos));
+                self.message_entry.set_text(&history[len - 1 - new_pos]);
+                self.message_entry.set_position(-1);
+                glib::Propagation::Stop
+            }
+            gtk::gdk::Key::Down => match self.history_pos.get() {
+                None => glib::Propagation::Proceed,
+                Some(0) => {
+                    self.history_pos.set(None);
+                    let draft = self.history_draft.borrow().clone();
+                    self.message_entry.set_text(&draft);
+                    self.message_entry.set_position(-1);
+                    glib::Propagation::Stop
+                }
+                Some(i) => {
+                    let new_pos = i - 1;
+                    self.history_pos.set(Some(new_pos));
+                    self.message_entry.set_text(&history[len - 1 - new_pos]);
+                    self.message_entry.set_position(-1);
+                    glib::Propagation::Stop
+                }
+            },
+            _ => glib::Propagation::Proceed,
         }
     }
 
@@ -696,6 +749,15 @@ impl Ui {
         } else {
             self.send_bottom_unproto(&text);
         }
+        // Save to history, suppressing adjacent duplicates.
+        {
+            let mut history = self.send_history.borrow_mut();
+            if history.last().map(|s| s.as_str()) != Some(text.as_str()) {
+                history.push(text);
+            }
+        }
+        self.history_pos.set(None);
+        *self.history_draft.borrow_mut() = String::new();
         self.message_entry.set_text("");
     }
 
@@ -707,15 +769,16 @@ impl Ui {
             if let Some(handle) = self.state.active.borrow().get(&tab.port.id) {
                 let _ = handle.cmd_tx.send(PortCommand::Send { id: conn_id, bytes });
             }
-            // Connected-mode AX.25/AGWPE backends don't echo our own
-            // transmissions back, so log what we sent ourselves. Telnet/SSH
-            // already get a remote echo from the far end, so don't double
-            // it up there.
+            // Echo every sent line into the scrollback with a `»` prefix so
+            // the operator always sees what they transmitted, regardless of
+            // port type. AX.25/AGWPE/KISS backends never echo back at the
+            // protocol level; Telnet/SSH may echo from the remote end, but
+            // the `»` prefix makes the local copy visually distinct.
+            tab.append_sent_line(text);
             if port_supports_connect(&tab.port.config) {
-                tab.append_sent_line(text);
                 self.monitor.append_line(&tab.port.id, &format!("[{}] TX > {}: {text}", tab.port.name, tab.node), false);
-                self.refresh_status_bar();
             }
+            self.refresh_status_bar();
         }
     }
 
@@ -929,6 +992,7 @@ impl Ui {
                             if let Some(tab) = self.tabs.borrow().get(&tab_id) {
                                 self.refresh_phone_button(tab);
                             }
+                            self.refresh_send_button_sensitivity();
                         }
                     }
                 }
@@ -961,6 +1025,7 @@ impl Ui {
                     self.maybe_notify_directed(port_id, &from, &to, &message, &line);
                     self.maybe_detect_beacon(port_id, &from, &to, &message);
                     self.maybe_record_beacon_packet(&from, &to, &message);
+                    self.maybe_detect_mail(port_id, &from, &to, &message);
                 }
             }
             PortEvent::ConnectionOpened { id, label, to } => {
@@ -1073,6 +1138,7 @@ impl Ui {
                 }
                 if self.selected_tab.get() == Some(tab_id) {
                     self.refresh_bottom_bar();
+                    self.message_entry.grab_focus();
                 }
                 self.refresh_status_bar();
             }
@@ -1137,22 +1203,22 @@ impl Ui {
     }
 
     /// Fire a desktop notification if `to` is directed at the configured
-    /// callsign or matches a Custom Rule — no-op if the relevant toggle is
-    /// off or nothing matches. `line` (the full formatted Monitor text) is
-    /// only used for the historical Notified Packets record, which wants
-    /// the same highlighted display everything else gets; the live
-    /// notification body itself uses the clean structured fields, per
-    /// explicit request (from/to/message only, no frame-tag/PID metadata).
+    /// callsign. Always records the packet and lights the Notifications button;
+    /// only fires a desktop alert/sound when not silenced.
     fn maybe_notify_directed(&self, port_id: &str, from: &str, to: &str, message: &str, line: &str) {
         let matcher = crate::notify::NotifyMatcher::build(&self.state.config.borrow());
-        let Some(match_kind) = matcher.match_destination(to) else { return };
-        let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
-        let title = match &match_kind {
-            crate::notify::NotifyMatch::Directed => format!("Packet Radio \u{2014} {port_name}"),
-            crate::notify::NotifyMatch::Custom(label) => format!("Packet Radio \u{2014} {port_name} ({label})"),
-        };
-        crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
+        if !matcher.matches_directed(to) {
+            return;
+        }
         self.state.record_notified_packet(port_id, line);
+        self.mark_notification_received();
+        let silenced = self.state.config.borrow().notify.notifications_silenced;
+        if !silenced {
+            let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
+            let title = format!("Packet Radio \u{2014} {port_name}");
+            crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
+            crate::notify::play_sound(&self.state.config.borrow());
+        }
     }
 
     /// Record and (optionally) notify on a received frame matching a
@@ -1163,8 +1229,15 @@ impl Ui {
     fn maybe_detect_beacon(&self, port_id: &str, from: &str, to: &str, message: &str) {
         let label = {
             let cfg = self.state.config.borrow();
+            let from_base = crate::qrz::strip_ssid(from.trim()).to_uppercase();
             let mut found = None;
             for rule in cfg.beacon_rules.iter().filter(|r| r.enabled) {
+                if !rule.sender.trim().is_empty() {
+                    let rule_sender = crate::qrz::strip_ssid(rule.sender.trim()).to_uppercase();
+                    if !rule_sender.eq_ignore_ascii_case(&from_base) {
+                        continue;
+                    }
+                }
                 if let Ok(re) = regex::RegexBuilder::new(&rule.pattern).case_insensitive(true).build() {
                     if re.is_match(to) {
                         found = Some(rule.label.clone());
@@ -1177,12 +1250,13 @@ impl Ui {
         let Some(label) = label else { return };
 
         self.state.record_incoming_beacon(port_id, from, to, message);
-        self.mark_beacon_lit();
+        self.mark_notification_received();
 
-        if self.state.config.borrow().notify.beacon_enabled {
+        if !self.state.config.borrow().notify.notifications_silenced {
             let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
-            let title = format!("Packet Radio \u{2014} {port_name} (Beacon: {label})");
+            let title = format!("Packet Radio \u{2014} {port_name} (Destination Monitor: {label})");
             crate::notify::send(&self.window, &title, &format!("From: {from}\nTo: {to}\n{message}"));
+            crate::notify::play_sound(&self.state.config.borrow());
         }
     }
 
@@ -1193,21 +1267,51 @@ impl Ui {
     /// cross-station log, not a per-station one.
     fn maybe_record_beacon_packet(&self, from: &str, to: &str, message: &str) {
         if to.eq_ignore_ascii_case("BEACON") {
-            self.state.record_beacon_packet(from, message);
+            self.state.record_id_packet(from, message);
         }
     }
 
-    /// Light up the header's Incoming Beacons button — same explicit
-    /// CSS-class-toggle pattern as the favorites bar/pin toggle elsewhere in
-    /// this file, rather than a `:checked`-style pseudo-class.
-    pub fn mark_beacon_lit(&self) {
-        self.beacon_button.add_css_class("beacon-lit");
+    /// Detect a MAIL-destination frame that names our callsign, indicating
+    /// that another node has mail waiting for us. Records a directed
+    /// notification so it appears in the Notifications dialog.
+    fn maybe_detect_mail(&self, port_id: &str, from: &str, to: &str, message: &str) {
+        if !to.eq_ignore_ascii_case("MAIL") {
+            return;
+        }
+        let our_call = {
+            let cfg = self.state.config.borrow();
+            cfg.ui.default_call.clone().unwrap_or_default()
+        };
+        if our_call.is_empty() {
+            return;
+        }
+        let our_base = crate::qrz::strip_ssid(our_call.trim()).to_uppercase();
+        if !message.to_uppercase().contains(&our_base) {
+            return;
+        }
+        let from_node = crate::qrz::strip_ssid(from.trim()).to_uppercase();
+        let synthetic_line = format!("Mail waiting at {from_node} (received from {from} \u{2192} MAIL)");
+        self.state.record_notified_packet(port_id, &synthetic_line);
+        self.mark_notification_received();
+        let silenced = self.state.config.borrow().notify.notifications_silenced;
+        if !silenced {
+            let port_name = find_entry(&self.state.config.borrow(), port_id).map(|e| e.name).unwrap_or_else(|| port_id.to_string());
+            let title = format!("Packet Radio \u{2014} {port_name}");
+            crate::notify::send(&self.window, &title, &format!("Mail waiting at {from_node}\n{message}"));
+            crate::notify::play_sound(&self.state.config.borrow());
+        }
     }
 
-    /// Clear the lit state — called when the Incoming Beacons dialog is
-    /// actually opened, the simplest "mark as seen" trigger available.
-    pub fn clear_beacon_lit(&self) {
-        self.beacon_button.remove_css_class("beacon-lit");
+    /// Light up the Notifications header button — called whenever a new
+    /// directed notification or destination monitor match arrives.
+    pub fn mark_notification_received(&self) {
+        self.notifications_button.add_css_class("beacon-lit");
+    }
+
+    /// Clear the lit state — called when the Notifications dialog is opened
+    /// ("mark as seen").
+    pub fn clear_notification_received(&self) {
+        self.notifications_button.remove_css_class("beacon-lit");
     }
 
     /// Recolor the header's Mailbox button from current config/message
@@ -1392,6 +1496,28 @@ fn refresh_keyboard_mode_button(button: &gtk::Button, enabled: bool) {
     button.set_tooltip_text(Some(tooltip));
 }
 
+fn refresh_notifications_button(button: &gtk::Button, silenced: bool) {
+    button.remove_css_class("state-warning");
+    let tooltip = if silenced {
+        button.add_css_class("state-warning");
+        "Notifications: silenced \u{2014} right-click to unsilence"
+    } else {
+        "Notifications\u{2026} \u{2014} right-click to silence"
+    };
+    button.set_tooltip_text(Some(tooltip));
+}
+
+fn refresh_beacons_button(button: &gtk::Button, enabled: bool) {
+    button.remove_css_class("state-success");
+    let tooltip = if enabled {
+        button.add_css_class("state-success");
+        "Outgoing Beacons: on \u{2014} click to disable, right-click to configure"
+    } else {
+        "Outgoing Beacons: off \u{2014} click to enable, right-click to configure"
+    };
+    button.set_tooltip_text(Some(tooltip));
+}
+
 /// The line ending to append when sending a line of text over a connected
 /// session. Telnet gets a proper CRLF -- BPQ nodes and similar raw-socket
 /// telnet BBS/node servers are commonly strict RFC854 NVT parsers that
@@ -1521,10 +1647,6 @@ pub fn build_ui(app: &adw::Application) {
     let phone_button = gtk::Button::from_icon_name("call-start-symbolic");
     phone_button.add_css_class("flat");
     phone_button.set_visible(false);
-    let disconnect_button = gtk::Button::from_icon_name("call-stop-symbolic");
-    disconnect_button.add_css_class("flat");
-    disconnect_button.set_tooltip_text(Some("Disconnect"));
-    disconnect_button.set_visible(false);
     let message_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Unproto message\u{2026}").build();
     let send_button = gtk::Button::with_label("Send");
     send_button.add_css_class("suggested-action");
@@ -1539,7 +1661,6 @@ pub fn build_ui(app: &adw::Application) {
     bottom_bar.append(&bottom_via_entry);
     bottom_bar.append(&bottom_port_dropdown);
     bottom_bar.append(&phone_button);
-    bottom_bar.append(&disconnect_button);
     bottom_bar.append(&message_entry);
     bottom_bar.append(&send_button);
 
@@ -1621,9 +1742,9 @@ pub fn build_ui(app: &adw::Application) {
     let header_handle = gtk::WindowHandle::builder().child(&header_row).build();
 
     // Created here (rather than alongside its click handler below) so it can
-    // be stored on `Ui` itself -- `maybe_detect_beacon` needs to light it up
-    // from anywhere event handling happens, not just from this setup code.
-    let beacon_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
+    // be stored on `Ui` itself -- `maybe_detect_beacon`/`maybe_notify_directed`
+    // need to light it up from anywhere event handling happens.
+    let notifications_button = gtk::Button::from_icon_name("notifications-symbolic");
 
     // Same reasoning as `beacon_button`: created here so it can be stored on
     // `Ui` and recolored from `refresh_mailbox_button` wherever config or
@@ -1654,7 +1775,7 @@ pub fn build_ui(app: &adw::Application) {
         status_stats_label,
         favorites_bar,
         favorite_buttons: RefCell::new(HashMap::new()),
-        beacon_button: beacon_button.clone(),
+        notifications_button: notifications_button.clone(),
         mailbox_button: mailbox_button.clone(),
         confirmed_ports: RefCell::new(HashSet::new()),
         established_conns: RefCell::new(HashSet::new()),
@@ -1664,9 +1785,11 @@ pub fn build_ui(app: &adw::Application) {
         bottom_ports_snapshot: RefCell::new(Vec::new()),
         dial_button: dial_button.clone(),
         phone_button: phone_button.clone(),
-        disconnect_button: disconnect_button.clone(),
         message_entry: message_entry.clone(),
         send_button: send_button.clone(),
+        send_history: RefCell::new(Vec::new()),
+        history_pos: Cell::new(None),
+        history_draft: RefCell::new(String::new()),
         keyboard_mode_beacon_timer: RefCell::new(None),
         mailbox_beacon_timer: RefCell::new(None),
         direwolf: DirewolfProcess::new(),
@@ -1696,14 +1819,6 @@ pub fn build_ui(app: &adw::Application) {
     }
     {
         let ui = ui.clone();
-        disconnect_button.connect_clicked(move |_| {
-            if let Some(tab_id) = ui.selected_tab.get() {
-                ui.disconnect_tab(tab_id);
-            }
-        });
-    }
-    {
-        let ui = ui.clone();
         message_entry.connect_activate(move |_| {
             ui.activate_message_entry();
         });
@@ -1713,6 +1828,12 @@ pub fn build_ui(app: &adw::Application) {
         send_button.connect_clicked(move |_| {
             ui.activate_message_entry();
         });
+    }
+    {
+        let key_controller = gtk::EventControllerKey::new();
+        let ui = ui.clone();
+        key_controller.connect_key_pressed(move |_, key, _, _| ui.on_message_entry_key_pressed(key));
+        message_entry.add_controller(key_controller);
     }
     {
         // Only meaningful in the ad-hoc unproto compose mode (no tab
@@ -1735,9 +1856,9 @@ pub fn build_ui(app: &adw::Application) {
     }
     {
         let ui = ui.clone();
-        let unproto_only_check = ui.monitor.unproto_only_check.clone();
-        unproto_only_check.connect_toggled(move |check| {
-            ui.monitor.set_unproto_only(check.is_active());
+        let unproto_only_switch = ui.monitor.unproto_only_switch.clone();
+        unproto_only_switch.connect_active_notify(move |sw| {
+            ui.monitor.set_unproto_only(sw.is_active());
         });
     }
 
@@ -1796,13 +1917,12 @@ pub fn build_ui(app: &adw::Application) {
     menu_popover.set_child(Some(&menu_box));
     menu_button.set_popover(Some(&menu_popover));
 
-    // Mailbox/Incoming Beacons/Notified Packets each have their own header
+    // Mailbox/Notifications/Beacons/Address Book each have their own header
     // button now, so they're deliberately left out of this menu rather than
     // duplicated in both.
     type MenuAction = fn(&Rc<Ui>);
-    let menu_items: [(&str, MenuAction); 4] = [
+    let menu_items: [(&str, MenuAction); 3] = [
         ("Ports\u{2026}", |ui| ports_dialog::show(ui)),
-        ("Address Book\u{2026}", |ui| address_book_dialog::show(ui)),
         ("Beacons\u{2026}", |ui| beacons_dialog::show(ui)),
         ("Preferences\u{2026}", |ui| preferences_dialog::show(ui)),
     ];
@@ -1897,6 +2017,19 @@ pub fn build_ui(app: &adw::Application) {
         });
         keyboard_mode_button.add_controller(gesture);
     }
+    // Address book: icon-only, lives at the left edge of header_end so it's
+    // adjacent to the keyboard-to-keyboard button. Clicking opens the dialog
+    // directly (no right-click action needed).
+    let address_book_button = gtk::Button::from_icon_name("x-office-address-book-symbolic");
+    address_book_button.add_css_class("flat");
+    address_book_button.set_tooltip_text(Some("Address Book\u{2026}"));
+    {
+        let ui = ui.clone();
+        address_book_button.connect_clicked(move |_| {
+            address_book_dialog::show(&ui);
+        });
+    }
+    header_end.append(&address_book_button);
     header_end.append(&keyboard_mode_button);
 
     // Modem-style handset for the optional managed Direwolf process — icon
@@ -1936,38 +2069,83 @@ pub fn build_ui(app: &adw::Application) {
     }
     header_end.append(&direwolf_button);
 
-    // Opens the Incoming Beacons dialog -- icon-only (a loudspeaker with
-    // sound waves), same tier as the Direwolf button next to it. `flat`
-    // keeps its resting appearance uniform with the other header icon
-    // buttons; it only stands out via `beacon-lit` when a new beacon is
-    // actually detected (see `Ui::mark_beacon_lit`).
-    beacon_button.add_css_class("flat");
-    beacon_button.set_tooltip_text(Some("Incoming Beacons\u{2026}"));
+    // Notifications button: left-click opens the unified Notifications dialog;
+    // right-click silences/unsilences (turns yellow while silenced). Lights up
+    // via `beacon-lit` when a new notification arrives.
+    notifications_button.add_css_class("flat");
+    refresh_notifications_button(&notifications_button, ui.state.config.borrow().notify.notifications_silenced);
     {
         let ui = ui.clone();
-        beacon_button.connect_clicked(move |_| {
+        notifications_button.connect_clicked(move |_| {
             incoming_beacons_dialog::show(&ui);
         });
     }
-    header_start.append(&beacon_button);
-
-    // Quick-access icon button for Notified Packets, same tier as Mailbox/
-    // Direwolf/Incoming Beacons -- moved out of the hamburger menu so every
-    // frequent-use dialog lives at the same level.
-    let notified_packets_button = gtk::Button::from_icon_name("notifications-symbolic");
-    notified_packets_button.add_css_class("flat");
-    notified_packets_button.set_tooltip_text(Some("Notified Packets\u{2026}"));
     {
         let ui = ui.clone();
-        notified_packets_button.connect_clicked(move |_| {
-            notified_packets_dialog::show(&ui);
+        let btn = notifications_button.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, _, _| {
+            let silenced = {
+                let mut cfg = ui.state.config.borrow_mut();
+                cfg.notify.notifications_silenced = !cfg.notify.notifications_silenced;
+                cfg.notify.notifications_silenced
+            };
+            ui.state.save_config();
+            refresh_notifications_button(&btn, silenced);
+        });
+        notifications_button.add_controller(gesture);
+    }
+    header_start.append(&notifications_button);
+
+    // Outgoing beacons toggle: left-click enables/disables all scheduled
+    // outgoing beacons at once (green while active); right-click opens the
+    // Beacons dialog for configuring individual beacon entries.
+    let beacons_button = gtk::Button::from_icon_name("audio-speakers-symbolic");
+    beacons_button.add_css_class("flat");
+    refresh_beacons_button(&beacons_button, ui.state.config.borrow().beacon_prefs.enabled);
+    {
+        let ui = ui.clone();
+        let btn = beacons_button.clone();
+        beacons_button.connect_clicked(move |_| {
+            let enabled = {
+                let mut cfg = ui.state.config.borrow_mut();
+                cfg.beacon_prefs.enabled = !cfg.beacon_prefs.enabled;
+                cfg.beacon_prefs.enabled
+            };
+            ui.state.save_config();
+            refresh_beacons_button(&btn, enabled);
         });
     }
-    header_start.append(&notified_packets_button);
-    header_start.append(&ui.monitor.filter_entry);
-    header_start.append(&ui.monitor.port_filter_button);
-    header_start.append(&ui.monitor.unproto_only_check);
-    header_end.prepend(&ui.favorites_bar);
+    {
+        let ui = ui.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, _, _| {
+            beacons_dialog::show(&ui);
+        });
+        beacons_button.add_controller(gesture);
+    }
+    header_start.append(&beacons_button);
+
+    // Second toolbar row: filter controls + favorites bar. Placed below the
+    // main title row so the title bar stays uncluttered.
+    let filter_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    filter_bar.set_margin_start(6);
+    filter_bar.set_margin_end(6);
+    filter_bar.set_margin_top(2);
+    filter_bar.set_margin_bottom(4);
+    filter_bar.append(&ui.monitor.filter_entry);
+    filter_bar.append(&ui.monitor.port_filter_button);
+    let ui_label = gtk::Label::new(Some("UI"));
+    ui_label.add_css_class("dim-label");
+    filter_bar.append(&ui_label);
+    filter_bar.append(&ui.monitor.unproto_only_switch);
+    let filter_bar_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    filter_bar_spacer.set_hexpand(true);
+    filter_bar.append(&filter_bar_spacer);
+    filter_bar.append(&ui.favorites_bar);
+    let filter_bar_handle = gtk::WindowHandle::builder().child(&filter_bar).build();
 
     let log_toggle_button = gtk::ToggleButton::builder().icon_name("utilities-terminal-symbolic").build();
     log_toggle_button.add_css_class("flat");
@@ -1990,6 +2168,7 @@ pub fn build_ui(app: &adw::Application) {
     header_end.append(&gtk::WindowControls::new(gtk::PackType::End));
 
     toolbar_view.add_top_bar(&header_handle);
+    toolbar_view.add_top_bar(&filter_bar_handle);
     toolbar_view.set_content(Some(&content_box));
     window.set_content(Some(&toolbar_view));
 
