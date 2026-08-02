@@ -196,14 +196,13 @@ pub fn show(ui: &Rc<Ui>) {
     }
     button_row.append(&add_button);
 
-    // "Export ADIF..." exports real connected-mode QSOs (`AppConfig.qso_log`)
-    // — distinct from this list, which includes any monitored traffic.
-    let export_button = gtk::Button::with_label("Export ADIF\u{2026}");
+    let export_button = gtk::Button::with_label("Export\u{2026}");
+    export_button.set_tooltip_text(Some("Export address book as TOML"));
     {
         let ui = ui.clone();
         export_button.connect_clicked(move |_| {
-            let adif = crate::adif::format_adif(&ui.state.config.borrow().qso_log);
-            crate::export::save_text(&ui.window, "log.adi", adif, None);
+            let toml = format_address_book_toml(&ui.state.config.borrow().address_book);
+            crate::export::save_text(&ui.window, "address_book.toml", toml, None);
         });
     }
     button_row.append(&export_button);
@@ -757,4 +756,44 @@ fn edit_entry_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Address
     root.append(&button_row);
 
     win.present();
+}
+
+// ---------------------------------------------------------------------------
+// Address book TOML export
+// ---------------------------------------------------------------------------
+
+fn format_address_book_toml(entries: &[pr_core::AddressBookEntry]) -> String {
+    let mut out = String::from("# Packet Radio Client — Address Book Export\n\n");
+    for e in entries {
+        out.push_str("[[entries]]\n");
+        out.push_str(&format!("callsign = {:?}\n", e.callsign));
+        if let Some(name) = e.name.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("name = {:?}\n", name));
+        }
+        if let Some(alias) = e.alias.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("alias = {:?}\n", alias));
+        }
+        if !e.via.is_empty() {
+            out.push_str(&format!("via = {:?}\n", e.via));
+        }
+        if !e.home_bbs.is_empty() {
+            out.push_str(&format!("home_bbs = {:?}\n", e.home_bbs));
+        }
+        if let Some(loc) = e.location.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("location = {:?}\n", loc));
+        }
+        if let Some(notes) = e.notes.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("notes = {:?}\n", notes));
+        }
+        if let Some(id) = e.id_packet.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("id_packet = {:?}\n", id));
+        }
+        if let Some(last) = &e.last_heard {
+            out.push_str(&format!("last_heard = {:?}\n", last));
+            out.push_str(&format!("heard_count = {}\n", e.heard_count));
+            out.push_str(&format!("heard_direct = {}\n", e.heard_direct));
+        }
+        out.push('\n');
+    }
+    out
 }

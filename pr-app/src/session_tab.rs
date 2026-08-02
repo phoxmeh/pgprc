@@ -83,6 +83,10 @@ pub struct SessionTab {
     /// buffers incoming bytes into complete lines for the mailbox command
     /// parser specifically.
     mailbox_input: RefCell<String>,
+    /// `true` while this tab is serving an incoming keyboard-to-keyboard
+    /// session — enables `/bye` (and `B`/`BYE`) detection so the remote
+    /// station can gracefully close just the AX.25 connection.
+    pub k2k_active: Cell<bool>,
     buffer: gtk::TextBuffer,
     text_view: gtk::TextView,
     state: Rc<AppState>,
@@ -148,6 +152,7 @@ impl SessionTab {
             packets_received: Cell::new(0),
             mailbox_state: RefCell::new(None),
             mailbox_input: RefCell::new(String::new()),
+            k2k_active: Cell::new(false),
             buffer,
             text_view,
             state,
@@ -312,6 +317,13 @@ impl SessionTab {
 
     pub fn clear_text(&self) {
         self.buffer.set_text("");
+    }
+
+    /// The underlying text buffer — callers can create additional
+    /// `gtk::TextView` widgets backed by this same buffer so multiple
+    /// views stay automatically in sync (used by detached-tab windows).
+    pub fn buffer_ref(&self) -> &gtk::TextBuffer {
+        &self.buffer
     }
 
     /// The full scrollback text, e.g. for exporting to a file.

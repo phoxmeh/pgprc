@@ -1,19 +1,19 @@
 //! A minimal BBS-style personal packet mailbox: other stations connect and
-//! interact with a short command prompt to leave/read text messages. Local
-//! store-and-forward only — not compatible with real Winlink/RMS network
-//! infrastructure.
+//! interact with a short command prompt to read back messages they've left,
+//! or log a CQ contact with their QTH. Local store-and-forward only —
+//! not compatible with real Winlink/RMS network infrastructure.
 
-use pr_core::MailboxMessage;
+use pr_core::{MailboxMessage, QsoLogEntry};
 
 /// Where a mailbox-driven connection currently is in the command grammar.
 pub enum MailboxState {
     Command,
-    SendSubject { to: String },
-    SendBody { to: String, subject: String, body: Vec<String> },
+    /// Waiting for the remote station's QTH after they typed `CQ`.
+    AwaitingQth,
 }
 
 pub fn welcome_banner(my_call: &str) -> String {
-    format!("{my_call} BBS. Commands: L)ist  R)ead <id>  S)end <call>  B)ye\n")
+    format!("{my_call} BBS. Commands: L)ist  R)ead <id>  CQ  B)ye\n")
 }
 
 /// Whether an unsolicited incoming connection addressed to `to` should be
@@ -55,50 +55,42 @@ fn prompt() -> String {
 }
 
 /// Advance the mailbox state machine by one line of input from the
-/// connected station. Returns the text to send back, and whether the
-/// connection should now be closed. Mutates `messages` in place when a
-/// `Send` completes. `timestamp` is supplied by the caller (rather than
-/// computed here) so this module stays free of a GTK dependency and
-/// independently unit-testable, while still using the same human-readable
-/// format the rest of the app persists (see `AppState`'s `now_timestamp`).
+/// connected station. Returns `(reply_text, close_connection, new_qso_entry)`.
+/// The caller is responsible for appending `new_qso_entry` to the QSO log
+/// when `Some`; keeping it separate avoids a double-mutable-borrow on the
+/// `AppConfig` at the call site. `timestamp` and `port_id` are supplied by
+/// the caller so this module stays free of GTK dependencies and remains
+/// independently unit-testable.
 pub fn handle_line(
     state: &mut MailboxState,
     messages: &mut Vec<MailboxMessage>,
     remote_call: &str,
+    port_id: &str,
     line: &str,
     timestamp: &str,
-) -> (String, bool) {
+) -> (String, bool, Option<QsoLogEntry>) {
     let line = line.trim();
     match state {
-        MailboxState::Command => handle_command(messages, remote_call, line, state),
-        MailboxState::SendSubject { to } => {
-            let to = to.clone();
-            if line.is_empty() {
-                return ("Subject is required.\n".to_string(), false);
-            }
-            let subject = line.to_string();
-            *state = MailboxState::SendBody { to, subject, body: Vec::new() };
-            ("Body (end with '.' alone on a line):\n".to_string(), false)
+        MailboxState::Command => {
+            let (text, close) = handle_command(messages, remote_call, line, state);
+            (text, close, None)
         }
-        MailboxState::SendBody { to, subject, body } => {
-            if line == "." {
-                let to = to.clone();
-                let msg = MailboxMessage {
-                    id: next_id(messages),
-                    to: to.clone(),
-                    from: remote_call.to_string(),
-                    subject: subject.clone(),
-                    body: body.join("\n"),
-                    timestamp: timestamp.to_string(),
-                    read: false,
-                };
-                messages.push(msg);
-                *state = MailboxState::Command;
-                (format!("Message saved for {}.\n{}", to, prompt()), false)
-            } else {
-                body.push(line.to_string());
-                (String::new(), false)
-            }
+        MailboxState::AwaitingQth => {
+            let location = if line.is_empty() { None } else { Some(line.to_string()) };
+            let entry = QsoLogEntry {
+                callsign: remote_call.to_string(),
+                port_id: port_id.to_string(),
+                started: timestamp.to_string(),
+                ended: None,
+                location: location.clone(),
+                from_cq: true,
+            };
+            *state = MailboxState::Command;
+            let qth_line = match &location {
+                Some(qth) => format!("QTH logged: {qth}\n"),
+                None => String::new(),
+            };
+            (format!("{qth_line}Contact logged. 73 de {remote_call}!\n{}", prompt()), false, Some(entry))
         }
     }
 }
@@ -110,13 +102,15 @@ fn handle_command(messages: &mut [MailboxMessage], remote_call: &str, line: &str
 
     match cmd.as_str() {
         "L" | "LIST" => {
-            let unread: Vec<&MailboxMessage> = messages.iter().filter(|m| m.to == remote_call && !m.read).collect();
-            if unread.is_empty() {
-                (format!("No messages.\n{}", prompt()), false)
+            // Show messages this station previously left here.
+            let sent: Vec<&MailboxMessage> = messages.iter().filter(|m| m.from.eq_ignore_ascii_case(remote_call)).collect();
+            if sent.is_empty() {
+                (format!("No messages on file from you.\n{}", prompt()), false)
             } else {
                 let mut out = String::new();
-                for m in unread {
-                    out.push_str(&format!("{:>4}  {}  from {}  {}\n", m.id, m.timestamp, m.from, m.subject));
+                for m in sent {
+                    let read_flag = if m.read { "R" } else { " " };
+                    out.push_str(&format!("{:>4}  {}  [{read_flag}]  to {}  {}\n", m.id, m.timestamp, m.to, m.subject));
                 }
                 out.push_str(&prompt());
                 (out, false)
@@ -126,28 +120,24 @@ fn handle_command(messages: &mut [MailboxMessage], remote_call: &str, line: &str
             let Some(id) = arg.parse::<u64>().ok() else {
                 return (format!("Usage: R <id>\n{}", prompt()), false);
             };
-            match messages.iter_mut().find(|m| m.id == id && m.to == remote_call) {
+            // Only allow reading back messages this station sent.
+            match messages.iter().find(|m| m.id == id && m.from.eq_ignore_ascii_case(remote_call)) {
                 Some(m) => {
-                    m.read = true;
-                    (format!("From: {}\nSubject: {}\n\n{}\n{}", m.from, m.subject, m.body, prompt()), false)
+                    (format!("To: {}\nSubject: {}\n\n{}\n{}", m.to, m.subject, m.body, prompt()), false)
                 }
                 None => (format!("No such message.\n{}", prompt()), false),
             }
         }
-        "S" | "SEND" => {
-            if arg.is_empty() {
-                return (format!("Usage: S <callsign>\n{}", prompt()), false);
-            }
-            let to = arg.to_uppercase();
-            *state = MailboxState::SendSubject { to };
-            ("Subject: ".to_string(), false)
+        "CQ" => {
+            *state = MailboxState::AwaitingQth;
+            ("QTH (city, state/country or grid locator): ".to_string(), false)
         }
         "B" | "BYE" => ("73, disconnecting...\n".to_string(), true),
         _ => (format!("Unknown command.\n{}", prompt()), false),
     }
 }
 
-fn next_id(messages: &[MailboxMessage]) -> u64 {
+fn _next_id(messages: &[MailboxMessage]) -> u64 {
     messages.iter().map(|m| m.id).max().unwrap_or(0) + 1
 }
 
@@ -156,49 +146,70 @@ mod tests {
     use super::*;
 
     const TS: &str = "2026-07-27 20:45:39";
+    const PORT: &str = "port-0";
+
+    fn run(state: &mut MailboxState, messages: &mut Vec<MailboxMessage>, from: &str, line: &str) -> (String, bool, Option<QsoLogEntry>) {
+        handle_line(state, messages, from, PORT, line, TS)
+    }
 
     #[test]
-    fn full_send_then_list_then_read_flow() {
+    fn list_shows_messages_sent_by_connecting_station() {
+        let mut messages = vec![
+            MailboxMessage { id: 1, to: "KD3BFP-5".to_string(), from: "N0CALL-1".to_string(), subject: "Hello".to_string(), body: "hi".to_string(), timestamp: TS.to_string(), read: false },
+            MailboxMessage { id: 2, to: "OTHER".to_string(), from: "THIRD-1".to_string(), subject: "Other".to_string(), body: "x".to_string(), timestamp: TS.to_string(), read: false },
+        ];
+        let mut state = MailboxState::Command;
+        let (resp, _, _) = run(&mut state, &mut messages, "N0CALL-1", "L");
+        assert!(resp.contains("Hello"));
+        assert!(!resp.contains("Other"));
+    }
+
+    #[test]
+    fn read_only_allows_own_messages() {
+        let mut messages = vec![
+            MailboxMessage { id: 1, to: "KD3BFP-5".to_string(), from: "N0CALL-1".to_string(), subject: "Test".to_string(), body: "body".to_string(), timestamp: TS.to_string(), read: false },
+        ];
+        let mut state = MailboxState::Command;
+        let (resp, _, _) = run(&mut state, &mut messages, "N0CALL-1", "R 1");
+        assert!(resp.contains("body"));
+        let mut state2 = MailboxState::Command;
+        let (resp2, _, _) = run(&mut state2, &mut messages, "OTHER-1", "R 1");
+        assert!(resp2.contains("No such message"));
+    }
+
+    #[test]
+    fn cq_logs_contact_with_qth() {
         let mut messages = Vec::new();
         let mut state = MailboxState::Command;
-
-        let (resp, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "S KD3BFP-9", TS);
+        let (prompt_resp, close, entry) = run(&mut state, &mut messages, "N0CALL-1", "CQ");
         assert!(!close);
-        assert!(resp.contains("Subject"));
+        assert!(entry.is_none());
+        assert!(prompt_resp.to_lowercase().contains("qth"));
 
-        let (_, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "Test Subject", TS);
+        let (resp, close, entry) = run(&mut state, &mut messages, "N0CALL-1", "Pittsburgh, PA");
         assert!(!close);
+        assert!(resp.contains("Pittsburgh"));
+        assert!(resp.contains("logged"));
+        let entry = entry.expect("CQ should produce a QsoLogEntry");
+        assert_eq!(entry.location.as_deref(), Some("Pittsburgh, PA"));
+        assert_eq!(entry.callsign, "N0CALL-1");
+    }
 
-        let (_, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "line one", TS);
-        assert!(!close);
-        let (resp, close) = handle_line(&mut state, &mut messages, "N0CALL-1", ".", TS);
-        assert!(!close);
-        assert!(resp.contains("saved"));
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].to, "KD3BFP-9");
-        assert_eq!(messages[0].from, "N0CALL-1");
-        assert_eq!(messages[0].body, "line one");
-        assert_eq!(messages[0].timestamp, TS);
-
-        // A different station listing sees nothing addressed to them.
-        let (resp, _) = handle_line(&mut state, &mut messages, "N0CALL-1", "L", TS);
-        assert!(resp.contains("No messages"));
-
-        // KD3BFP-9 connecting and listing sees the message.
-        let (resp, _) = handle_line(&mut state, &mut messages, "KD3BFP-9", "L", TS);
-        assert!(resp.contains("Test Subject"));
-
-        let id = messages[0].id;
-        let (resp, _) = handle_line(&mut state, &mut messages, "KD3BFP-9", &format!("R {id}"), TS);
-        assert!(resp.contains("line one"));
-        assert!(messages[0].read);
+    #[test]
+    fn cq_accepts_blank_qth() {
+        let mut messages = Vec::new();
+        let mut state = MailboxState::Command;
+        run(&mut state, &mut messages, "N0CALL-1", "CQ");
+        let (resp, _, entry) = run(&mut state, &mut messages, "N0CALL-1", "");
+        assert!(resp.contains("logged"));
+        assert_eq!(entry.expect("should produce entry").location, None);
     }
 
     #[test]
     fn bye_signals_close() {
         let mut messages = Vec::new();
         let mut state = MailboxState::Command;
-        let (_, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "B", TS);
+        let (_, close, _) = run(&mut state, &mut messages, "N0CALL-1", "B");
         assert!(close);
     }
 
@@ -206,7 +217,7 @@ mod tests {
     fn unknown_command_reprompts_without_closing() {
         let mut messages = Vec::new();
         let mut state = MailboxState::Command;
-        let (resp, close) = handle_line(&mut state, &mut messages, "N0CALL-1", "ZZZ", TS);
+        let (resp, close, _) = run(&mut state, &mut messages, "N0CALL-1", "ZZZ");
         assert!(!close);
         assert!(resp.contains("Unknown command"));
     }
@@ -219,26 +230,15 @@ mod tests {
 
     #[test]
     fn should_answer_declines_with_no_respond_call() {
-        // The mailbox never falls back to any general/default callsign --
-        // it requires its own explicit one (also enforced up front by the
-        // Enable button, which refuses to turn on without one).
         assert!(!should_answer(true, "", Some("KD3BFP-1")));
         assert!(!should_answer(true, "", None));
     }
 
     #[test]
     fn should_answer_only_matches_configured_callsign() {
-        // Exact scenario from the feature request: mailbox configured to
-        // respond as KD3BFP-5 must not answer a connect addressed to a
-        // different SSID of the same base callsign.
         assert!(should_answer(true, "KD3BFP-5", Some("KD3BFP-5")));
         assert!(!should_answer(true, "KD3BFP-5", Some("KD3BFP-6")));
-        // Case-insensitive, and tolerant of incidental whitespace in the
-        // configured value.
         assert!(should_answer(true, " kd3bfp-5 ", Some("KD3BFP-5")));
-        // No known destination (a backend that doesn't report `to`) can't be
-        // confirmed as addressed to the configured call, so it's declined
-        // rather than assumed.
         assert!(!should_answer(true, "KD3BFP-5", None));
     }
 

@@ -42,6 +42,22 @@ struct TabChip {
     root: gtk::Box,
 }
 
+/// Live handles into a tab's detached pop-out window, kept so connection-
+/// state changes can update the window's phone button, send-button
+/// sensitivity, and status label alongside the main window's equivalents.
+struct DetachedWindow {
+    window: gtk::Window,
+    phone_button: gtk::Button,
+    send_button: gtk::Button,
+    status_label: gtk::Label,
+    /// Handler ID for the pop-out window's close-request signal (the one
+    /// that re-attaches the tab to the main view). Stored so `close_tab`
+    /// can disconnect it before calling `window.close()`, preventing the
+    /// "return to main window" logic from firing when the tab itself is
+    /// being removed.
+    close_handler: glib::SignalHandlerId,
+}
+
 pub struct Ui {
     pub state: Rc<AppState>,
     pub monitor: Rc<MonitorView>,
@@ -154,6 +170,9 @@ pub struct Ui {
 
     pub direwolf: Rc<DirewolfProcess>,
     pub window: adw::ApplicationWindow,
+    /// Pop-out windows, one per detached tab — keyed by tab id so
+    /// connection-state changes can refresh them alongside the main bar.
+    detached_windows: RefCell<HashMap<TabId, DetachedWindow>>,
 }
 
 impl Ui {
@@ -501,6 +520,18 @@ impl Ui {
         }
         chip_root.append(&click_area);
 
+        let detach_button = gtk::Button::from_icon_name("window-new-symbolic");
+        detach_button.add_css_class("flat");
+        detach_button.add_css_class("tab-chip-button");
+        detach_button.set_tooltip_text(Some("Pop out"));
+        {
+            let ui = self.clone();
+            detach_button.connect_clicked(move |_| {
+                ui.detach_tab(tab_id);
+            });
+        }
+        chip_root.append(&detach_button);
+
         let close_button = gtk::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
         close_button.add_css_class("tab-chip-button");
@@ -530,7 +561,14 @@ impl Ui {
 
     /// Expand the tab-content pane (Monitor shrinks to ~1/4) showing
     /// `tab_id`, and refresh the bottom bar/status bar/phone button for it.
+    /// If the tab is currently popped out, raises its window instead of
+    /// showing it inline — clicking its chip in the strip does the same.
     pub fn select_tab(self: &Rc<Self>, tab_id: TabId) {
+        // Detached tab: clicking its chip raises the pop-out window.
+        if let Some(dw) = self.detached_windows.borrow().get(&tab_id) {
+            dw.window.present();
+            return;
+        }
         if !self.tabs.borrow().contains_key(&tab_id) {
             return;
         }
@@ -653,50 +691,58 @@ impl Ui {
         }
     }
 
-    /// Handle Up/Down arrow keys in the message entry to navigate send
-    /// history. Up goes back (older), Down goes forward (newer); pressing
-    /// Down past the most-recent entry restores whatever the user was typing
-    /// before they first pressed Up.
-    fn on_message_entry_key_pressed(&self, key: gtk::gdk::Key) -> glib::Propagation {
-        let history = self.send_history.borrow();
-        let len = history.len();
-        if len == 0 {
-            return glib::Propagation::Proceed;
-        }
+    /// Navigate send history with Up/Down in `entry`. Always consumes Up
+    /// and Down so the entry never loses focus to GTK's built-in
+    /// focus-chain navigation — if there is no history yet the keys are
+    /// swallowed but the entry text is unchanged.
+    fn navigate_send_history(&self, entry: &gtk::Entry, key: gtk::gdk::Key) -> glib::Propagation {
         match key {
             gtk::gdk::Key::Up => {
-                let new_pos = match self.history_pos.get() {
-                    None => {
-                        *self.history_draft.borrow_mut() = self.message_entry.text().to_string();
-                        0
-                    }
-                    Some(i) if i + 1 < len => i + 1,
-                    Some(i) => i,
-                };
-                self.history_pos.set(Some(new_pos));
-                self.message_entry.set_text(&history[len - 1 - new_pos]);
-                self.message_entry.set_position(-1);
+                let history = self.send_history.borrow();
+                let len = history.len();
+                if len > 0 {
+                    let new_pos = match self.history_pos.get() {
+                        None => {
+                            *self.history_draft.borrow_mut() = entry.text().to_string();
+                            0
+                        }
+                        Some(i) if i + 1 < len => i + 1,
+                        Some(i) => i,
+                    };
+                    self.history_pos.set(Some(new_pos));
+                    entry.set_text(&history[len - 1 - new_pos]);
+                    entry.set_position(-1);
+                }
                 glib::Propagation::Stop
             }
-            gtk::gdk::Key::Down => match self.history_pos.get() {
-                None => glib::Propagation::Proceed,
-                Some(0) => {
-                    self.history_pos.set(None);
-                    let draft = self.history_draft.borrow().clone();
-                    self.message_entry.set_text(&draft);
-                    self.message_entry.set_position(-1);
-                    glib::Propagation::Stop
+            gtk::gdk::Key::Down => {
+                let history = self.send_history.borrow();
+                let len = history.len();
+                if len > 0 {
+                    match self.history_pos.get() {
+                        None => {}
+                        Some(0) => {
+                            self.history_pos.set(None);
+                            let draft = self.history_draft.borrow().clone();
+                            entry.set_text(&draft);
+                            entry.set_position(-1);
+                        }
+                        Some(i) => {
+                            let new_pos = i - 1;
+                            self.history_pos.set(Some(new_pos));
+                            entry.set_text(&history[len - 1 - new_pos]);
+                            entry.set_position(-1);
+                        }
+                    }
                 }
-                Some(i) => {
-                    let new_pos = i - 1;
-                    self.history_pos.set(Some(new_pos));
-                    self.message_entry.set_text(&history[len - 1 - new_pos]);
-                    self.message_entry.set_position(-1);
-                    glib::Propagation::Stop
-                }
-            },
+                glib::Propagation::Stop
+            }
             _ => glib::Propagation::Proceed,
         }
+    }
+
+    fn on_message_entry_key_pressed(&self, key: gtk::gdk::Key) -> glib::Propagation {
+        self.navigate_send_history(&self.message_entry.clone(), key)
     }
 
     /// Prompt to confirm, then permanently clear the persisted history *and*
@@ -844,10 +890,14 @@ impl Ui {
         for line in tab.take_mailbox_lines(chunk) {
             let mut state_slot = tab.mailbox_state.borrow_mut();
             let Some(state) = state_slot.as_mut() else { break };
-            let mut cfg = self.state.config.borrow_mut();
             let timestamp = crate::app_state::now_timestamp();
-            let (response, close) = crate::mailbox::handle_line(state, &mut cfg.mailbox.messages, &remote_call, &line, &timestamp);
-            drop(cfg);
+            let (response, close, qso_entry) = {
+                let mut cfg = self.state.config.borrow_mut();
+                crate::mailbox::handle_line(state, &mut cfg.mailbox.messages, &remote_call, port_id, &line, &timestamp)
+            };
+            if let Some(entry) = qso_entry {
+                self.state.config.borrow_mut().qso_log.push(entry);
+            }
             drop(state_slot);
             self.state.save_config();
             self.refresh_mailbox_button();
@@ -857,6 +907,27 @@ impl Ui {
             if close {
                 *tab.mailbox_state.borrow_mut() = None;
                 if let (Some(conn_id), Some(handle)) = (tab.conn_id.get(), self.state.active.borrow().get(port_id)) {
+                    let _ = handle.cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
+                }
+                break;
+            }
+        }
+    }
+
+    /// Watch a live keyboard-to-keyboard tab for `/bye` (and `B`/`BYE`) from
+    /// the remote station: send a sign-off, then close just this AX.25
+    /// connection. The port stays up and K2K mode stays enabled — only the
+    /// single connected session ends, leaving the tab disconnected as if the
+    /// remote had dropped carrier.
+    fn drive_k2k(&self, tab: &SessionTab, port_id: &str, conn_id: ConnectionId, chunk: &str) {
+        if !tab.k2k_active.get() {
+            return;
+        }
+        for line in tab.take_mailbox_lines(chunk) {
+            if crate::keyboard_mode::is_bye(&line) {
+                tab.k2k_active.set(false);
+                self.send_tab_text(tab, port_id, "73, disconnecting...\n");
+                if let Some(handle) = self.state.active.borrow().get(port_id) {
                     let _ = handle.cmd_tx.send(PortCommand::CloseConnection { id: conn_id });
                 }
                 break;
@@ -912,11 +983,265 @@ impl Ui {
         }
     }
 
+    /// Send a line from a detached window's own message entry, mirroring
+    /// `activate_message_entry` but scoped to a specific tab (not the
+    /// selected one) and without touching `self.message_entry`.
+    fn activate_detached_message(self: &Rc<Self>, tab_id: TabId, entry: &gtk::Entry) {
+        let text = entry.text().to_string();
+        if text.is_empty() {
+            return;
+        }
+        {
+            let tabs = self.tabs.borrow();
+            let Some(tab) = tabs.get(&tab_id) else { return };
+            if tab.conn_id.get().is_none() {
+                return;
+            }
+            self.send_tab_connected(tab, &text);
+        }
+        {
+            let mut history = self.send_history.borrow_mut();
+            if history.last().map(|s| s.as_str()) != Some(text.as_str()) {
+                history.push(text);
+            }
+        }
+        self.history_pos.set(None);
+        *self.history_draft.borrow_mut() = String::new();
+        entry.set_text("");
+        self.refresh_detached_tab(tab_id);
+    }
+
+    /// Update a detached window's phone button, send-button sensitivity,
+    /// and status label to match the current connection state of `tab_id`.
+    fn refresh_detached_tab(&self, tab_id: TabId) {
+        let refs = {
+            let dws = self.detached_windows.borrow();
+            dws.get(&tab_id).map(|dw| (dw.phone_button.clone(), dw.send_button.clone(), dw.status_label.clone()))
+        };
+        let Some((phone_btn, send_btn, status_lbl)) = refs else { return };
+        let tabs = self.tabs.borrow();
+        if let Some(tab) = tabs.get(&tab_id) {
+            let connected = tab.conn_id.get().is_some();
+            phone_btn.remove_css_class("state-success");
+            phone_btn.remove_css_class("state-destructive");
+            if connected {
+                phone_btn.add_css_class("state-destructive");
+                phone_btn.set_tooltip_text(Some("Disconnect"));
+            } else {
+                phone_btn.add_css_class("state-success");
+                phone_btn.set_tooltip_text(Some("Connect"));
+            }
+            send_btn.set_sensitive(connected);
+            let status_text = match (connected, tab.elapsed_text()) {
+                (true, Some(elapsed)) => format!("Connected to {} \u{2014} {elapsed}", tab.node),
+                (true, None) => format!("Connected to {}", tab.node),
+                (false, _) => "Disconnected".to_string(),
+            };
+            status_lbl.set_text(&status_text);
+        }
+    }
+
+    /// Pop `tab_id` out into its own non-modal, non-transient window.
+    /// Calling again while the window is already open just raises it.
+    fn detach_tab(self: &Rc<Self>, tab_id: TabId) {
+        // Raise the existing window if already detached.
+        let existing = self.detached_windows.borrow().get(&tab_id).map(|dw| dw.window.clone());
+        if let Some(w) = existing {
+            w.present();
+            return;
+        }
+
+        let (title, buffer) = {
+            let tabs = self.tabs.borrow();
+            let Some(tab) = tabs.get(&tab_id) else { return };
+            (self.tab_title_text(tab), tab.buffer_ref().clone())
+        };
+
+        let dw = adw::Window::builder().title(&title).default_width(640).default_height(500).build();
+        if let Some(app) = self.window.application() {
+            app.add_window(&dw);
+        }
+
+        // Header: Save and Clear History buttons in the title bar.
+        let header = adw::HeaderBar::new();
+        let save_btn = gtk::Button::with_label("Save\u{2026}");
+        save_btn.add_css_class("flat");
+        let clear_btn = gtk::Button::with_label("Clear History\u{2026}");
+        clear_btn.add_css_class("flat");
+        header.pack_start(&save_btn);
+        header.pack_end(&clear_btn);
+
+        // Scrollback: a second view backed by the same buffer so both
+        // the main tab and this window always show the same text.
+        let text_view = gtk::TextView::builder()
+            .buffer(&buffer)
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(4)
+            .bottom_margin(4)
+            .left_margin(6)
+            .right_margin(6)
+            .build();
+        text_view.add_css_class("pr-mono");
+        let scrolled = gtk::ScrolledWindow::builder().child(&text_view).vexpand(true).build();
+
+        // Bottom bar: phone (connect/disconnect) + message entry + Send.
+        let phone_button = gtk::Button::from_icon_name("call-start-symbolic");
+        phone_button.add_css_class("flat");
+        let msg_entry = gtk::Entry::builder().hexpand(true).placeholder_text("Type and press Enter\u{2026}").build();
+        let send_button = gtk::Button::with_label("Send");
+        send_button.add_css_class("suggested-action");
+        let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bottom_bar.set_margin_start(8);
+        bottom_bar.set_margin_end(8);
+        bottom_bar.set_margin_top(4);
+        bottom_bar.set_margin_bottom(4);
+        bottom_bar.append(&phone_button);
+        bottom_bar.append(&msg_entry);
+        bottom_bar.append(&send_button);
+
+        // Status label at the very bottom.
+        let status_label = gtk::Label::new(Some(""));
+        status_label.set_halign(gtk::Align::Start);
+        status_label.set_margin_start(8);
+        status_label.set_margin_end(8);
+        status_label.set_margin_bottom(6);
+        status_label.add_css_class("caption");
+
+        let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inner.append(&scrolled);
+        inner.append(&bottom_bar);
+        inner.append(&status_label);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header);
+        toolbar_view.set_content(Some(&inner));
+        dw.set_content(Some(&toolbar_view));
+
+        // Wire up Save.
+        {
+            let ui = self.clone();
+            let dw_ref = dw.clone();
+            save_btn.connect_clicked(move |_| {
+                let tabs = ui.tabs.borrow();
+                if let Some(tab) = tabs.get(&tab_id) {
+                    let name = format!("{}_{}", tab.port.name, tab.node).replace([':', ' ', '/'], "_");
+                    let history_dir = pr_core::AppConfig::config_dir().map(|dir| pr_core::history_dir(&dir, &tab.port.name));
+                    crate::export::save_text(&dw_ref, &format!("{name}.txt"), tab.full_text(), history_dir.as_deref());
+                }
+            });
+        }
+
+        // Wire up Clear History (confirm dialog uses the main window as parent).
+        {
+            let ui = self.clone();
+            clear_btn.connect_clicked(move |_| ui.confirm_clear_history(tab_id));
+        }
+
+        // Wire up phone button.
+        {
+            let ui = self.clone();
+            phone_button.connect_clicked(move |_| {
+                let is_connected = ui.tabs.borrow().get(&tab_id).is_some_and(|t| t.conn_id.get().is_some());
+                if is_connected { ui.disconnect_tab(tab_id); } else { ui.connect_tab(tab_id); }
+            });
+        }
+
+        // Wire up message send (entry activate + Send button click).
+        {
+            let ui = self.clone();
+            let entry = msg_entry.clone();
+            msg_entry.connect_activate(move |_| ui.activate_detached_message(tab_id, &entry));
+        }
+        {
+            let ui = self.clone();
+            let entry = msg_entry.clone();
+            send_button.connect_clicked(move |_| ui.activate_detached_message(tab_id, &entry));
+        }
+
+        // Key controller: Up/Down history navigation in the message entry.
+        {
+            let kc = gtk::EventControllerKey::new();
+            let ui = self.clone();
+            let entry = msg_entry.clone();
+            kc.connect_key_pressed(move |_, key, _, _| ui.navigate_send_history(&entry, key));
+            msg_entry.add_controller(kc);
+        }
+
+        // Scroll to the bottom of the (already-populated) buffer once rendered.
+        {
+            let tv = text_view.clone();
+            let buf = buffer.clone();
+            glib::idle_add_local_once(move || {
+                let mark = buf.create_mark(None, &buf.end_iter(), false);
+                tv.scroll_mark_onscreen(&mark);
+            });
+        }
+
+        // When the user closes the pop-out window, return the tab to the
+        // main view by removing it from the detached map (so select_tab
+        // goes inline again) then selecting it there.  The handler ID is
+        // stored in DetachedWindow so close_tab can disconnect it before
+        // calling window.close(), preventing this re-attach logic from
+        // firing when the tab itself is being permanently removed.
+        let close_handler = {
+            let ui = self.clone();
+            dw.connect_close_request(move |_| {
+                ui.detached_windows.borrow_mut().remove(&tab_id);
+                // Only re-attach if the tab still exists (not being closed).
+                if ui.tabs.borrow().contains_key(&tab_id) {
+                    ui.select_tab(tab_id);
+                }
+                glib::Propagation::Proceed
+            })
+        };
+
+        self.detached_windows.borrow_mut().insert(tab_id, DetachedWindow {
+            window: dw.clone().upcast(),
+            phone_button,
+            send_button,
+            status_label,
+            close_handler,
+        });
+
+        // Deselect from the main view now that it lives in its own window.
+        // Find another non-detached tab to show; collapse if none.
+        if self.selected_tab.get() == Some(tab_id) {
+            let next = {
+                let tabs = self.tabs.borrow();
+                let dws = self.detached_windows.borrow();
+                tabs.keys().copied().find(|&id| id != tab_id && !dws.contains_key(&id))
+            };
+            if let Some(next_id) = next {
+                self.select_tab(next_id);
+            } else {
+                self.minimize_tab_area();
+            }
+        }
+
+        // Set initial widget state before presenting.
+        self.refresh_detached_tab(tab_id);
+        dw.present();
+    }
+
     /// Remove a tab entirely: disconnect it first if live (sends a proper
     /// disconnect over the wire rather than just dropping the UI side),
     /// unpin it, and drop its chip/content page.
     pub fn close_tab(self: &Rc<Self>, tab_id: TabId) {
         self.disconnect_tab(tab_id);
+
+        // Close the detached pop-out window first (if any). Disconnect
+        // its close-request handler before calling close() so the "return
+        // to main window" logic doesn't fire — the tab is being removed,
+        // not just returned. Extract the window after removing from the map
+        // so the borrow is dropped before close() can fire close-request.
+        let detached_window = self.detached_windows.borrow_mut().remove(&tab_id);
+        if let Some(dw) = detached_window {
+            dw.window.disconnect(dw.close_handler);
+            dw.window.close();
+        }
 
         if let Some(tab) = self.tabs.borrow().get(&tab_id) {
             if let Some((old_port, old_remote)) = tab.pinned_identity.borrow_mut().take() {
@@ -994,6 +1319,7 @@ impl Ui {
                             }
                             self.refresh_send_button_sensitivity();
                         }
+                        self.refresh_detached_tab(tab_id);
                     }
                 }
                 self.pending.borrow_mut().retain(|(pid, _), _| pid != port_id);
@@ -1088,6 +1414,7 @@ impl Ui {
                         if crate::keyboard_mode::should_answer(k2k_enabled, &k2k_identity, to.as_deref())
                             && crate::keyboard_mode::listens_on(&k2k_listen_ports, port_id)
                         {
+                            tab.k2k_active.set(true);
                             tab.append_status_line("Keyboard-to-keyboard session");
                             let welcome = if k2k_welcome.trim().is_empty() {
                                 crate::keyboard_mode::default_welcome(&k2k_identity)
@@ -1141,6 +1468,7 @@ impl Ui {
                     self.message_entry.grab_focus();
                 }
                 self.refresh_status_bar();
+                self.refresh_detached_tab(tab_id);
             }
             PortEvent::ConnectionClosed { id } => {
                 let was_established = self.established_conns.borrow_mut().remove(&(port_id.to_string(), id));
@@ -1157,10 +1485,12 @@ impl Ui {
                         let status_msg = if was_established { "Disconnected" } else { "Connection timed out" };
                         tab.append_status_line(status_msg);
                         *tab.mailbox_state.borrow_mut() = None;
+                        tab.k2k_active.set(false);
                     }
                     if self.selected_tab.get() == Some(tab_id) {
                         self.refresh_bottom_bar();
                     }
+                    self.refresh_detached_tab(tab_id);
                 }
                 self.refresh_status_bar();
             }
@@ -1176,7 +1506,9 @@ impl Ui {
                         let text = String::from_utf8_lossy(&bytes).replace('\0', "");
                         tab.receive_data(&text);
                         self.drive_mailbox(tab, port_id, &text);
+                        self.drive_k2k(tab, port_id, id, &text);
                     }
+                    self.refresh_detached_tab(tab_id);
                 }
                 self.refresh_status_bar();
             }
@@ -1794,6 +2126,7 @@ pub fn build_ui(app: &adw::Application) {
         mailbox_beacon_timer: RefCell::new(None),
         direwolf: DirewolfProcess::new(),
         window: window.clone(),
+        detached_windows: RefCell::new(HashMap::new()),
     });
     ui.rebuild_favorites_bar();
     ui.rebuild_bottom_ports();

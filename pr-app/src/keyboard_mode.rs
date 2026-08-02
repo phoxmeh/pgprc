@@ -29,6 +29,13 @@ pub fn should_answer(enabled: bool, node_call: &str, to: Option<&str>) -> bool {
     to.map(|t| t.eq_ignore_ascii_case(node_call)).unwrap_or(false)
 }
 
+/// Returns `true` if the incoming line from the remote station is a
+/// graceful-disconnect command (`/bye`, `B`, `BYE`, all case-insensitive).
+pub fn is_bye(line: &str) -> bool {
+    let s = line.trim().to_uppercase();
+    s == "/BYE" || s == "B" || s == "BYE"
+}
+
 /// Whether `port_id` is one of the ports a feature (keyboard mode or
 /// mailbox) should listen on -- an empty list means "any port", matching
 /// each feature's original behavior before per-port filtering existed.
@@ -69,6 +76,20 @@ mod tests {
         assert!(should_answer(true, "kd3bfp-9", Some("KD3BFP-9")));
         assert!(!should_answer(true, "KD3BFP-9", Some("KD3BFP-6")));
         assert!(!should_answer(true, "KD3BFP-9", None));
+    }
+
+    #[test]
+    fn is_bye_matches_all_forms() {
+        assert!(is_bye("/bye"));
+        assert!(is_bye("/BYE"));
+        assert!(is_bye("B"));
+        assert!(is_bye("b"));
+        assert!(is_bye("BYE"));
+        assert!(is_bye("bye"));
+        assert!(is_bye("  /bye  "));
+        assert!(!is_bye("HELLO"));
+        assert!(!is_bye("/b"));
+        assert!(!is_bye(""));
     }
 
     #[test]

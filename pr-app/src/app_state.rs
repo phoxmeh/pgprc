@@ -201,7 +201,7 @@ impl AppState {
             return;
         }
         let mut cfg = self.config.borrow_mut();
-        cfg.qso_log.push(QsoLogEntry { callsign, port_id: port_id.to_string(), started: now_timestamp(), ended: None });
+        cfg.qso_log.push(QsoLogEntry { callsign, port_id: port_id.to_string(), started: now_timestamp(), ended: None, location: None, from_cq: false });
         drop(cfg);
         self.save_config();
     }

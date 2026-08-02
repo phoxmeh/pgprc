@@ -400,6 +400,14 @@ pub struct QsoLogEntry {
     pub started: String,
     #[serde(default)]
     pub ended: Option<String>,
+    /// QTH reported by the station during a CQ exchange (city/state or
+    /// Maidenhead grid), if provided.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// `true` for contacts logged via the mailbox's CQ command, as opposed
+    /// to real connected-mode sessions. Used to separate the two for export.
+    #[serde(default)]
+    pub from_cq: bool,
 }
 
 /// A beacon that fires automatically on an interval while its port is

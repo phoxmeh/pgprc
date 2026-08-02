@@ -3,7 +3,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::object::IsA;
 
-use pr_core::MailboxMessage;
+use pr_core::{MailboxMessage, QsoLogEntry};
 
 use crate::ports_dialog::{collapse_listen_ports, dialog_window, dialog_window_with_header, force_uppercase, port_listen_checklist};
 use crate::window::Ui;
@@ -31,6 +31,18 @@ pub fn show(ui: &Rc<Ui>) {
         });
     }
     header.pack_end(&settings_button);
+
+    let qso_button = gtk::Button::from_icon_name("x-office-address-book-symbolic");
+    qso_button.set_tooltip_text(Some("View CQ Contacts\u{2026}"));
+    qso_button.add_css_class("flat");
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        qso_button.connect_clicked(move |_| {
+            show_cq_contacts(&ui, &win);
+        });
+    }
+    header.pack_end(&qso_button);
     {
         let ui = ui.clone();
         let win = win.clone();
@@ -319,4 +331,138 @@ fn build_message_row(ui: &Rc<Ui>, entry: MailboxMessage, list_box: &gtk::ListBox
     row.append(&remove_button);
 
     row.upcast()
+}
+
+// ---------------------------------------------------------------------------
+// CQ contacts sub-dialog
+// ---------------------------------------------------------------------------
+
+fn show_cq_contacts(ui: &Rc<Ui>, parent: &adw::Window) {
+    use crate::ports_dialog::dialog_window;
+
+    let (win, root) = dialog_window(parent, "CQ Contacts", 520);
+    win.set_default_height(420);
+
+    let desc = gtk::Label::new(Some("Contacts logged via the CQ command by stations that connected to this mailbox."));
+    desc.set_wrap(true);
+    desc.set_halign(gtk::Align::Start);
+    desc.add_css_class("dim-label");
+    desc.add_css_class("caption");
+    root.append(&desc);
+
+    let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    list_box.add_css_class("boxed-list");
+    let scrolled = gtk::ScrolledWindow::builder().child(&list_box).vexpand(true).min_content_height(260).build();
+    root.append(&scrolled);
+
+    rebuild_cq_list(ui, &list_box);
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+    let export_button = gtk::Button::with_label("Export ADIF\u{2026}");
+    export_button.set_tooltip_text(Some("Export CQ contacts as an ADIF log file"));
+    {
+        let ui = ui.clone();
+        export_button.connect_clicked(move |_| {
+            let adif = crate::adif::format_adif(&ui.state.config.borrow().qso_log);
+            crate::export::save_text(&ui.window, "cq_contacts.adi", adif, None);
+        });
+    }
+    button_row.append(&export_button);
+
+    let clear_button = gtk::Button::with_label("Clear All");
+    clear_button.add_css_class("destructive-action");
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        let list_box = list_box.clone();
+        clear_button.connect_clicked(move |_| {
+            confirm_clear_cq(&ui, &win, &list_box);
+        });
+    }
+    button_row.append(&clear_button);
+
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    button_row.append(&spacer);
+
+    let close_button = gtk::Button::with_label("Close");
+    {
+        let win = win.clone();
+        close_button.connect_clicked(move |_| win.close());
+    }
+    button_row.append(&close_button);
+
+    root.append(&button_row);
+
+    win.present();
+}
+
+fn rebuild_cq_list(ui: &Rc<Ui>, list_box: &gtk::ListBox) {
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+    let mut contacts: Vec<QsoLogEntry> = ui.state.config.borrow().qso_log.iter().filter(|e| e.from_cq).cloned().collect();
+    contacts.sort_by(|a, b| b.started.cmp(&a.started));
+
+    if contacts.is_empty() {
+        let label = gtk::Label::new(Some("No CQ contacts logged yet."));
+        label.set_margin_top(12);
+        label.set_margin_bottom(12);
+        list_box.append(&label);
+        return;
+    }
+    for contact in contacts {
+        list_box.append(&build_cq_row(contact));
+    }
+}
+
+fn build_cq_row(entry: QsoLogEntry) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(8);
+    row.set_margin_end(8);
+
+    let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text_box.set_hexpand(true);
+
+    let callsign_label = gtk::Label::new(Some(&entry.callsign));
+    callsign_label.set_halign(gtk::Align::Start);
+    text_box.append(&callsign_label);
+
+    let mut detail_parts = vec![entry.started.clone()];
+    if let Some(qth) = entry.location.as_deref().filter(|s| !s.is_empty()) {
+        detail_parts.push(qth.to_string());
+    }
+    let detail_label = gtk::Label::new(Some(&detail_parts.join("  \u{b7}  ")));
+    detail_label.set_halign(gtk::Align::Start);
+    detail_label.add_css_class("dim-label");
+    detail_label.add_css_class("caption");
+    text_box.append(&detail_label);
+
+    row.append(&text_box);
+    row.upcast()
+}
+
+fn confirm_clear_cq(ui: &Rc<Ui>, win: &adw::Window, list_box: &gtk::ListBox) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Clear All CQ Contacts?")
+        .body("This permanently deletes every logged CQ contact. This can't be undone.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("clear", "Clear");
+    dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    let list_box = list_box.clone();
+    dialog.choose(win, gtk::gio::Cancellable::NONE, move |response| {
+        if response == "clear" {
+            ui.state.config.borrow_mut().qso_log.retain(|e| !e.from_cq);
+            ui.state.save_config();
+            rebuild_cq_list(&ui, &list_box);
+        }
+    });
 }
