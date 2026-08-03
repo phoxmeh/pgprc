@@ -1,0 +1,24 @@
+# branch-per-task, commit-per-action, --no-ff merges
+git_workflow: true
+# status report after each action
+status_reporting: true
+# eidos skill listing in session start context
+skills_list: true
+# spec/concept listing, future items at session start
+specs_and_concepts: true
+# session orientation: branches, todos, plans, recent memory
+session_context: true
+# max tokens for context window tracking (null to disable), used to warn about compaction early
+context_tracking_max: 200000
+# mono-repo sub-part focus injection at session start
+mono_focus: true
+# persist pasted images as named observation files in memory/
+observation_images: true
+# path to eidos-ping-app binary (macOS opt-in); empty disables /eidos:ping
+ping_macos: ""
+# cross-repo agent communication: inbox awareness + open-message surfacing (opt-in)
+agent_inbox: false
+# consumer-driven standins: STANDIN marker awareness + scan/send/sweep skill (default on)
+standins: true
+# inject eidos/required-reading/ contents full-content at session start (default on; no-op if folder absent)
+required_reading: true
