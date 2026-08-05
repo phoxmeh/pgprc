@@ -192,7 +192,7 @@ fn edit_beacon_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<Beacon
 
     let message_entry =
         gtk::Entry::builder().placeholder_text("Message text").text(existing.as_ref().map(|e| e.message.as_str()).unwrap_or("")).build();
-    message_entry.set_tooltip_text(Some("$$NODE/$$NAME/$$LOC/$$BBSHOME available; $$NODE is your Profile Callsign"));
+    message_entry.set_tooltip_text(Some("$$NODE/$$NAME/$$LOC/$$BBSHOME available; $$NODE is your Profile Call Sign"));
     root.append(&labeled("Message", &message_entry));
 
     let interval_entry =

@@ -272,7 +272,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     agw_box.append(&labeled("Host", &agw_host));
     agw_box.append(&labeled("TCP Port", &agw_port));
     agw_box.append(&labeled("Radio Port", &agw_radio_port));
-    agw_box.append(&labeled("My Callsign", &agw_my_call));
+    agw_box.append(&labeled("My Call Sign", &agw_my_call));
     agw_box.append(&labeled("Login User", &agw_user));
     agw_box.append(&labeled_widget("Login Password", agw_pass.clone().upcast()));
     stack.add_named(&agw_box, Some("AGWPE"));
@@ -298,7 +298,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let kt_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     kt_box.append(&labeled("Host", &kt_host));
     kt_box.append(&labeled("Port", &kt_port));
-    kt_box.append(&labeled("My Callsign", &kt_my_call));
+    kt_box.append(&labeled("My Call Sign", &kt_my_call));
     kt_box.append(&labeled("TXDELAY (x10ms)", &kt_tx_delay));
     kt_box.append(&labeled("Persistence", &kt_persistence));
     kt_box.append(&labeled("Slot Time (x10ms)", &kt_slot_time));
@@ -324,7 +324,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let ks_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     ks_box.append(&labeled("Device", &ks_device));
     ks_box.append(&labeled("Baud", &ks_baud));
-    ks_box.append(&labeled("My Callsign", &ks_my_call));
+    ks_box.append(&labeled("My Call Sign", &ks_my_call));
     ks_box.append(&labeled("TXDELAY (x10ms)", &ks_tx_delay));
     ks_box.append(&labeled("Persistence", &ks_persistence));
     ks_box.append(&labeled("Slot Time (x10ms)", &ks_slot_time));
@@ -711,28 +711,44 @@ pub(crate) fn labeled_widget(text: &str, widget: gtk::Widget) -> gtk::Box {
 
 /// A boxed-list of switches, one per connect-capable port, shared by any
 /// feature (mailbox, keyboard-to-keyboard mode) that listens for unsolicited
-/// connections on a configurable subset of ports. `selected` empty means
-/// "every port" (each such feature's own pre-existing behavior before this
-/// per-port filtering existed), shown as every switch defaulting on.
-/// Returns the widget to append plus each port's `(id, Switch)`, so the
-/// caller can read back which are active on Save -- see
-/// `collapse_listen_ports` for turning that back into the "empty means all"
-/// storage convention.
-pub(crate) fn port_listen_checklist(ports: &[PortEntry], selected: &[String]) -> (gtk::Widget, Vec<(String, gtk::Switch)>) {
+/// connections on a configurable subset of ports.
+///
+/// "All Ports" at the top is ON when `selected` is empty (the stored
+/// "listen on everything" convention) and hides the individual rows while
+/// it stays on.  Returns the widget, the "All Ports" switch, and each
+/// port's `(id, Switch)`.  See `collapse_listen_ports` to turn the
+/// switch states back into the storage convention.
+pub(crate) fn port_listen_checklist(
+    ports: &[PortEntry],
+    selected: &[String],
+) -> (gtk::Widget, gtk::Switch, Vec<(String, gtk::Switch)>) {
     let list_box = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
     list_box.add_css_class("boxed-list");
 
-    let connect_ports: Vec<&PortEntry> = ports.iter().filter(|p| crate::session_tab::port_supports_connect(&p.config)).collect();
+    let connect_ports: Vec<&PortEntry> =
+        ports.iter().filter(|p| crate::session_tab::port_supports_connect(&p.config)).collect();
     if connect_ports.is_empty() {
         let label = gtk::Label::new(Some("No connect-capable ports configured yet."));
         label.set_margin_top(8);
         label.set_margin_bottom(8);
         list_box.append(&label);
-        return (list_box.upcast(), Vec::new());
+        let dummy = gtk::Switch::new();
+        dummy.set_active(true);
+        return (list_box.upcast(), dummy, Vec::new());
     }
 
-    let mut switches = Vec::new();
-    for port in connect_ports {
+    // "All Ports" row — ON when nothing is explicitly listed (= listen on all).
+    let all_on = selected.is_empty();
+    let all_switch = gtk::Switch::builder().active(all_on).valign(gtk::Align::Center).build();
+    let all_row = adw::ActionRow::builder().title("All Ports").build();
+    all_row.add_suffix(&all_switch);
+    all_row.set_activatable_widget(Some(&all_switch));
+    list_box.append(&all_row);
+
+    // Per-port rows.
+    let mut switches: Vec<(String, gtk::Switch)> = Vec::new();
+    let mut port_rows: Vec<adw::ActionRow> = Vec::new();
+    for port in &connect_ports {
         let row = adw::ActionRow::builder().title(&port.name).build();
         let switch = gtk::Switch::builder()
             .active(selected.is_empty() || selected.iter().any(|p| p == &port.id))
@@ -740,21 +756,173 @@ pub(crate) fn port_listen_checklist(ports: &[PortEntry], selected: &[String]) ->
             .build();
         row.add_suffix(&switch);
         row.set_activatable_widget(Some(&switch));
+        row.set_visible(!all_on);
         list_box.append(&row);
         switches.push((port.id.clone(), switch));
+        port_rows.push(row);
     }
-    (list_box.upcast(), switches)
+
+    // Toggle individual rows when "All Ports" changes.
+    all_switch.connect_state_set(move |_, active| {
+        for row in &port_rows {
+            row.set_visible(!active);
+        }
+        glib::Propagation::Proceed
+    });
+
+    (list_box.upcast(), all_switch, switches)
 }
 
 /// Reads back a `port_listen_checklist`'s switches into the "empty means
-/// every port" storage convention: only persists an explicit subset when at
-/// least one port was actually turned off, so leaving every switch at its
-/// (all-on) default keeps listening on ports added later too.
-pub(crate) fn collapse_listen_ports(switches: &[(String, gtk::Switch)]) -> Vec<String> {
-    let chosen: Vec<String> = switches.iter().filter(|(_, sw)| sw.is_active()).map(|(id, _)| id.clone()).collect();
-    if chosen.len() == switches.len() {
+/// every port" storage convention.  When "All Ports" is on, or every
+/// individual switch is on, returns an empty Vec (= listen on all, including
+/// ports added in the future).
+pub(crate) fn collapse_listen_ports(
+    all_switch: &gtk::Switch,
+    port_switches: &[(String, gtk::Switch)],
+) -> Vec<String> {
+    if all_switch.is_active() {
+        return Vec::new();
+    }
+    let chosen: Vec<String> =
+        port_switches.iter().filter(|(_, sw)| sw.is_active()).map(|(id, _)| id.clone()).collect();
+    if chosen.len() == port_switches.len() {
         Vec::new()
     } else {
         chosen
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared call sign / SSID helpers
+// ---------------------------------------------------------------------------
+
+/// Split a stored callsign like `"N0CALL-9"` into its base and SSID parts.
+/// The SSID is clamped to 1–15; a missing or zero SSID defaults to 1.
+pub(crate) fn split_call_ssid(call: &str) -> (String, u8) {
+    match call.split_once('-') {
+        Some((base, ssid_str)) => {
+            let ssid = ssid_str.parse::<u8>().unwrap_or(1).clamp(1, 15);
+            (base.to_string(), ssid)
+        }
+        None => (call.to_string(), 1),
+    }
+}
+
+/// Base call (everything before the first `-`) from a stored call sign.
+pub(crate) fn base_call(full_call: &str) -> String {
+    full_call.split('-').next().unwrap_or(full_call).to_string()
+}
+
+/// Build a DropDown listing SSIDs 1–15.  `ssid` is pre-selected.
+pub(crate) fn make_ssid_dropdown(ssid: u8) -> gtk::DropDown {
+    let labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"];
+    let model = gtk::StringList::new(&labels);
+    let dd = gtk::DropDown::builder().model(&model).build();
+    dd.set_selected(ssid.clamp(1, 15) as u32 - 1);
+    dd
+}
+
+/// Read the currently selected SSID (1–15) from a dropdown built by
+/// `make_ssid_dropdown`.
+pub(crate) fn get_ssid_from_dropdown(dd: &gtk::DropDown) -> u8 {
+    dd.selected() as u8 + 1
+}
+
+/// A `?` button that, when clicked, shows a brief SSID reference guide
+/// relative to `parent_win`.
+pub(crate) fn ssid_hint_button(parent_win: adw::Window) -> gtk::Button {
+    let btn = gtk::Button::builder()
+        .label("?")
+        .tooltip_text("SSID reference guide")
+        .valign(gtk::Align::Center)
+        .build();
+    btn.add_css_class("flat");
+    btn.add_css_class("circular");
+    btn.connect_clicked(move |_| show_ssid_hint(&parent_win));
+    btn
+}
+
+fn show_ssid_hint(parent: &adw::Window) {
+    let (win, root) = dialog_window(parent, "SSID Reference", 460);
+
+    let intro = gtk::Label::new(Some(
+        "SSIDs 1–15 distinguish multiple stations sharing the same base call sign. \
+         The meanings below are widely-used conventions, not hard requirements.",
+    ));
+    intro.set_wrap(true);
+    intro.set_halign(gtk::Align::Start);
+    intro.add_css_class("caption");
+    intro.add_css_class("dim-label");
+    root.append(&intro);
+
+    let pr_group = adw::PreferencesGroup::builder().title("Packet Radio (common)").build();
+    for (ssid, desc) in [
+        (1u8, "Node / BBS (primary)"),
+        (2, "Home station — alternate frequency"),
+        (3, "Third port / alternate"),
+        (4, "HF / regional gateway"),
+        (5, "Satellite / ISS"),
+        (7, "Handheld (HT / walkie-talkie)"),
+        (8, "Boat / marine"),
+        (9, "Mobile unit"),
+        (10, "Internet gateway (IGate)"),
+        (11, "Balloon / airborne"),
+        (13, "Weather station"),
+        (14, "Long-haul mobile / truck"),
+        (15, "Emergency / incident command"),
+    ] {
+        let row = adw::ActionRow::builder().title(&format!("-{ssid}")).subtitle(desc).build();
+        pr_group.add(&row);
+    }
+    root.append(&pr_group);
+
+    let aprs_group = adw::PreferencesGroup::builder().title("APRS (from the spec)").build();
+    for (ssid, desc) in [
+        (1u8, "Generic (primary)"),
+        (2, "Generic"),
+        (3, "Generic"),
+        (4, "HF gateway"),
+        (5, "APRS software"),
+        (6, "Satellite operation"),
+        (7, "Handheld / walkie-talkie"),
+        (8, "Handheld HT"),
+        (9, "Mobile"),
+        (10, "Internet IGate"),
+        (11, "Balloon / aircraft"),
+        (12, "Rover / tactical"),
+        (13, "Weather station"),
+        (14, "Truck"),
+        (15, "Bus / command post"),
+    ] {
+        let row = adw::ActionRow::builder().title(&format!("-{ssid}")).subtitle(desc).build();
+        aprs_group.add(&row);
+    }
+    root.append(&aprs_group);
+
+    let close_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    close_row.set_halign(gtk::Align::End);
+    let close_btn = gtk::Button::with_label("Close");
+    {
+        let win = win.clone();
+        close_btn.connect_clicked(move |_| win.close());
+    }
+    close_row.append(&close_btn);
+    root.append(&close_row);
+
+    win.present();
+}
+
+/// Force-uppercase that additionally strips non-alphanumeric characters —
+/// used for the base call sign field where only letters and digits are valid.
+pub(crate) fn force_alphanumeric_uppercase(entry: &impl IsA<gtk::Editable>) {
+    entry.connect_changed(|entry| {
+        let text = entry.text();
+        let filtered: String = text.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_uppercase();
+        if text.as_str() != filtered.as_str() {
+            let pos = entry.position();
+            entry.set_text(&filtered);
+            entry.set_position(pos);
+        }
+    });
 }

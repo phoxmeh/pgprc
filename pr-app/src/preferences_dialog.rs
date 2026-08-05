@@ -5,7 +5,10 @@ use adw::prelude::*;
 
 use pr_core::HighlightRule;
 
-use crate::ports_dialog::{dialog_window, force_uppercase};
+use crate::ports_dialog::{
+    dialog_window, force_alphanumeric_uppercase, force_uppercase, get_ssid_from_dropdown,
+    make_ssid_dropdown, split_call_ssid, ssid_hint_button,
+};
 use crate::window::{apply_font, Ui};
 
 pub fn show(ui: &Rc<Ui>) {
@@ -34,10 +37,20 @@ pub fn show(ui: &Rc<Ui>) {
     name_row.set_text(current.name.as_deref().unwrap_or(""));
     profile_group.add(&name_row);
 
-    let callsign_row = adw::EntryRow::builder().title("Callsign").build();
-    callsign_row.set_text(current.default_call.as_deref().unwrap_or(""));
-    force_uppercase(&callsign_row);
-    profile_group.add(&callsign_row);
+    let (call_base, call_ssid) = split_call_ssid(current.default_call.as_deref().unwrap_or(""));
+    let call_sign_row = adw::EntryRow::builder().title("Call Sign").build();
+    call_sign_row.set_text(&call_base);
+    force_alphanumeric_uppercase(&call_sign_row);
+    let call_ssid_dd = make_ssid_dropdown(call_ssid);
+    call_ssid_dd.set_valign(gtk::Align::Center);
+    let ssid_hint_btn = ssid_hint_button(win.clone());
+    let call_suffix_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    call_suffix_box.set_valign(gtk::Align::Center);
+    call_suffix_box.append(&gtk::Label::new(Some("-")));
+    call_suffix_box.append(&call_ssid_dd);
+    call_suffix_box.append(&ssid_hint_btn);
+    call_sign_row.add_suffix(&call_suffix_box);
+    profile_group.add(&call_sign_row);
 
     let location_row = adw::EntryRow::builder().title("Location").build();
     location_row.set_text(current.location.as_deref().unwrap_or(""));
@@ -93,7 +106,7 @@ pub fn show(ui: &Rc<Ui>) {
     let notify_group = adw::PreferencesGroup::builder().title("Notifications").build();
     let notify_directed_row = adw::SwitchRow::builder()
         .title("Directed Notifications")
-        .subtitle("An incoming connection, or a frame directed to your callsign")
+        .subtitle("An incoming connection, or a frame directed to your call sign")
         .active(current_notify.directed_enabled)
         .build();
     notify_group.add(&notify_directed_row);
@@ -106,19 +119,19 @@ pub fn show(ui: &Rc<Ui>) {
     hl_group.add(&hl_enabled_row);
 
     let callsign_color_btn = color_button(&current_hl.callsign_color);
-    let callsign_color_row = adw::ActionRow::builder().title("Callsigns").build();
+    let callsign_color_row = adw::ActionRow::builder().title("Call Signs").build();
     callsign_color_row.add_suffix(&callsign_color_btn);
     hl_group.add(&callsign_color_row);
 
     let known_color_btn = color_button(&current_hl.known_callsign_color);
-    let known_color_row = adw::ActionRow::builder().title("Known Callsigns").build();
+    let known_color_row = adw::ActionRow::builder().title("Known Call Signs").build();
     known_color_row.add_suffix(&known_color_btn);
     hl_group.add(&known_color_row);
 
     let my_call_color_btn = color_button(&current_hl.my_call_color);
     let my_call_color_row = adw::ActionRow::builder()
-        .title("My Callsign")
-        .subtitle("Matches the Profile Callsign above, wherever it's mentioned")
+        .title("My Call Sign")
+        .subtitle("Matches the Profile Call Sign above, wherever it's mentioned")
         .build();
     my_call_color_row.add_suffix(&my_call_color_btn);
     hl_group.add(&my_call_color_row);
@@ -188,7 +201,12 @@ pub fn show(ui: &Rc<Ui>) {
             let font = font_row.text().to_string();
             let show_timestamps = timestamps_row.is_active();
             let name = name_row.text().to_string();
-            let default_call = callsign_row.text().to_string();
+            let call_base = call_sign_row.text().trim().to_uppercase();
+            let default_call = if call_base.is_empty() {
+                String::new()
+            } else {
+                format!("{}-{}", call_base, get_ssid_from_dropdown(&call_ssid_dd))
+            };
             let location = location_row.text().to_string();
             let home_bbs = home_bbs_row.text().to_string();
             let qrz_username = qrz_user_row.text().to_string();
@@ -206,8 +224,7 @@ pub fn show(ui: &Rc<Ui>) {
                 cfg.ui.font = if font.trim().is_empty() { None } else { Some(font.clone()) };
                 cfg.ui.show_timestamps = show_timestamps;
                 cfg.ui.name = if name.trim().is_empty() { None } else { Some(name) };
-                cfg.ui.default_call =
-                    if default_call.trim().is_empty() { None } else { Some(default_call.to_uppercase()) };
+                cfg.ui.default_call = if default_call.is_empty() { None } else { Some(default_call) };
                 cfg.ui.location = if location.trim().is_empty() { None } else { Some(location) };
                 cfg.ui.home_bbs = if home_bbs.trim().is_empty() { None } else { Some(home_bbs.to_uppercase()) };
                 cfg.ui.qrz_username = if qrz_username.trim().is_empty() { None } else { Some(qrz_username) };

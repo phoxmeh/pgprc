@@ -118,15 +118,30 @@ pub fn show(ui: &Rc<Ui>) {
         cancel_button.connect_clicked(move |_| win.close());
     }
     let open_disconnected_button = gtk::Button::with_label("Open Disconnected");
-    let open_connected_button = gtk::Button::with_label("Open Connected");
-    open_connected_button.add_css_class("suggested-action");
+    let dial_button = gtk::Button::with_label("Dial");
+    dial_button.add_css_class("suggested-action");
     button_row.append(&cancel_button);
     button_row.append(&open_disconnected_button);
-    button_row.append(&open_connected_button);
+    button_row.append(&dial_button);
     root.append(&button_row);
 
-    // Enter in any field triggers "Open Connected" -- the common case.
-    win.set_default_widget(Some(&open_connected_button));
+    // Enter in any field triggers "Dial" when the port is active.
+    win.set_default_widget(Some(&dial_button));
+
+    // Refresh Dial sensitivity whenever the port selection changes.
+    let refresh_dial = {
+        let ports = ports.clone();
+        let port_dropdown = port_dropdown.clone();
+        let ui = ui.clone();
+        let dial_button = dial_button.clone();
+        move || {
+            let active = ports
+                .get(port_dropdown.selected() as usize)
+                .is_some_and(|p| ui.state.is_active(&p.id));
+            dial_button.set_sensitive(active);
+        }
+    };
+    refresh_dial();
 
     let resolve = {
         let ui = ui.clone();
@@ -141,10 +156,14 @@ pub fn show(ui: &Rc<Ui>) {
                 error_label.set_text("Select a port.");
                 return;
             };
+            if connect && !ui.state.is_active(&port.id) {
+                error_label.set_text("Port not connected \u{2014} start the port first.");
+                return;
+            }
             let needs_node = port_supports_connect(&port.config);
             let node = node_entry.text().trim().to_uppercase();
             if needs_node && node.is_empty() {
-                error_label.set_text("Enter a node/callsign.");
+                error_label.set_text("Enter a node/call sign.");
                 return;
             }
             let via_raw = via_entry.text().trim().to_uppercase();
@@ -152,8 +171,8 @@ pub fn show(ui: &Rc<Ui>) {
             win.close();
         }
     };
-    // Pressing Enter in either text field submits "Open Connected" directly
-    // -- `set_default_widget` alone doesn't reliably fire on every GTK4
+    // Pressing Enter in either text field submits Dial directly --
+    // `set_default_widget` alone doesn't reliably fire on every GTK4
     // version/theme combination, so this is the belt-and-suspenders path.
     {
         let resolve = resolve.clone();
@@ -167,7 +186,11 @@ pub fn show(ui: &Rc<Ui>) {
         let resolve = resolve.clone();
         open_disconnected_button.connect_clicked(move |_| resolve(false));
     }
-    open_connected_button.connect_clicked(move |_| resolve(true));
+    {
+        let refresh_dial = refresh_dial.clone();
+        port_dropdown.connect_selected_notify(move |_| refresh_dial());
+    }
+    dial_button.connect_clicked(move |_| resolve(true));
 
     win.present();
 }

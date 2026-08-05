@@ -75,7 +75,7 @@ pub fn show(ui: &Rc<Ui>) {
     directed_heading.set_margin_top(4);
     root.append(&directed_heading);
 
-    let directed_sub = gtk::Label::new(Some("Incoming connections and frames addressed to your callsign"));
+    let directed_sub = gtk::Label::new(Some("Incoming connections and frames addressed to your call sign"));
     directed_sub.add_css_class("dim-label");
     directed_sub.add_css_class("caption");
     directed_sub.set_halign(gtk::Align::Start);
@@ -377,7 +377,7 @@ fn show_rules_dialog(ui: &Rc<Ui>, parent: &adw::Window) {
     win.set_default_height(440);
 
     let desc = gtk::Label::new(Some(
-        "Watch for frames with a matching destination (regex) and optional sender callsign. \
+        "Watch for frames with a matching destination (regex) and optional sender call sign. \
          Leave Sender blank (shown as @ALL) to match any sender. \
          Address-book entries at the top are managed from the Address Book.",
     ));

@@ -5,7 +5,11 @@ use gtk::glib::object::IsA;
 
 use pr_core::{MailboxMessage, QsoLogEntry};
 
-use crate::ports_dialog::{collapse_listen_ports, dialog_window, dialog_window_with_header, force_uppercase, port_listen_checklist};
+use crate::ports_dialog::{
+    base_call, collapse_listen_ports, dialog_window, dialog_window_with_header,
+    get_ssid_from_dropdown, make_ssid_dropdown, port_listen_checklist, split_call_ssid,
+    ssid_hint_button,
+};
 use crate::window::Ui;
 
 /// The mailbox's message list (read or not), with a Delete button per row.
@@ -113,13 +117,34 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
 
     let current = ui.state.config.borrow().mailbox.clone();
 
+    // Derive the mailbox call sign: base always comes from the Profile call sign;
+    // only the SSID is editable here so that all call signs share the same base.
+    let profile_base = base_call(ui.state.config.borrow().ui.default_call.as_deref().unwrap_or(""));
+    let current_ssid = split_call_ssid(&current.respond_call).1;
+
     let settings_group = adw::PreferencesGroup::builder()
-        .description("Required to enable the mailbox; never falls back to your Profile callsign.")
+        .description(
+            "Required to enable the mailbox. The base call sign comes from your Profile; \
+             choose an SSID to distinguish this station.",
+        )
         .build();
 
-    let respond_call_row = adw::EntryRow::builder().title("Mailbox Callsign").build();
-    respond_call_row.set_text(&current.respond_call);
-    force_uppercase(&respond_call_row);
+    let respond_call_row = adw::ActionRow::builder()
+        .title("Mailbox Call Sign")
+        .subtitle(if profile_base.is_empty() { "Set your Profile call sign first" } else { "" })
+        .build();
+    let call_label = gtk::Label::new(Some(&format!("{profile_base}-")));
+    call_label.set_valign(gtk::Align::Center);
+    call_label.add_css_class("monospace");
+    let ssid_dd = make_ssid_dropdown(current_ssid);
+    ssid_dd.set_valign(gtk::Align::Center);
+    let hint_btn = ssid_hint_button(win.clone());
+    let call_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    call_box.set_valign(gtk::Align::Center);
+    call_box.append(&call_label);
+    call_box.append(&ssid_dd);
+    call_box.append(&hint_btn);
+    respond_call_row.add_suffix(&call_box);
     settings_group.add(&respond_call_row);
 
     let intro_hint = if current.intro_message.trim().is_empty() {
@@ -153,7 +178,7 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
         .title("Availability Beacon")
         .description(
             "Sent periodically on every listen port that supports unproto, while enabled. \
-             $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Mailbox Callsign.",
+             $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Mailbox Call Sign.",
         )
         .build();
     let beacon_text_row = adw::EntryRow::builder().title("Beacon Text").build();
@@ -169,7 +194,8 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
         .description("Ports to auto-answer unsolicited connections (as the mailbox) on")
         .build();
     let ports = ui.state.config.borrow().ports.clone();
-    let (listen_widget, listen_switches) = port_listen_checklist(&ports, &current.listen_ports);
+    let (listen_widget, all_ports_switch, listen_switches) =
+        port_listen_checklist(&ports, &current.listen_ports);
     listen_group.add(&listen_widget);
     root.append(&listen_group);
 
@@ -191,9 +217,18 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
         let ui = ui.clone();
         let win = win.clone();
         save_button.connect_clicked(move |_| {
-            let respond_call = respond_call_row.text().trim().to_uppercase();
+            let pb = base_call(ui.state.config.borrow().ui.default_call.as_deref().unwrap_or(""));
+            if pb.is_empty() && ui.state.config.borrow().mailbox.enabled {
+                error_label.set_text("Set your Profile call sign before enabling the mailbox.");
+                return;
+            }
+            let respond_call = if pb.is_empty() {
+                String::new()
+            } else {
+                format!("{}-{}", pb, get_ssid_from_dropdown(&ssid_dd))
+            };
             if respond_call.is_empty() && ui.state.config.borrow().mailbox.enabled {
-                error_label.set_text("A Mailbox Callsign is required while the mailbox is enabled.");
+                error_label.set_text("A Mailbox Call Sign is required while the mailbox is enabled.");
                 return;
             }
             let beacon_interval_secs = match beacon_interval_row.text().trim().parse::<u32>() {
@@ -209,7 +244,7 @@ pub(crate) fn show_settings(ui: &Rc<Ui>, parent: &impl IsA<gtk::Window>) {
                 cfg.mailbox.intro_message = intro_message.borrow().clone();
                 cfg.mailbox.beacon_text = beacon_text_row.text().to_string();
                 cfg.mailbox.beacon_interval_secs = beacon_interval_secs;
-                cfg.mailbox.listen_ports = collapse_listen_ports(&listen_switches);
+                cfg.mailbox.listen_ports = collapse_listen_ports(&all_ports_switch, &listen_switches);
             }
             ui.state.save_config();
             ui.reschedule_mailbox_beacon();
@@ -234,7 +269,7 @@ fn edit_intro_message(parent: &adw::Window, intro_row: &adw::ActionRow, intro_me
 
     let label = gtk::Label::new(Some(
         "Sent when a station connects to the mailbox. Leave blank to use the default greeting. \
-         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is the Mailbox Callsign.",
+         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is the Mailbox Call Sign.",
     ));
     label.set_halign(gtk::Align::Start);
     label.set_wrap(true);

@@ -3,7 +3,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::ports_dialog::{collapse_listen_ports, dialog_window, force_uppercase, port_listen_checklist};
+use crate::ports_dialog::{
+    base_call, collapse_listen_ports, dialog_window, get_ssid_from_dropdown, make_ssid_dropdown,
+    port_listen_checklist, split_call_ssid, ssid_hint_button,
+};
 use crate::window::Ui;
 
 /// Keyboard-to-keyboard mode settings: welcome message, availability beacon,
@@ -16,19 +19,35 @@ pub fn show_settings(ui: &Rc<Ui>) {
     let current = ui.state.config.borrow().keyboard_mode.clone();
     let ports = ui.state.config.borrow().ports.clone();
 
+    // Derive the node call sign: base from Profile, SSID editable here.
+    let profile_base = base_call(ui.state.config.borrow().ui.default_call.as_deref().unwrap_or(""));
+    let current_ssid = split_call_ssid(&current.node_call).1;
+
     let settings_group = adw::PreferencesGroup::builder()
         .description(
-            "The callsign this mode answers as \u{2014} independent of your Profile callsign and the mailbox's own \
-             Respond From Callsign, so the two auto-responders can't intercept each other's connects. Leave blank to \
-             fall back to your Profile callsign. Note: the beacon and any connected-mode replies always go out under \
-             whichever port sends them (each port has its own fixed callsign) \u{2014} for them to actually appear as \
-             this callsign on the air, point \u{201c}Listen On\u{201d} below at a port configured with this same call.",
+            "The call sign this mode answers as \u{2014} base comes from your Profile, choose an SSID to \
+             distinguish it from your other stations. Note: the beacon and connected-mode replies go out \
+             under whichever port sends them; for them to appear as this call sign on the air, point \
+             \u{201c}Listen On\u{201d} below at a port configured with this same call.",
         )
         .build();
 
-    let node_call_row = adw::EntryRow::builder().title("Node Callsign").build();
-    node_call_row.set_text(&current.node_call);
-    force_uppercase(&node_call_row);
+    let node_call_row = adw::ActionRow::builder()
+        .title("Node Call Sign")
+        .subtitle(if profile_base.is_empty() { "Set your Profile call sign first" } else { "" })
+        .build();
+    let call_label = gtk::Label::new(Some(&format!("{profile_base}-")));
+    call_label.set_valign(gtk::Align::Center);
+    call_label.add_css_class("monospace");
+    let ssid_dd = make_ssid_dropdown(current_ssid);
+    ssid_dd.set_valign(gtk::Align::Center);
+    let hint_btn = ssid_hint_button(win.clone());
+    let call_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    call_box.set_valign(gtk::Align::Center);
+    call_box.append(&call_label);
+    call_box.append(&ssid_dd);
+    call_box.append(&hint_btn);
+    node_call_row.add_suffix(&call_box);
     settings_group.add(&node_call_row);
 
     let welcome_hint = if current.welcome_message.trim().is_empty() {
@@ -54,7 +73,7 @@ pub fn show_settings(ui: &Rc<Ui>) {
 
     let beacon_text_row = adw::EntryRow::builder()
         .title("Availability Beacon Text")
-        .tooltip_text("$$NODE/$$NAME/$$LOC/$$BBSHOME available; $$NODE is this Node Callsign")
+        .tooltip_text("$$NODE/$$NAME/$$LOC/$$BBSHOME available; $$NODE is this Node Call Sign")
         .build();
     beacon_text_row.set_text(&current.beacon_text);
     settings_group.add(&beacon_text_row);
@@ -69,7 +88,8 @@ pub fn show_settings(ui: &Rc<Ui>) {
         .title("Listen On")
         .description("Ports to answer keyboard-to-keyboard connects (and send the availability beacon) on")
         .build();
-    let (listen_widget, listen_switches) = port_listen_checklist(&ports, &current.listen_ports);
+    let (listen_widget, all_ports_switch, listen_switches) =
+        port_listen_checklist(&ports, &current.listen_ports);
     listen_group.add(&listen_widget);
     root.append(&listen_group);
 
@@ -99,12 +119,19 @@ pub fn show_settings(ui: &Rc<Ui>) {
                 }
             };
             {
+                let pb = base_call(ui.state.config.borrow().ui.default_call.as_deref().unwrap_or(""));
+                let node_call = if pb.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}-{}", pb, get_ssid_from_dropdown(&ssid_dd))
+                };
                 let mut cfg = ui.state.config.borrow_mut();
-                cfg.keyboard_mode.node_call = node_call_row.text().trim().to_uppercase();
+                cfg.keyboard_mode.node_call = node_call;
                 cfg.keyboard_mode.welcome_message = welcome_message.borrow().clone();
                 cfg.keyboard_mode.beacon_text = beacon_text_row.text().to_string();
                 cfg.keyboard_mode.beacon_interval_secs = beacon_interval_secs;
-                cfg.keyboard_mode.listen_ports = collapse_listen_ports(&listen_switches);
+                cfg.keyboard_mode.listen_ports =
+                    collapse_listen_ports(&all_ports_switch, &listen_switches);
             }
             ui.state.save_config();
             ui.reschedule_keyboard_mode_beacon();
@@ -128,7 +155,7 @@ fn edit_welcome_message(parent: &adw::Window, welcome_row: &adw::ActionRow, welc
 
     let label = gtk::Label::new(Some(
         "Sent when a station connects for keyboard-to-keyboard. Leave blank to use the default greeting. \
-         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Node Callsign.",
+         $$NODE/$$NAME/$$LOC/$$BBSHOME are available; $$NODE is this Node Call Sign.",
     ));
     label.set_halign(gtk::Align::Start);
     label.set_wrap(true);
