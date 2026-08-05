@@ -779,10 +779,10 @@ impl Ui {
     /// unproto frame using the bottom bar's own Node/Via/Port fields.
     fn activate_message_entry(self: &Rc<Self>) {
         let text = self.message_entry.text().to_string();
-        if text.is_empty() {
-            return;
-        }
         if let Some(tab_id) = self.selected_tab.get() {
+            if text.is_empty() {
+                return;
+            }
             let tabs = self.tabs.borrow();
             let Some(tab) = tabs.get(&tab_id) else { return };
             if tab.conn_id.get().is_none() {
@@ -793,10 +793,11 @@ impl Ui {
             self.send_tab_connected(tab, &text);
             drop(tabs);
         } else {
+            // Unproto: blank frames are valid (common beacon/ping practice).
             self.send_bottom_unproto(&text);
         }
-        // Save to history, suppressing adjacent duplicates.
-        {
+        // Save to history, suppressing adjacent duplicates and blank entries.
+        if !text.is_empty() {
             let mut history = self.send_history.borrow_mut();
             if history.last().map(|s| s.as_str()) != Some(text.as_str()) {
                 history.push(text);
