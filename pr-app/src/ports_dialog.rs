@@ -845,6 +845,10 @@ pub(crate) fn ssid_hint_button(parent_win: adw::Window) -> gtk::Button {
 
 fn show_ssid_hint(parent: &adw::Window) {
     let (win, root) = dialog_window(parent, "SSID Reference", 460);
+    win.set_default_height(480);
+
+    // Scrollable content area.
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
     let intro = gtk::Label::new(Some(
         "SSIDs 1–15 distinguish multiple stations sharing the same base call sign. \
@@ -854,7 +858,7 @@ fn show_ssid_hint(parent: &adw::Window) {
     intro.set_halign(gtk::Align::Start);
     intro.add_css_class("caption");
     intro.add_css_class("dim-label");
-    root.append(&intro);
+    content.append(&intro);
 
     let pr_group = adw::PreferencesGroup::builder().title("Packet Radio (common)").build();
     for (ssid, desc) in [
@@ -875,7 +879,7 @@ fn show_ssid_hint(parent: &adw::Window) {
         let row = adw::ActionRow::builder().title(&format!("-{ssid}")).subtitle(desc).build();
         pr_group.add(&row);
     }
-    root.append(&pr_group);
+    content.append(&pr_group);
 
     let aprs_group = adw::PreferencesGroup::builder().title("APRS (from the spec)").build();
     for (ssid, desc) in [
@@ -898,7 +902,14 @@ fn show_ssid_hint(parent: &adw::Window) {
         let row = adw::ActionRow::builder().title(&format!("-{ssid}")).subtitle(desc).build();
         aprs_group.add(&row);
     }
-    root.append(&aprs_group);
+    content.append(&aprs_group);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&content)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    root.append(&scrolled);
 
     let close_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     close_row.set_halign(gtk::Align::End);
