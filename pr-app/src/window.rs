@@ -1851,18 +1851,22 @@ fn refresh_beacons_button(button: &gtk::Button, enabled: bool) {
 }
 
 /// The line ending to append when sending a line of text over a connected
-/// session. Telnet gets a proper CRLF -- BPQ nodes and similar raw-socket
-/// telnet BBS/node servers are commonly strict RFC854 NVT parsers that
-/// never recognize a bare LF as a completed line (this was the actual cause
-/// of "my username isn't accepted" against a BPQ node: the line was sent,
-/// just never recognized as finished). Every other backend (SSH's own PTY,
-/// AGWPE, AX.25) keeps the existing bare-LF behavior, already live-verified
-/// working -- there's no reason to risk regressing it for a Telnet-specific
-/// bug.
+/// session.
+///
+/// - Telnet: `\r\n` — RFC 854 NVT requires CRLF; strict servers (BPQ etc.)
+///   never recognize a bare LF as a completed line.
+/// - SSH: `\n` — the remote PTY translates newlines; sending CR would double
+///   it.
+/// - AX.25/AGWPE/KISS: `\r` — BBS and node software (BPQ, TNOS, JNOS …)
+///   universally uses CR as the command terminator. Sending only LF leaves
+///   the command buffered at the application layer indefinitely; the AX.25
+///   layer still acks the I-frame with RR, giving the false impression that
+///   the command was received but ignored.
 fn line_ending(config: &PortConfig) -> &'static [u8] {
     match config {
         PortConfig::Telnet { .. } => b"\r\n",
-        _ => b"\n",
+        PortConfig::Ssh { .. } => b"\n",
+        _ => b"\r",
     }
 }
 
@@ -2537,13 +2541,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_ending_is_crlf_for_telnet_only() {
+    fn line_endings_by_backend() {
         assert_eq!(line_ending(&PortConfig::Telnet { host: "bpq.example".to_string(), port: 8010 }), b"\r\n");
         assert_eq!(
             line_ending(&PortConfig::Ssh { host: "h".to_string(), port: 22, user: "u".to_string() }),
             b"\n"
         );
-        assert_eq!(line_ending(&PortConfig::Ax25RawSocket { device: "ax0".to_string() }), b"\n");
+        // AX.25/AGWPE/KISS: BBS/node software expects \r as the command terminator.
+        assert_eq!(line_ending(&PortConfig::Ax25RawSocket { device: "ax0".to_string() }), b"\r");
         assert_eq!(
             line_ending(&PortConfig::Agwpe {
                 host: "127.0.0.1".to_string(),
@@ -2552,7 +2557,17 @@ mod tests {
                 my_call: "N0CALL".to_string(),
                 login: None,
             }),
-            b"\n"
+            b"\r"
+        );
+        assert_eq!(
+            line_ending(&PortConfig::KissTcp {
+                host: "127.0.0.1".to_string(),
+                port: 8001,
+                my_call: "N0CALL".to_string(),
+                kiss_params: pr_core::KissParams::default(),
+                kiss_arq: pr_core::KissArqParams::default(),
+            }),
+            b"\r"
         );
     }
 }
