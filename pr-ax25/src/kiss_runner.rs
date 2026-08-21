@@ -44,6 +44,10 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 pub enum KissTransport {
     Tcp { host: String, port: u16 },
     Serial { device: String, baud: u32 },
+    /// `address` is the BLE device address as BlueZ knows it (e.g.
+    /// `AA:BB:CC:DD:EE:FF` on Linux), entered by the user after pairing the
+    /// device via the OS's own Bluetooth settings -- see `run_ble`.
+    Ble { address: String },
 }
 
 pub struct KissRunner {
@@ -59,6 +63,7 @@ impl PortRunner for KissRunner {
         match transport {
             KissTransport::Tcp { host, port } => run_tcp(&host, port, &my_call, &params, &arq, cmd_rx, event_tx),
             KissTransport::Serial { device, baud } => run_serial(&device, baud, &my_call, &params, &arq, cmd_rx, event_tx),
+            KissTransport::Ble { address } => run_ble(&address, &my_call, &params, &arq, cmd_rx, event_tx),
         }
     }
 }
@@ -200,6 +205,217 @@ fn run_serial(
     let _ = reader_handle.join();
 }
 
+/// Nordic UART Service UUIDs -- see `docs/kiss_protocol.md` in the
+/// lora-kiss-tnc repo. Standard NUS UUIDs, not vendor-specific.
+const BLE_NUS_SERVICE_UUID: &str = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+const BLE_NUS_RX_CHAR_UUID: &str = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+const BLE_NUS_TX_CHAR_UUID: &str = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+/// Matches the firmware's own `BleNusTransport::sendFrame` chunk size
+/// (`ble_nimble_impl.cpp`). No explicit MTU negotiation is needed on
+/// Linux -- BlueZ's D-Bus `WriteValue`/notify transparently fragments and
+/// reassembles payloads regardless of the negotiated ATT MTU, and this
+/// exact chunk size is already verified end-to-end against real hardware
+/// by the sibling repo's `tools/ble_kiss_client.py`.
+const BLE_CHUNK_SIZE: usize = 180;
+
+/// `Read` half of the BLE transport: drains bytes forwarded from the TX
+/// (notify) characteristic by `notify_forward_task`. A closed channel
+/// (sender dropped, e.g. the whole tokio runtime torn down on disconnect)
+/// reads as `Ok(0)` -- end of stream -- matching TCP/serial's `Ok(0)`
+/// convention so `kiss_read_loop` needs no BLE-specific handling.
+struct BleReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    leftover: std::collections::VecDeque<u8>,
+}
+
+impl Read for BleReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.leftover.is_empty() {
+            match self.rx.recv_timeout(READ_TIMEOUT) {
+                Ok(chunk) => self.leftover.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no BLE notification"));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        let n = self.leftover.len().min(buf.len());
+        for (i, b) in self.leftover.drain(..n).enumerate() {
+            buf[i] = b;
+        }
+        Ok(n)
+    }
+}
+
+/// `Write` half of the BLE transport: hands whole KISS-encoded frames off
+/// to `write_drain_task`, which does the actual chunked GATT write on the
+/// tokio runtime. Message-queue semantics rather than a byte stream --
+/// `write()` always accepts the full buffer at once (`command_loop` never
+/// calls it with anything but one already-encoded frame per call) -- so no
+/// partial-write bookkeeping is needed.
+struct BleWriter {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Write for BleWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx
+            .send(buf.to_vec())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "BLE write channel closed"))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Connects to `address` (must already be paired/bonded via the OS's own
+/// Bluetooth settings -- see `docs/kiss_protocol.md`'s "BLE pairing"
+/// section in the lora-kiss-tnc repo), discovers the NUS service, and
+/// spawns the background tasks that bridge btleplug's async API into the
+/// synchronous `BleReader`/`BleWriter` above. Returns the connected
+/// peripheral (kept alive so `run_ble` can call `disconnect()` on
+/// teardown) once everything is wired up.
+async fn ble_connect(
+    address: &str,
+    notify_tx: mpsc::Sender<Vec<u8>>,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<InternalEvent>,
+) -> Result<btleplug::platform::Peripheral, String> {
+    use btleplug::api::{BDAddr, Central, Characteristic, Manager as _, Peripheral as _, WriteType};
+    use futures::StreamExt;
+
+    let target = BDAddr::from_str_delim(address).or_else(|_| BDAddr::from_str_no_delim(address)).map_err(|e| format!("invalid BLE address '{address}': {e}"))?;
+
+    let manager = btleplug::platform::Manager::new().await.map_err(|e| format!("BLE manager init failed: {e}"))?;
+    let adapters = manager.adapters().await.map_err(|e| format!("list Bluetooth adapters: {e}"))?;
+    let central = adapters.into_iter().next().ok_or_else(|| "no Bluetooth adapter found".to_string())?;
+
+    let peripherals = central.peripherals().await.map_err(|e| format!("list BLE devices: {e}"))?;
+    let peripheral = peripherals
+        .into_iter()
+        .find(|p| p.address() == target)
+        .ok_or_else(|| format!("BLE device {address} not known to the system -- pair it via your OS Bluetooth settings first"))?;
+
+    peripheral.connect().await.map_err(|e| format!("BLE connect {address}: {e}"))?;
+    peripheral.discover_services().await.map_err(|e| format!("BLE discover services: {e}"))?;
+
+    let service_uuid = uuid::Uuid::parse_str(BLE_NUS_SERVICE_UUID).expect("valid UUID constant");
+    let characteristics = peripheral.characteristics();
+    let find_char = |uuid_str: &str| -> Option<Characteristic> {
+        let uuid = uuid::Uuid::parse_str(uuid_str).ok()?;
+        characteristics.iter().find(|c| c.uuid == uuid && c.service_uuid == service_uuid).cloned()
+    };
+    let rx_char = find_char(BLE_NUS_RX_CHAR_UUID).ok_or_else(|| "NUS RX characteristic not found -- is this a lora-kiss-tnc device?".to_string())?;
+    let tx_char = find_char(BLE_NUS_TX_CHAR_UUID).ok_or_else(|| "NUS TX characteristic not found -- is this a lora-kiss-tnc device?".to_string())?;
+
+    peripheral.subscribe(&tx_char).await.map_err(|e| format!("BLE subscribe: {e}"))?;
+
+    // Forward TX notifications into `BleReader`'s channel.
+    let mut notifications = peripheral.notifications().await.map_err(|e| format!("BLE notifications stream: {e}"))?;
+    let tx_uuid = tx_char.uuid;
+    tokio::spawn(async move {
+        while let Some(notification) = notifications.next().await {
+            if notification.uuid == tx_uuid && notify_tx.send(notification.value).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Drain queued writes from `BleWriter`, chunked to match the
+    // firmware's own convention (see `BLE_CHUNK_SIZE`).
+    let write_peripheral = peripheral.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = write_rx.recv().await {
+            for chunk in bytes.chunks(BLE_CHUNK_SIZE) {
+                if write_peripheral.write(&rx_char, chunk, WriteType::WithoutResponse).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    // Watch for a peripheral-initiated disconnect (TNC reboot, out of
+    // range, etc.) -- a dropped link isn't otherwise caught promptly since
+    // `BleWriter::write` only fails once the write-drain task above
+    // notices, which won't happen at all if nothing is being sent.
+    let my_id = peripheral.id();
+    let mut events = central.events().await.map_err(|e| format!("BLE central events stream: {e}"))?;
+    tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if matches!(event, btleplug::api::CentralEvent::DeviceDisconnected(id) if id == my_id) {
+                let _ = disconnect_tx.send(InternalEvent::Disconnected);
+                break;
+            }
+        }
+    });
+
+    Ok(peripheral)
+}
+
+fn run_ble(address: &str, my_call: &str, params: &KissParams, arq: &KissArqParams, cmd_rx: mpsc::Receiver<PortCommand>, event_tx: async_channel::Sender<PortEvent>) {
+    use btleplug::api::Peripheral as _;
+
+    let local = match parse_address(my_call) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            return;
+        }
+    };
+    let arq_cfg = arq_config_from(arq);
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: format!("start BLE runtime: {e}") });
+            return;
+        }
+    };
+
+    let (notify_tx, notify_rx) = mpsc::channel::<Vec<u8>>();
+    let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>();
+    let disconnect_tx = internal_tx.clone();
+
+    let peripheral = match rt.block_on(ble_connect(address, notify_tx, write_rx, disconnect_tx)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = event_tx.send_blocking(PortEvent::PortError { message: e });
+            rt.shutdown_timeout(Duration::from_secs(2));
+            return;
+        }
+    };
+    let _ = event_tx.send_blocking(PortEvent::PortConnected);
+
+    let mut writer = BleWriter { tx: write_tx };
+    if let Err(e) = send_kiss_params(&mut writer, params) {
+        let _ = event_tx.send_blocking(PortEvent::PortError { message: format!("send TNC params: {e}") });
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = stop.clone();
+    let reader_events = event_tx.clone();
+    let reader_local = local.clone();
+    let reader_handle = thread::spawn(move || {
+        let reader = BleReader { rx: notify_rx, leftover: std::collections::VecDeque::new() };
+        kiss_read_loop(reader, &reader_events, &reader_stop, &internal_tx, &reader_local);
+    });
+
+    command_loop(&mut writer, &local, &arq_cfg, &cmd_rx, &internal_rx, &event_tx);
+
+    stop.store(true, Ordering::Relaxed);
+    rt.block_on(async {
+        let _ = peripheral.disconnect().await;
+    });
+    // Drops the notify-forward/write-drain/disconnect-watcher tasks along
+    // with the runtime, closing `BleReader`'s channel -- its next
+    // `recv_timeout` reads that as `Ok(0)` and `kiss_read_loop` exits.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    let _ = event_tx.send_blocking(PortEvent::PortDisconnected { reason: None });
+    let _ = reader_handle.join();
+}
+
 /// One connected-mode session per remote callsign, multiplexed over the
 /// one shared KISS stream -- mirrors AGWPE's `ConnMap` precedent (AX.25
 /// addressing has no numeric connection id of its own either), except a
@@ -249,6 +465,14 @@ enum InternalEvent {
     RawSabme { remote: Address, route: Vec<RouteEntry> },
     /// XID (parameter negotiation) -- same situation as SABME.
     RawXid { remote: Address, route: Vec<RouteEntry>, payload: Vec<u8> },
+    /// The transport itself dropped (currently BLE-only: the peripheral
+    /// disconnected). Unlike TCP/serial, a dead BLE link isn't reliably
+    /// caught by the next `write_all` failing (the write hands off to an
+    /// async task -- see `BleWriter`), so the disconnect watcher reports it
+    /// explicitly through the same internal-event path used for decoded
+    /// frames, tearing `command_loop` down the same way a write failure
+    /// would.
+    Disconnected,
 }
 
 /// Shared by both transports: owns the ARQ state for every live connection
@@ -339,6 +563,7 @@ fn handle_internal_event(
     event_tx: &async_channel::Sender<PortEvent>,
 ) -> bool {
     match ev {
+        InternalEvent::Disconnected => false,
         InternalEvent::RawSabme { remote, route } => {
             let dm = wire::build_dm(local, &remote, wire::reverse_route(&route), true);
             let ok = write_frame(writer, &dm);

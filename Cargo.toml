@@ -20,6 +20,10 @@ libc = "0.2"
 ax25 = "0.4"
 portable-pty = "0.8"
 regex = "1"
+btleplug = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+uuid = "1"
+futures = "0.3"
 
 pr-core = { path = "pr-core" }
 pr-ax25 = { path = "pr-ax25" }
