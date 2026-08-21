@@ -180,25 +180,43 @@ type, wiring it up as a KISS TNC over BLE.
      64/64 passing (existing tests untouched, no BLE-specific tests added
      yet — hardware verification is Phase 4)
 
-### Phase 3 - Config & UI wiring (pr-core, pr-app) - status: open
+### Phase 3 - Config & UI wiring (pr-core, pr-app) - status: done
 
-1. [ ] Add `PortConfig::Ble { address: String, name: Option<String>, my_call:
+1. [x] Add `PortConfig::Ble { address: String, name: Option<String>, my_call:
    String, kiss_params: KissParams, kiss_arq: KissArqParams }` to
    [pr-core/src/config.rs](pr-core/src/config.rs); `kind_label()` →
    `"KISS (BLE)"`
    - `name` is a display-only label (device name at pairing time), not used
      for connecting — `address` is authoritative
-2. [ ] Wire `KissRunner`'s `PortConfig` → `KissTransport` dispatch (wherever
+   - => named `PortConfig::KissBle` (not bare `Ble`) to match the existing
+     `KissTcp`/`KissSerial` naming convention
+2. [x] Wire `KissRunner`'s `PortConfig` → `KissTransport` dispatch (wherever
    that mapping lives — check `pr-app` where `PortRunner`s are constructed
    from `PortConfig`) to build `KissTransport::Ble`
-3. [ ] Add a `KIND_NAMES` entry and per-kind field block in
+   - => lives in `pr-app/src/app_state.rs`'s `spawn_for_config()`
+3. [x] Add a `KIND_NAMES` entry and per-kind field block in
    [pr-app/src/ports_dialog.rs](pr-app/src/ports_dialog.rs): address field
    (manual entry — paste the BlueZ device address after pairing in OS
    settings), reuse existing my_call/kiss_params/kiss_arq rows
-4. [ ] Update the other exhaustive `PortConfig::` matches found this
+   - => added a dim-label hint above the address field pointing at OS
+     Bluetooth settings, since this is the one field with no sensible
+     default/placeholder that actually works
+4. [x] Update the other exhaustive `PortConfig::` matches found this
    session (`window.rs`, `app_state.rs`, `session_tab.rs`, `dial_dialog.rs`)
    — compiler will catch these as non-exhaustive-match errors, use that as
    the checklist
+   - => `window.rs`'s `line_ending()` and `dial_dialog.rs`'s Telnet/SSH
+     check both already used wildcard/negative matches, correct for BLE
+     as-is (added a BLE case to `line_ending`'s test anyway for coverage)
+   - => `session_tab.rs`'s `port_supports_connect`/`port_supports_unproto`
+     are **allowlists**, not exhaustive matches — compiler didn't catch
+     these, had to be found by inspection. Missing `KissBle` here would
+     have silently left BLE ports unable to open connected-mode sessions
+     or send unproto traffic despite being otherwise fully wired up. Added
+     `KissBle` to both, plus a `KissBle` case in the table-driven tests
+     covering them (`all_variants()`) — the existing tests didn't exercise
+     the new variant at all until this
+   - => `cargo test --workspace`: 113/113 passing
 
 ### Phase 4 - Hardware verification - status: open
 
@@ -244,6 +262,14 @@ automatically after Phase 4._
   answers folded into Phase 1 (now `status: done`) and Phase 2 actions 3-4.
   Review's other open items (unbonded-connect error handling, Context
   links) not addressed — user asked specifically for MTU/scan.
+- 2608211934 — Noticed mid-Phase-3 that lora-kiss-tnc's
+  `ble_nimble_impl.cpp` changed on disk since Phase 1's reading (a
+  30-second pairing timeout that force-drops a connected-but-never-paired
+  device, plus `setLinkEncrypted()` gating `sendFrame()` on the link
+  actually being encrypted, not just connected). No action needed on this
+  side — doesn't change the GATT UUIDs, write type, or chunking this plan
+  relies on — but worth knowing about before Phase 4: if a device connects
+  and gets dropped ~30s later, that's this timeout, not a packet-radio bug.
 
 ## Progress Log
 
@@ -264,3 +290,12 @@ automatically after Phase 4._
   async setup, `run_ble()`, and `InternalEvent::Disconnected` added to
   [pr-ax25/src/kiss_runner.rs](pr-ax25/src/kiss_runner.rs). `cargo check
   --workspace` clean, `cargo test -p pr-ax25` 64/64 passing.
+- 2608211934 — Phase 3 implemented: `PortConfig::KissBle` in
+  [pr-core/src/config.rs](pr-core/src/config.rs), dispatch in
+  [pr-app/src/app_state.rs](pr-app/src/app_state.rs), "KISS (BLE)" tab in
+  [pr-app/src/ports_dialog.rs](pr-app/src/ports_dialog.rs), allowlists in
+  [pr-app/src/session_tab.rs](pr-app/src/session_tab.rs) (compiler-silent —
+  found by inspection, not a build error). `cargo test --workspace`
+  113/113 passing. Noticed lora-kiss-tnc firmware source changed since
+  Phase 1 (pairing timeout, link-encryption gate) — no plan impact, logged
+  for Phase 4 awareness.
