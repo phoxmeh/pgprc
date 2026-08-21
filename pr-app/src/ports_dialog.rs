@@ -225,8 +225,8 @@ fn build_port_row(ui: &Rc<Ui>, entry: PortEntry, idx: usize, count: usize, list_
     row.upcast()
 }
 
-const KIND_NAMES: [&str; 6] =
-    ["Telnet", "SSH", "AGWPE", "AX.25 raw socket", "KISS (TCP)", "KISS (Serial)"];
+const KIND_NAMES: [&str; 7] =
+    ["Telnet", "SSH", "AGWPE", "AX.25 raw socket", "KISS (TCP)", "KISS (Serial)", "KISS (BLE)"];
 
 fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntry>, list_box: &gtk::ListBox) {
     let (win, root) = dialog_window(parent, if existing.is_some() { "Edit Port" } else { "Add Port" }, 420);
@@ -335,11 +335,43 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     ks_box.append(&labeled("Max I-Frame Size (N1, bytes)", &ks_paclen));
     stack.add_named(&ks_box, Some("KISS (Serial)"));
 
+    // KISS (BLE)
+    let kb_address = gtk::Entry::builder().placeholder_text("AA:BB:CC:DD:EE:FF").build();
+    let kb_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
+    let kb_tx_delay = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kb_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kb_slot_time = gtk::Entry::builder().placeholder_text("TNC default").build();
+    let kb_full_duplex = gtk::CheckButton::with_label("Force full duplex");
+    let kb_window = gtk::Entry::builder().placeholder_text("app default (4)").build();
+    let kb_t1_ms = gtk::Entry::builder().placeholder_text("app default (4000)").build();
+    let kb_n2 = gtk::Entry::builder().placeholder_text("app default (10)").build();
+    let kb_paclen = gtk::Entry::builder().placeholder_text("app default (256)").build();
+    let kb_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let kb_hint = gtk::Label::new(Some(
+        "Pair the device via your OS Bluetooth settings first, then paste its address here.",
+    ));
+    kb_hint.set_wrap(true);
+    kb_hint.set_xalign(0.0);
+    kb_hint.add_css_class("dim-label");
+    kb_box.append(&kb_hint);
+    kb_box.append(&labeled("Device Address", &kb_address));
+    kb_box.append(&labeled("My Call Sign", &kb_my_call));
+    kb_box.append(&labeled("TXDELAY (x10ms)", &kb_tx_delay));
+    kb_box.append(&labeled("Persistence", &kb_persistence));
+    kb_box.append(&labeled("Slot Time (x10ms)", &kb_slot_time));
+    kb_box.append(&kb_full_duplex);
+    kb_box.append(&labeled("Window Size (k)", &kb_window));
+    kb_box.append(&labeled("Ack Timer T1 (ms)", &kb_t1_ms));
+    kb_box.append(&labeled("Max Retries (N2)", &kb_n2));
+    kb_box.append(&labeled("Max I-Frame Size (N1, bytes)", &kb_paclen));
+    stack.add_named(&kb_box, Some("KISS (BLE)"));
+
     if existing.is_none() {
         if let Some(default_call) = &ui.state.config.borrow().ui.default_call {
             agw_my_call.set_text(default_call);
             kt_my_call.set_text(default_call);
             ks_my_call.set_text(default_call);
+            kb_my_call.set_text(default_call);
         }
     }
 
@@ -397,6 +429,12 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                 ks_my_call.set_text(my_call);
                 load_kiss_params(kiss_params, &ks_tx_delay, &ks_persistence, &ks_slot_time, &ks_full_duplex);
                 load_kiss_arq_params(kiss_arq, &ks_window, &ks_t1_ms, &ks_n2, &ks_paclen);
+            }
+            PortConfig::KissBle { address, name: _, my_call, kiss_params, kiss_arq } => {
+                kb_address.set_text(address);
+                kb_my_call.set_text(my_call);
+                load_kiss_params(kiss_params, &kb_tx_delay, &kb_persistence, &kb_slot_time, &kb_full_duplex);
+                load_kiss_arq_params(kiss_arq, &kb_window, &kb_t1_ms, &kb_n2, &kb_paclen);
             }
         }
     }
@@ -526,7 +564,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                         kiss_arq,
                     }
                 }
-                _ => {
+                "KISS (Serial)" => {
                     let baud = match ks_baud.text().parse::<u32>() {
                         Ok(b) => b,
                         Err(_) => {
@@ -552,6 +590,34 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                         device: ks_device.text().to_string(),
                         baud,
                         my_call: ks_my_call.text().to_string(),
+                        kiss_params,
+                        kiss_arq,
+                    }
+                }
+                _ => {
+                    let address = kb_address.text().trim().to_string();
+                    if address.is_empty() {
+                        error_label.set_text("BLE device address is required -- pair the device via OS Bluetooth settings, then paste its address here.");
+                        return;
+                    }
+                    let kiss_params = match parse_kiss_params(&kb_tx_delay, &kb_persistence, &kb_slot_time, &kb_full_duplex) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
+                    let kiss_arq = match parse_kiss_arq_params(&kb_window, &kb_t1_ms, &kb_n2, &kb_paclen) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            error_label.set_text(&msg);
+                            return;
+                        }
+                    };
+                    PortConfig::KissBle {
+                        address,
+                        name: None,
+                        my_call: kb_my_call.text().to_string(),
                         kiss_params,
                         kiss_arq,
                     }

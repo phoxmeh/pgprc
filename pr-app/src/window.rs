@@ -2570,5 +2570,15 @@ mod tests {
             }),
             b"\r"
         );
+        assert_eq!(
+            line_ending(&PortConfig::KissBle {
+                address: "AA:BB:CC:DD:EE:FF".to_string(),
+                name: None,
+                my_call: "N0CALL".to_string(),
+                kiss_params: pr_core::KissParams::default(),
+                kiss_arq: pr_core::KissArqParams::default(),
+            }),
+            b"\r"
+        );
     }
 }

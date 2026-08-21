@@ -65,6 +65,22 @@ pub enum PortConfig {
         #[serde(default)]
         kiss_arq: KissArqParams,
     },
+    /// KISS TNC reachable over Bluetooth LE (Nordic UART Service GATT),
+    /// e.g. the lora-kiss-tnc firmware. `address` must already be
+    /// paired/bonded via the OS's own Bluetooth settings before use — this
+    /// app never initiates BLE pairing itself.
+    KissBle {
+        address: String,
+        /// Display-only label (device name at pairing time). Not used for
+        /// connecting — `address` is authoritative.
+        #[serde(default)]
+        name: Option<String>,
+        my_call: String,
+        #[serde(default)]
+        kiss_params: KissParams,
+        #[serde(default)]
+        kiss_arq: KissArqParams,
+    },
 }
 
 /// Optional TNC transmit parameters sent as KISS command frames right after
@@ -114,6 +130,7 @@ impl PortConfig {
             PortConfig::Ax25RawSocket { .. } => "AX.25 raw socket",
             PortConfig::KissTcp { .. } => "KISS (TCP)",
             PortConfig::KissSerial { .. } => "KISS (Serial)",
+            PortConfig::KissBle { .. } => "KISS (BLE)",
         }
     }
 }

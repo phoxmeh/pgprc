@@ -375,6 +375,12 @@ pub fn spawn_for_config(config: &PortConfig) -> PortHandle {
             params: kiss_params.clone(),
             arq: kiss_arq.clone(),
         }),
+        PortConfig::KissBle { address, name: _, my_call, kiss_params, kiss_arq } => spawn_port(KissRunner {
+            transport: KissTransport::Ble { address: address.clone() },
+            my_call: my_call.clone(),
+            params: kiss_params.clone(),
+            arq: kiss_arq.clone(),
+        }),
     }
 }
 

@@ -18,7 +18,7 @@ pub type TabId = u64;
 pub fn port_supports_connect(config: &PortConfig) -> bool {
     matches!(
         config,
-        PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. }
+        PortConfig::Agwpe { .. } | PortConfig::Ax25RawSocket { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. } | PortConfig::KissBle { .. }
     )
 }
 
@@ -33,7 +33,7 @@ pub fn port_dialable(config: &PortConfig) -> bool {
 pub fn port_supports_unproto(config: &PortConfig) -> bool {
     matches!(
         config,
-        PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. } | PortConfig::Ax25RawSocket { .. }
+        PortConfig::Agwpe { .. } | PortConfig::KissTcp { .. } | PortConfig::KissSerial { .. } | PortConfig::KissBle { .. } | PortConfig::Ax25RawSocket { .. }
     )
 }
 
@@ -405,13 +405,23 @@ mod tests {
                     kiss_arq: KissArqParams::default(),
                 },
             ),
+            (
+                "KissBle",
+                PortConfig::KissBle {
+                    address: "AA:BB:CC:DD:EE:FF".into(),
+                    name: None,
+                    my_call: "N0CALL".into(),
+                    kiss_params: KissParams::default(),
+                    kiss_arq: KissArqParams::default(),
+                },
+            ),
         ]
     }
 
     #[test]
     fn port_supports_connect_covers_agwpe_raw_socket_and_kiss() {
         for (name, config) in all_variants() {
-            let expected = matches!(name, "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial");
+            let expected = matches!(name, "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial" | "KissBle");
             assert_eq!(port_supports_connect(&config), expected, "{name}");
         }
     }
@@ -419,7 +429,7 @@ mod tests {
     #[test]
     fn port_dialable_adds_telnet_and_ssh_on_top_of_connect_capable() {
         for (name, config) in all_variants() {
-            let expected = matches!(name, "Telnet" | "Ssh" | "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial");
+            let expected = matches!(name, "Telnet" | "Ssh" | "Agwpe" | "Ax25RawSocket" | "KissTcp" | "KissSerial" | "KissBle");
             assert_eq!(port_dialable(&config), expected, "{name}");
         }
     }
@@ -427,7 +437,7 @@ mod tests {
     #[test]
     fn port_supports_unproto_covers_agwpe_kiss_and_raw_socket_not_telnet_ssh() {
         for (name, config) in all_variants() {
-            let expected = matches!(name, "Agwpe" | "KissTcp" | "KissSerial" | "Ax25RawSocket");
+            let expected = matches!(name, "Agwpe" | "KissTcp" | "KissSerial" | "KissBle" | "Ax25RawSocket");
             assert_eq!(port_supports_unproto(&config), expected, "{name}");
         }
     }
