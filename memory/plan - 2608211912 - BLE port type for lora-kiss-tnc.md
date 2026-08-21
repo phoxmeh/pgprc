@@ -218,7 +218,7 @@ type, wiring it up as a KISS TNC over BLE.
      the new variant at all until this
    - => `cargo test --workspace`: 113/113 passing
 
-### Phase 4 - Hardware verification - status: open
+### Phase 4 - Hardware verification - status: done
 
 1. [x] Pair the lora-kiss-tnc device via OS Bluetooth settings (GNOME
    Settings / `bluetoothctl`), confirm bonded
@@ -228,7 +228,7 @@ type, wiring it up as a KISS TNC over BLE.
 2. [x] Add a BLE port in packet-radio pointing at the paired device, connect
    - => connected successfully through the real GUI (`target/debug/pgprc`,
      built from this branch)
-3. [ ] Verify KISS traffic round-trip: send unproto/UI frame from
+3. [x] Verify KISS traffic round-trip: send unproto/UI frame from
    packet-radio, confirm received on the TNC side (or a second radio/SDR
    per lora-kiss-tnc's own verified setup); receive an inbound frame,
    confirm it decodes and shows in Monitor
@@ -237,13 +237,20 @@ type, wiring it up as a KISS TNC over BLE.
      frequency -- confirms connect, KISS encode, the BLE write path
      (`WriteType::WithoutResponse`, 180-byte chunking), and the firmware's
      TX-to-radio path all work end to end over a real link
-   - RX half (inbound LoRa frame -> BLE notify -> Monitor) not yet
-     verified -- needs a second LoRa device/SDR that can transmit on the
-     TNC's frequency; matches lora-kiss-tnc's own README, which lists RX
-     as its one still-unverified path. Staying `[ ]` until this is done or
-     the user decides to accept TX-only verification for now.
-4. [ ] Fix issues found; note any deviations from Phase 1's protocol
+   - => RX half (inbound LoRa frame -> BLE notify -> Monitor) explicitly
+     **not verified this pass, by user decision** (offered the choice,
+     user chose "accept TX-only for now" over testing RX) -- needs a
+     second LoRa device/SDR transmitting on the TNC's frequency. Matches
+     lora-kiss-tnc's own README, which lists RX as its one still-unverified
+     path upstream too. Marking this action done on that basis, not as an
+     oversight.
+4. [x] Fix issues found; note any deviations from Phase 1's protocol
    assumptions
+   - => no BLE-specific issues found; Phase 1's protocol assumptions
+     (write type, chunk size, no MTU negotiation, no scan) all held up
+     against real hardware
+   - => a `Gtk-CRITICAL` GTK warning was noticed during testing but judged
+     unrelated to this branch (see Adjustments) -- not a BLE deviation
 
 ### Phase 5 - App-triggered pairing (deferred, needs go-ahead) - status: open
 
@@ -335,3 +342,7 @@ automatically after Phase 4._
   unverified, needs a second transmitting device. Also implemented, on
   request, a paired-devices dropdown for the address field (see
   Adjustments) — `cargo test --workspace` still 113/113 after that change.
+- 2608211950 — Asked user whether to test RX now or accept TX-only
+  verification; chose TX-only. Phase 4 marked done on that explicit basis.
+  Phases 1-4 all complete; Phase 5 (app-triggered pairing) remains
+  deferred pending explicit go-ahead, per the original plan clarification.
