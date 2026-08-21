@@ -16,10 +16,16 @@ status: active
     packet-radio (this app) is the intended BLE client; the sibling CLI is
     deliberately not one.
 - `/home/phox/Nextcloud/Projects/lora-kiss-tnc/docs/kiss_protocol.md` — wire
-  protocol reference, not yet read in full; read before Phase 1 research.
+  protocol reference, read in full (see Phase 1 findings below).
+- `/home/phox/Nextcloud/Projects/lora-kiss-tnc/src/transport/
+  ble_nus_transport.h` / `ble_nimble_impl.cpp` — firmware's BLE transport:
+  RX characteristic is `WRITE_NR | WRITE_ENC` (write-without-response,
+  encrypted-link-required), TX notifications chunked at a fixed 180 bytes
+  with no explicit MTU-negotiation call.
 - `/home/phox/Nextcloud/Projects/lora-kiss-tnc/tools/ble_kiss_client.py` —
-  Python/bleak reference client, useful for cross-checking characteristic
-  UUIDs, write type, and chunking behavior.
+  Python/bleak reference client, read in full — confirms the same 180-byte
+  chunking + `response=False` write scheme works end-to-end against real
+  hardware over BlueZ (per that repo's README verification notes).
 - Existing packet-radio architecture read this session:
   - [pr-core/src/port.rs](pr-core/src/port.rs) — `PortRunner` trait, one
     blocking OS thread per port.
@@ -56,9 +62,9 @@ type, wiring it up as a KISS TNC over BLE.
 
 ## Phases
 
-### Phase 1 - Research & wire-protocol confirmation - status: open
+### Phase 1 - Research & wire-protocol confirmation - status: done
 
-1. [ ] Read `docs/kiss_protocol.md` and the BLE-relevant parts of
+1. [x] Read `docs/kiss_protocol.md` and the BLE-relevant parts of
    `lora-kiss-tnc/src` (or `tools/ble_kiss_client.py`) to confirm:
    - exact GATT write type used for the RX characteristic (Write vs
      WriteWithoutResponse) — affects btleplug call and latency
@@ -67,13 +73,48 @@ type, wiring it up as a KISS TNC over BLE.
    - confirm TX (notify) characteristic requires no special subscribe
      dance beyond standard CCCD write (btleplug's `subscribe()` should
      cover this, but confirm nothing TNC-specific is needed)
-2. [ ] Confirm btleplug's current version and Linux/BlueZ backend
+   - => RX characteristic is `WRITE_NR | WRITE_ENC` — write-without-response,
+     encrypted-link-required. btleplug's `Peripheral::write()` must be
+     called with `WriteType::WithoutResponse`
+     (`ble_nimble_impl.cpp:117-118`)
+   - => firmware does no explicit MTU negotiation; `sendFrame()` chunks TX
+     notifications at a fixed 180 bytes regardless of negotiated MTU
+     (`ble_nimble_impl.cpp:163-172`) and relies on the far side's streaming
+     `KissDecoder` to reassemble across chunk boundaries — matches this
+     app's existing `KissDecoder`, no changes needed there
+   - => TX subscribe is standard NUS notify, nothing TNC-specific beyond
+     the UUIDs already documented
+2. [x] Confirm btleplug's current version and Linux/BlueZ backend
    requirements (D-Bus session, any system packages/permissions needed
    beyond what BlueZ pairing already requires)
    - check whether connecting to an already-bonded/encrypted GATT
      characteristic "just works" once BlueZ holds the bond (expected, since
      encryption is a link-layer property BlueZ manages), or needs anything
      explicit from btleplug
+   - => **MTU resolved**: on Linux, btleplug's BlueZ backend goes through
+     BlueZ's D-Bus API (`bluez_async` crate → `WriteValue`/notify), and
+     BlueZ auto-negotiates the ATT MTU while transparently
+     fragmenting/reassembling `WriteValue`/notification payloads at the
+     D-Bus level regardless of the negotiated MTU (confirmed via the
+     linux-bluetooth mailing list: "MTU is negotiated automatically to the
+     maximum value possible but it doesn't really matter with WriteValue
+     and ReadValue since they will fragment and reassemble the data
+     automatically"). This is also already empirically verified: the
+     bleak-based `ble_kiss_client.py` uses the identical 180-byte-chunk +
+     write-without-response scheme against real lora-kiss-tnc hardware,
+     confirmed working end-to-end. **No explicit MTU-negotiation step
+     needed in `run_ble`** — chunk writes at 180 bytes to match the
+     firmware's own convention and let BlueZ/btleplug handle the rest.
+   - => **Scan resolved**: btleplug's Linux backend (`src/bluez/adapter.rs`,
+     `peripherals()`/`peripheral()`) queries BlueZ's live D-Bus device list
+     (`session.get_devices_on_adapter()`) rather than a locally-cached
+     scan-discovered set — a bonded device already known to BlueZ shows up
+     via `adapter.peripherals()` with **no active `start_scan()` required**.
+     `run_ble` can call `peripherals()`, match by `Peripheral::address()`
+     (`BDAddr`) against the configured address, and `connect()` directly.
+   - => write type: `Peripheral::write()` takes `btleplug::api::WriteType`
+     (`WithoutResponse`/`WithResponse`), maps directly to the RX
+     characteristic's `WRITE_NR` property — use `WriteType::WithoutResponse`.
 
 ### Phase 2 - BLE transport core (pr-ax25) - status: open
 
@@ -91,12 +132,17 @@ type, wiring it up as a KISS TNC over BLE.
      abstraction)
    - notify → `std::sync::mpsc` channel drained by a `Read` impl
    - `Write` impl pushes bytes to a channel drained by an async task that
-     writes to the RX characteristic, chunked to the negotiated/assumed
-     ATT MTU (per Phase 1 findings)
+     writes to the RX characteristic via `WriteType::WithoutResponse`,
+     chunked at 180 bytes (matches the firmware's own chunk size; no
+     explicit MTU negotiation needed — BlueZ fragments/reassembles
+     `WriteValue`/notify transparently, see Phase 1 findings)
    - unlike TCP/serial, BLE reader/writer aren't naturally the same
      `try_clone`-able handle — write `run_ble` directly rather than forcing
      it through `run_tcp`/`run_serial`'s clone pattern
-4. [ ] Implement `run_ble()`: connect by address, discover NUS service
+4. [ ] Implement `run_ble()`: call `adapter.peripherals()` (queries BlueZ's
+   live device list, no `start_scan()` needed for an already-bonded
+   device — see Phase 1), match by `Peripheral::address()` against the
+   configured address, `connect()`, discover NUS service
    (`6E400001-...`) and RX/TX characteristics (`6E400002-`/`6E400003-...`),
    subscribe to TX, send `send_kiss_params` over the writer, spawn
    `kiss_read_loop` over the reader, run `command_loop` over the writer —
@@ -162,7 +208,13 @@ automatically after Phase 4._
 
 ## Adjustments
 
-_None yet._
+- 2608211917 — [[planreview - 2608211917 - BLE port type for lora-kiss-tnc]]
+  written after starting Phase 1; user asked to resolve the MTU and scan
+  questions it raised before continuing. Phase 1 completed via firmware
+  source reading + external research (btleplug/BlueZ source, mailing list),
+  answers folded into Phase 1 (now `status: done`) and Phase 2 actions 3-4.
+  Review's other open items (unbonded-connect error handling, Context
+  links) not addressed — user asked specifically for MTU/scan.
 
 ## Progress Log
 
@@ -170,3 +222,11 @@ _None yet._
   memory and packet-radio's port/KISS/UI architecture; clarified pairing
   scope (manual first), BLE crate (btleplug), platform scope (Linux only)
   with the user before drafting phases.
+- 2608211917 — Plan review written; user asked to resolve MTU/scan
+  questions. Read lora-kiss-tnc firmware BLE transport source
+  (`ble_nus_transport.h`, `ble_nimble_impl.cpp`) and `ble_kiss_client.py`,
+  researched btleplug's BlueZ backend source and BlueZ D-Bus MTU behavior.
+  Phase 1 completed: write type is `WriteType::WithoutResponse`, no MTU
+  negotiation needed (BlueZ fragments/reassembles transparently), no scan
+  needed to reach an already-bonded device (`adapter.peripherals()` queries
+  BlueZ live). Phase 2 actions 3-4 updated to reflect these answers.

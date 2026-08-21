@@ -11,7 +11,7 @@ and `src/transport/ble_nimble_impl.cpp` in the lora-kiss-tnc repo (read
 partway through Phase 1 before this review was requested — findings below
 fold that reading in).
 
-# Phase 1: Research & wire-protocol confirmation — two of three sub-questions already answered by firmware source — status: open
+# Phase 1: Research & wire-protocol confirmation — MTU/scan questions resolved — status: resolved
 
 1. RX characteristic property is `WRITE_NR | WRITE_ENC` (write-without-response,
    encrypted-link-required) — not plain `WRITE`. btleplug's write call takes
@@ -33,12 +33,21 @@ fold that reading in).
      question — it's actually a central-side (btleplug/BlueZ) question:
      does btleplug/BlueZ auto-request a larger MTU on connect, or does the
      plan need an explicit MTU-request step in Phase 2's `run_ble`?
-   - [ ]
+   - [x] Resolved: no explicit MTU request needed. On Linux, btleplug's
+     BlueZ backend goes through BlueZ's D-Bus API, which auto-negotiates
+     MTU and transparently fragments/reassembles `WriteValue`/notify
+     payloads regardless of the negotiated value (linux-bluetooth mailing
+     list). Empirically confirmed too: `ble_kiss_client.py` (bleak, same
+     BlueZ backend) already does the identical 180-byte-chunk +
+     write-without-response scheme against real hardware, verified
+     working per the lora-kiss-tnc README.
 3. `tools/ble_kiss_client.py` (bleak-based reference client) was not read
    during this session's Phase 1 work despite being named in the plan's
    Context — bleak's own MTU/write-type handling there would be a fast,
    already-working cross-check before writing the btleplug equivalent.
-   - [ ]
+   - [x] Read. Connects directly via `BleakClient(address)` (no scan when
+     address is already known), writes RX in 180-byte chunks with
+     `response=False` — matches the write-type/chunking findings above.
 
 # Phase 2: BLE transport core (pr-ax25) — status: open
 
@@ -49,7 +58,9 @@ fold that reading in).
    resolved (either "btleplug/BlueZ auto-negotiates a usable MTU, use
    `characteristic.max_write_len` or equivalent" or "we must explicitly
    request MTU=X before writing").
-   - [ ]
+   - [x] Resolved, plan action 3 updated: fixed 180-byte chunks +
+     `WriteType::WithoutResponse`, no MTU negotiation step. See Phase 1
+     above.
 2. No action addresses what happens if `run_ble` is asked to connect while
    BlueZ has no bond for the given address (i.e. Phase 4's manual-pairing
    precondition wasn't actually met) — should probably surface as a clear
@@ -62,7 +73,10 @@ fold that reading in).
    bonded/known to BlueZ)? This affects whether `run_ble` needs a
    scan-then-match step before `connect()`, and belongs in Phase 1's
    research rather than being discovered mid-Phase-2.
-   - [ ]
+   - [x] Resolved: no scan needed. btleplug's BlueZ backend queries BlueZ's
+     live D-Bus device list on `peripherals()`, which already includes
+     bonded devices. Plan action 4 updated to match/connect directly. See
+     Phase 1 above.
 
 # Phase 3: Config & UI wiring (pr-core, pr-app) — status: open
 
