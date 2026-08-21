@@ -116,14 +116,17 @@ type, wiring it up as a KISS TNC over BLE.
      (`WithoutResponse`/`WithResponse`), maps directly to the RX
      characteristic's `WRITE_NR` property — use `WriteType::WithoutResponse`.
 
-### Phase 2 - BLE transport core (pr-ax25) - status: open
+### Phase 2 - BLE transport core (pr-ax25) - status: done
 
-1. [ ] Add `btleplug` to `Cargo.toml` workspace deps and `pr-ax25/Cargo.toml`
-2. [ ] Add `KissTransport::Ble { address: String }` to
+1. [x] Add `btleplug` to `Cargo.toml` workspace deps and `pr-ax25/Cargo.toml`
+   - => also added `tokio` (`rt-multi-thread`, `sync`, `time` features),
+     `uuid`, `futures` as workspace deps — btleplug's async API and the
+     reader/writer bridge need all four
+2. [x] Add `KissTransport::Ble { address: String }` to
    [pr-ax25/src/kiss_runner.rs](pr-ax25/src/kiss_runner.rs)
    - `address` is the BLE device address/identifier BlueZ uses (platform
      peripheral id), entered by the user after pairing via OS settings
-3. [ ] Implement a reader/writer bridge from btleplug's async API into the
+3. [x] Implement a reader/writer bridge from btleplug's async API into the
    blocking `impl Read` / `impl Write` shapes `kiss_read_loop`/
    `command_loop` expect
    - spin up a `tokio::runtime::Runtime` inside `run_ble`'s dedicated
@@ -139,7 +142,18 @@ type, wiring it up as a KISS TNC over BLE.
    - unlike TCP/serial, BLE reader/writer aren't naturally the same
      `try_clone`-able handle — write `run_ble` directly rather than forcing
      it through `run_tcp`/`run_serial`'s clone pattern
-4. [ ] Implement `run_ble()`: call `adapter.peripherals()` (queries BlueZ's
+   - => implemented as `BleReader`/`BleWriter` structs. Runtime is a
+     **multi-thread** tokio runtime (not current-thread): the
+     notify-forward/write-drain/disconnect-watcher tasks (action 4/5) must
+     keep making progress on their own worker threads even while the port
+     thread isn't inside `block_on` (e.g. while blocked in
+     `command_loop`'s synchronous `cmd_rx.recv_timeout`) — a current-thread
+     runtime would stall those tasks the moment `block_on` returns from
+     the initial connect setup
+   - => `BleReader::read` maps a closed channel (`RecvTimeoutError::
+     Disconnected`) to `Ok(0)`, matching TCP/serial's EOF convention, so
+     `kiss_read_loop` needed no BLE-specific changes
+4. [x] Implement `run_ble()`: call `adapter.peripherals()` (queries BlueZ's
    live device list, no `start_scan()` needed for an already-bonded
    device — see Phase 1), match by `Peripheral::address()` against the
    configured address, `connect()`, discover NUS service
@@ -148,8 +162,23 @@ type, wiring it up as a KISS TNC over BLE.
    `kiss_read_loop` over the reader, run `command_loop` over the writer —
    same lifecycle events (`PortConnected`/`PortDisconnected`/`PortError`) as
    `run_tcp`/`run_serial`
-5. [ ] Handle a BLE-initiated disconnect (peripheral drops the link, e.g.
+   - => implemented as `ble_connect()` (async setup) + `run_ble()` (sync
+     shell matching `run_tcp`/`run_serial`'s shape); characteristics
+     matched by both UUID and `service_uuid` (not just UUID) to be safe if
+     the device ever exposes more than the NUS service
+5. [x] Handle a BLE-initiated disconnect (peripheral drops the link, e.g.
    TNC reboot or out of range) → `PortEvent::PortDisconnected`
+   - => a dropped write only fails once something is actively being sent,
+     so added a dedicated disconnect-watcher task (watches
+     `Central::events()` for `CentralEvent::DeviceDisconnected` matching
+     our peripheral id) that reports through a new `InternalEvent::
+     Disconnected` variant — reuses the existing internal-event channel
+     `kiss_read_loop` already uses to hand decoded frames to
+     `command_loop`, so `command_loop` tears down via the same "return
+     false from `handle_internal_event`" path a write failure already uses
+   - => verified: `cargo check --workspace` clean, `cargo test -p pr-ax25`
+     64/64 passing (existing tests untouched, no BLE-specific tests added
+     yet — hardware verification is Phase 4)
 
 ### Phase 3 - Config & UI wiring (pr-core, pr-app) - status: open
 
@@ -230,3 +259,8 @@ automatically after Phase 4._
   negotiation needed (BlueZ fragments/reassembles transparently), no scan
   needed to reach an already-bonded device (`adapter.peripherals()` queries
   BlueZ live). Phase 2 actions 3-4 updated to reflect these answers.
+- 2608211929 — Phase 2 implemented: `btleplug`/`tokio`/`uuid`/`futures`
+  deps added; `KissTransport::Ble`, `BleReader`/`BleWriter`, `ble_connect()`
+  async setup, `run_ble()`, and `InternalEvent::Disconnected` added to
+  [pr-ax25/src/kiss_runner.rs](pr-ax25/src/kiss_runner.rs). `cargo check
+  --workspace` clean, `cargo test -p pr-ax25` 64/64 passing.
