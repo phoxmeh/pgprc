@@ -220,13 +220,28 @@ type, wiring it up as a KISS TNC over BLE.
 
 ### Phase 4 - Hardware verification - status: open
 
-1. [ ] Pair the lora-kiss-tnc device via OS Bluetooth settings (GNOME
+1. [x] Pair the lora-kiss-tnc device via OS Bluetooth settings (GNOME
    Settings / `bluetoothctl`), confirm bonded
-2. [ ] Add a BLE port in packet-radio pointing at the paired device, connect
+   - => device was already paired/bonded from earlier work on this
+     hardware (address `34:B7:DA:57:5F:1D`, name `LoRa-KISS-TNC`);
+     confirmed via `bluetoothctl info` (`Paired: yes`, `Bonded: yes`)
+2. [x] Add a BLE port in packet-radio pointing at the paired device, connect
+   - => connected successfully through the real GUI (`target/debug/pgprc`,
+     built from this branch)
 3. [ ] Verify KISS traffic round-trip: send unproto/UI frame from
    packet-radio, confirm received on the TNC side (or a second radio/SDR
    per lora-kiss-tnc's own verified setup); receive an inbound frame,
    confirm it decodes and shows in Monitor
+   - => TX half confirmed: sent a UI frame from packet-radio over the new
+     BLE port, visible on the user's SDR waterfall at the configured
+     frequency -- confirms connect, KISS encode, the BLE write path
+     (`WriteType::WithoutResponse`, 180-byte chunking), and the firmware's
+     TX-to-radio path all work end to end over a real link
+   - RX half (inbound LoRa frame -> BLE notify -> Monitor) not yet
+     verified -- needs a second LoRa device/SDR that can transmit on the
+     TNC's frequency; matches lora-kiss-tnc's own README, which lists RX
+     as its one still-unverified path. Staying `[ ]` until this is done or
+     the user decides to accept TX-only verification for now.
 4. [ ] Fix issues found; note any deviations from Phase 1's protocol
    assumptions
 
@@ -270,6 +285,19 @@ automatically after Phase 4._
   side — doesn't change the GATT UUIDs, write type, or chunking this plan
   relies on — but worth knowing about before Phase 4: if a device connects
   and gets dropped ~30s later, that's this timeout, not a packet-radio bug.
+- 2608211949 — User requested (mid-Phase-4, not part of the original plan)
+  that the BLE port's device-address field be a dropdown of paired
+  Bluetooth devices instead of manual entry. Implemented immediately
+  (explicit direction, not a silent scope addition) — see
+  `paired_ble_devices()` / dropdown + Refresh button in
+  [pr-app/src/ports_dialog.rs](pr-app/src/ports_dialog.rs).
+- 2608211949 — A `Gtk-CRITICAL **: gtk_box_append: assertion
+  'gtk_widget_get_parent (child) == NULL' failed` appeared in the app's
+  log ~13s after launch, during first manual testing. User confirmed the
+  Ports dialog looked fine visually, so not blocking; not chased down
+  further this session -- likely pre-existing (unrelated to this branch's
+  changes) but not confirmed either way. Worth a `/eidos:observe` or
+  separate investigation if it recurs.
 
 ## Progress Log
 
@@ -299,3 +327,11 @@ automatically after Phase 4._
   113/113 passing. Noticed lora-kiss-tnc firmware source changed since
   Phase 1 (pairing timeout, link-encryption gate) — no plan impact, logged
   for Phase 4 awareness.
+- 2608211949 — Phase 4 started against real hardware (already-paired
+  `LoRa-KISS-TNC` at `34:B7:DA:57:5F:1D`). Built and launched
+  `target/debug/pgprc`; user added a BLE port, connected successfully, sent
+  a UI frame that showed up on their SDR waterfall — confirms the full TX
+  path end to end. RX path (inbound LoRa frame -> Monitor) still
+  unverified, needs a second transmitting device. Also implemented, on
+  request, a paired-devices dropdown for the address field (see
+  Adjustments) — `cargo test --workspace` still 113/113 after that change.
