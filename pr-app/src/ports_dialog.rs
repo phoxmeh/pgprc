@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -336,7 +337,50 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     stack.add_named(&ks_box, Some("KISS (Serial)"));
 
     // KISS (BLE)
-    let kb_address = gtk::Entry::builder().placeholder_text("AA:BB:CC:DD:EE:FF").build();
+    // Existing address may not be among currently-paired devices (config
+    // edited by hand, or paired on another machine) -- keep it selectable
+    // either way rather than silently dropping it on save.
+    let existing_kb_address = match &existing {
+        Some(e) => match &e.config {
+            PortConfig::KissBle { address, .. } => Some(address.clone()),
+            _ => None,
+        },
+        None => None,
+    };
+    let kb_devices: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let kb_address_model = gtk::StringList::new(&[]);
+    let kb_address_dropdown = gtk::DropDown::builder().model(&kb_address_model).build();
+    let refresh_kb_devices = {
+        let kb_devices = kb_devices.clone();
+        let kb_address_model = kb_address_model.clone();
+        let kb_address_dropdown = kb_address_dropdown.clone();
+        let existing_kb_address = existing_kb_address.clone();
+        move || {
+            let mut devices = paired_ble_devices();
+            if let Some(addr) = &existing_kb_address {
+                if !devices.iter().any(|(a, _)| a == addr) {
+                    devices.push((addr.clone(), addr.clone()));
+                }
+            }
+            let labels: Vec<String> = if devices.is_empty() {
+                vec!["No paired Bluetooth devices found -- pair via OS settings, then Refresh".to_string()]
+            } else {
+                devices.iter().map(|(addr, name)| format!("{name} ({addr})")).collect()
+            };
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            kb_address_model.splice(0, kb_address_model.n_items(), &label_refs);
+            let selected = existing_kb_address.as_ref().and_then(|addr| devices.iter().position(|(a, _)| a == addr)).unwrap_or(0);
+            kb_address_dropdown.set_selected(selected as u32);
+            *kb_devices.borrow_mut() = devices;
+        }
+    };
+    refresh_kb_devices();
+    let kb_refresh_button = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Rescan paired Bluetooth devices").build();
+    kb_refresh_button.connect_clicked(move |_| refresh_kb_devices());
+    let kb_address_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    kb_address_row.append(&labeled("Device Address", &kb_address_dropdown));
+    kb_refresh_button.set_valign(gtk::Align::Center);
+    kb_address_row.append(&kb_refresh_button);
     let kb_my_call = gtk::Entry::builder().placeholder_text("MYCALL-1").build();
     let kb_tx_delay = gtk::Entry::builder().placeholder_text("TNC default").build();
     let kb_persistence = gtk::Entry::builder().placeholder_text("TNC default").build();
@@ -347,14 +391,12 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
     let kb_n2 = gtk::Entry::builder().placeholder_text("app default (10)").build();
     let kb_paclen = gtk::Entry::builder().placeholder_text("app default (256)").build();
     let kb_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let kb_hint = gtk::Label::new(Some(
-        "Pair the device via your OS Bluetooth settings first, then paste its address here.",
-    ));
+    let kb_hint = gtk::Label::new(Some("Pair the device via your OS Bluetooth settings first, then pick it below."));
     kb_hint.set_wrap(true);
     kb_hint.set_xalign(0.0);
     kb_hint.add_css_class("dim-label");
     kb_box.append(&kb_hint);
-    kb_box.append(&labeled("Device Address", &kb_address));
+    kb_box.append(&kb_address_row);
     kb_box.append(&labeled("My Call Sign", &kb_my_call));
     kb_box.append(&labeled("TXDELAY (x10ms)", &kb_tx_delay));
     kb_box.append(&labeled("Persistence", &kb_persistence));
@@ -430,8 +472,9 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                 load_kiss_params(kiss_params, &ks_tx_delay, &ks_persistence, &ks_slot_time, &ks_full_duplex);
                 load_kiss_arq_params(kiss_arq, &ks_window, &ks_t1_ms, &ks_n2, &ks_paclen);
             }
-            PortConfig::KissBle { address, name: _, my_call, kiss_params, kiss_arq } => {
-                kb_address.set_text(address);
+            PortConfig::KissBle { address: _, name: _, my_call, kiss_params, kiss_arq } => {
+                // Address selection is handled by `refresh_kb_devices` above
+                // (it pre-selects `existing_kb_address` in the dropdown).
                 kb_my_call.set_text(my_call);
                 load_kiss_params(kiss_params, &kb_tx_delay, &kb_persistence, &kb_slot_time, &kb_full_duplex);
                 load_kiss_arq_params(kiss_arq, &kb_window, &kb_t1_ms, &kb_n2, &kb_paclen);
@@ -595,11 +638,14 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                     }
                 }
                 _ => {
-                    let address = kb_address.text().trim().to_string();
-                    if address.is_empty() {
-                        error_label.set_text("BLE device address is required -- pair the device via OS Bluetooth settings, then paste its address here.");
-                        return;
-                    }
+                    let selected = kb_address_dropdown.selected() as usize;
+                    let (address, device_name) = match kb_devices.borrow().get(selected) {
+                        Some((addr, name)) => (addr.clone(), name.clone()),
+                        None => {
+                            error_label.set_text("No paired Bluetooth device selected -- pair the device via OS Bluetooth settings, then Refresh.");
+                            return;
+                        }
+                    };
                     let kiss_params = match parse_kiss_params(&kb_tx_delay, &kb_persistence, &kb_slot_time, &kb_full_duplex) {
                         Ok(p) => p,
                         Err(msg) => {
@@ -616,7 +662,7 @@ fn edit_port_dialog(ui: &Rc<Ui>, parent: &adw::Window, existing: Option<PortEntr
                     };
                     PortConfig::KissBle {
                         address,
-                        name: None,
+                        name: Some(device_name),
                         my_call: kb_my_call.text().to_string(),
                         kiss_params,
                         kiss_arq,
@@ -881,6 +927,29 @@ pub(crate) fn base_call(full_call: &str) -> String {
 }
 
 /// Build a DropDown listing SSIDs 1–15.  `ssid` is pre-selected.
+/// Paired Bluetooth devices (address, name), read via `bluetoothctl` --
+/// listed regardless of whether they're a BLE TNC specifically (classic
+/// Bluetooth peripherals show up too), since there's no cheap way to filter
+/// to "offers the NUS service" without connecting to each one. The user
+/// picks the right entry by name. Empty (not an error) if `bluetoothctl`
+/// isn't available or nothing is paired -- callers show a fallback message.
+pub(crate) fn paired_ble_devices() -> Vec<(String, String)> {
+    let Ok(output) = std::process::Command::new("bluetoothctl").args(["devices", "Paired"]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("Device ")?;
+            let (addr, name) = rest.split_once(' ')?;
+            Some((addr.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 pub(crate) fn make_ssid_dropdown(ssid: u8) -> gtk::DropDown {
     let labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"];
     let model = gtk::StringList::new(&labels);
